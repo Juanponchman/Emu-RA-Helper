@@ -242,6 +242,19 @@ fun HomeScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
             )
+            Spacer(Modifier.height(4.dp))
+            val appVersion = remember {
+                try {
+                    val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+                    "v${pi.versionName}"
+                } catch (e: Exception) { "" }
+            }
+            Text(
+                appVersion,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                textAlign = TextAlign.Center
+            )
         }
     }
 }
