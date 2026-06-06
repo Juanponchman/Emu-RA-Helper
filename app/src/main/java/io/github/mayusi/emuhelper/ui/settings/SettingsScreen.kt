@@ -11,6 +11,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
@@ -81,6 +82,15 @@ fun SettingsScreen(
     val testing by viewModel.testing.collectAsState()
     val result by viewModel.result.collectAsState()
     val device = remember { viewModel.device }
+
+    val context = LocalContext.current
+    val appVersion = remember {
+        try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            val code = if (android.os.Build.VERSION.SDK_INT >= 28) pInfo.longVersionCode else @Suppress("DEPRECATION") pInfo.versionCode.toLong()
+            "${pInfo.versionName} ($code)"
+        } catch (e: Exception) { "—" }
+    }
 
     Scaffold(
         topBar = {
@@ -180,6 +190,7 @@ fun SettingsScreen(
                 InfoRow("Model", device.model)
                 InfoRow("RAM", "${device.availRamMb} MB free / ${device.totalRamMb} MB")
                 InfoRow("CPU cores", device.cpuCores.toString())
+                InfoRow("App version", appVersion)
             }
 
             Text(
