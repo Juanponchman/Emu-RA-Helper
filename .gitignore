@@ -1,0 +1,38 @@
+# ─── EmuHelper — source URLs are kept out of the public repo ───────────────
+# The real source list is private. Build from the committed template:
+#   cp app/src/main/java/io/github/mayusi/emuhelper/data/config/Catalog.kt.template \
+#      app/src/main/java/io/github/mayusi/emuhelper/data/config/Catalog.kt
+app/src/main/java/io/github/mayusi/emuhelper/data/config/Catalog.kt
+
+# ─── Gradle / Android build ────────────────────────────────────────────────
+.gradle/
+build/
+app/build/
+*/build/
+captures/
+.cxx/
+
+# ─── Local config & secrets ────────────────────────────────────────────────
+local.properties
+*.keystore
+*.jks
+keystore.properties
+google-services.json
+secrets.properties
+*.env
+.env
+
+# ─── IDE ───────────────────────────────────────────────────────────────────
+.idea/
+*.iml
+.DS_Store
+*.swp
+
+# ─── Misc / scratch ────────────────────────────────────────────────────────
+*.log
+_*.png
+_*.txt
+_*.sh
+*.apk
+*.aab
+docs/superpowers/

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Foreground: a gamepad with a download arrow on its face.
+     Drawn within the ~66dp adaptive safe zone (centered in the 108 viewport). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Gamepad body -->
+    <path
+        android:pathData="M40,42 h28 c10,0 18,8 18,18 c0,8 -3,14 -8,16 c-5,2 -9,-1 -12,-5 l-3,-4 h-18 l-3,4 c-3,4 -7,7 -12,5 c-5,-2 -8,-8 -8,-16 c0,-10 8,-18 18,-18 z">
+        <aapt:attr xmlns:aapt="http://schemas.android.com/aapt"
+            name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="22" android:startY="42"
+                android:endX="86" android:endY="78"
+                android:startColor="#FFA294FF"
+                android:endColor="#FF6E5CF0" />
+        </aapt:attr>
+    </path>
+
+    <!-- Right-side face buttons (two dots) -->
+    <path android:fillColor="#FF13101F"
+        android:pathData="M70,54 m-3.5,0 a3.5,3.5 0,1 1,7 0 a3.5,3.5 0,1 1,-7 0 z" />
+    <path android:fillColor="#FF13101F"
+        android:pathData="M76,62 m-3.5,0 a3.5,3.5 0,1 1,7 0 a3.5,3.5 0,1 1,-7 0 z" />
+
+    <!-- Left D-pad (plus shape = two overlapping rounded bars) -->
+    <path android:fillColor="#FF13101F"
+        android:pathData="M32,53 h7 v14 h-7 z" />
+    <path android:fillColor="#FF13101F"
+        android:pathData="M28.5,56.5 h14 v7 h-14 z" />
+
+    <!-- Download arrow on the center face -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M53,48 h4 v10 h5 l-7,8 l-7,-8 h5 z" />
+</vector>

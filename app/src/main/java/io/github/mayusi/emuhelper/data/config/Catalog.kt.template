@@ -1,0 +1,134 @@
+/*
+ * ───────────────────────────────────────────────────────────────────────────
+ *  TEMPLATE — this file is committed to the public repository.
+ *
+ *  To build EmuHelper you must create the real source list:
+ *
+ *      1. Copy this file to `Catalog.kt` in the same directory.
+ *      2. Fill in the `IA_LINKS` map below with the download URLs for the
+ *         collections you want the app to scan.
+ *
+ *  `Catalog.kt` is git-ignored on purpose so that source URLs are NOT published
+ *  in the repository. Everything else (console metadata, colours, ordering, and
+ *  the helper functions) is shared here and can be used as-is.
+ *
+ *  Each entry maps a console key to a list of "download endpoint" URLs that
+ *  return a directory listing / metadata the scanner can read. Example shape:
+ *
+ *      "snes" to listOf(
+ *          "https://example.org/download/<collection-id>/<path>/",
+ *      ),
+ * ───────────────────────────────────────────────────────────────────────────
+ */
+package io.github.mayusi.emuhelper.data.config
+
+object Catalog {
+
+    /**
+     * Console key -> list of source URLs the scanner reads.
+     *
+     * LEFT EMPTY IN THE TEMPLATE. Add your own sources in your local `Catalog.kt`.
+     * The app compiles and runs with empty lists; consoles simply report zero
+     * sources until you populate them.
+     */
+    val IA_LINKS: Map<String, List<String>> = mapOf(
+        "ps1" to emptyList(),
+        "ps2" to emptyList(),
+        "psp" to emptyList(),
+        "wii" to emptyList(),
+        "wiiu" to emptyList(),
+        "3ds" to emptyList(),
+        "ds" to emptyList(),
+        "snes" to emptyList(),
+        "gba" to emptyList(),
+        "gb" to emptyList(),
+        "genesis" to emptyList(),
+        "dreamcast" to emptyList(),
+        "saturn" to emptyList(),
+        "arcade" to emptyList(),
+        "vita" to emptyList(),
+        "bios" to emptyList(),
+        "n64" to emptyList(),
+        "gcn" to emptyList(),
+    )
+
+    data class ConsoleDesc(val key: String, val display: String, val folder: String, val emulator: String)
+
+    /** Folder name for a console key, e.g. "snes" -> "SNES". Falls back to a cleaned key. */
+    fun folderForConsole(consoleKey: String): String =
+        CONSOLES[consoleKey]?.folder ?: consoleKey.ifBlank { "Other" }.uppercase()
+
+    /**
+     * Best-effort reverse lookup: which console key owns a given source identifier.
+     * Used only for older saved lists whose games predate the stored `console` field.
+     */
+    fun consoleForIdentifier(identifier: String): String? {
+        if (identifier.isBlank()) return null
+        for ((key, urls) in IA_LINKS) {
+            if (urls.any { it.contains("/download/$identifier/") || it.contains("/download/$identifier") || it.contains("/$identifier/") }) {
+                return key
+            }
+        }
+        return null
+    }
+
+    val CONSOLES: Map<String, ConsoleDesc> = mapOf(
+        "ps1"       to ConsoleDesc("ps1",       "PS1 - PlayStation",   "PS1",        "DuckStation"),
+        "ps2"       to ConsoleDesc("ps2",       "PS2 - PlayStation 2", "PS2",        "AetherSX2"),
+        "psp"       to ConsoleDesc("psp",       "PSP",                 "PSP",        "PPSSPP"),
+        "wii"       to ConsoleDesc("wii",       "Wii",                 "Wii",        "Dolphin"),
+        "wiiu"      to ConsoleDesc("wiiu",      "Wii U",               "Wii U",      "Cemu Android"),
+        "3ds"       to ConsoleDesc("3ds",       "3DS",                 "3DS",        "Citra"),
+        "ds"        to ConsoleDesc("ds",        "DS",                  "DS",         "Drastic"),
+        "snes"      to ConsoleDesc("snes",      "SNES",                "SNES",       "Snes9x"),
+        "gba"       to ConsoleDesc("gba",       "Game Boy Advance",    "GBA",        "mGBA"),
+        "gb"        to ConsoleDesc("gb",        "Game Boy / Color",    "GB",         "mGBA"),
+        "genesis"   to ConsoleDesc("genesis",   "Genesis",             "Genesis",    "MD.emu"),
+        "dreamcast" to ConsoleDesc("dreamcast", "Dreamcast",           "Dreamcast",  "Flycast"),
+        "saturn"    to ConsoleDesc("saturn",    "Saturn",              "Saturn",     "YabaSanshiro"),
+        "arcade"    to ConsoleDesc("arcade",    "Arcade",              "Arcade",     "MAME4droid"),
+        "vita"      to ConsoleDesc("vita",      "PS Vita",             "Vita",       "Vita3K"),
+        "bios"      to ConsoleDesc("bios",      "BIOS / Firmware",     "BIOS",       "All emulators"),
+        "switch"    to ConsoleDesc("switch",    "Nintendo Switch",     "Switch",     "Yuzu"),
+        "n64"       to ConsoleDesc("n64",       "Nintendo 64",         "N64",        "Mupen64Plus"),
+        "gcn"       to ConsoleDesc("gcn",       "GameCube",            "GameCube",   "Dolphin"),
+        "gamecube"  to ConsoleDesc("gamecube",  "GameCube",            "GameCube",   "Dolphin"),
+        "xbox"      to ConsoleDesc("xbox",      "Xbox",                "XBOX",       "Xemu"),
+        "xbox360"   to ConsoleDesc("xbox360",   "Xbox 360",            "XBOX360",    "Xenia"),
+        "retro"     to ConsoleDesc("retro",     "Retro",               "Retro",      "Various"),
+    )
+
+    val CONSOLE_COLORS: Map<String, Long> = mapOf(
+        "ps1"       to 0xFF89b4fa,
+        "ps2"       to 0xFFcba6f7,
+        "psp"       to 0xFFf5c2e7,
+        "wii"       to 0xFF94e2d5,
+        "wiiu"      to 0xFF94e2d5,
+        "3ds"       to 0xFF94e2d5,
+        "ds"        to 0xFF94e2d5,
+        "snes"      to 0xFFfab387,
+        "gba"       to 0xFFa6e3a1,
+        "gb"        to 0xFFa6e3a1,
+        "genesis"   to 0xFFf9e2af,
+        "dreamcast" to 0xFF74c7ec,
+        "saturn"    to 0xFF89dceb,
+        "arcade"    to 0xFFf38ba8,
+        "vita"      to 0xFFf5c2e7,
+        "bios"      to 0xFF6c7086,
+        "switch"    to 0xFFf38ba8,
+        "n64"       to 0xFFcba6f7,
+        "gcn"       to 0xFF94e2d5,
+        "gamecube"  to 0xFF94e2d5,
+        "xbox"      to 0xFFf9e2af,
+        "xbox360"   to 0xFFf9e2af,
+        "retro"     to 0xFF6c7086,
+    )
+
+    val DISPLAY_ORDER = listOf(
+        "ps1", "ps2", "psp", "vita",
+        "n64", "gcn", "wii", "wiiu", "3ds", "ds",
+        "snes", "gba", "gb",
+        "genesis", "dreamcast", "saturn",
+        "arcade", "bios"
+    )
+}

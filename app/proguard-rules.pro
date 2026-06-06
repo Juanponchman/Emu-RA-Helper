@@ -1,0 +1,4 @@
+-keepattributes *Annotation*
+-keep class kotlinx.serialization.** { *; }
+-keepclassmembers class io.github.mayusi.emuhelper.data.model.** { *; }
+-keepclassmembers class io.github.mayusi.emuhelper.data.source.** { *; }
