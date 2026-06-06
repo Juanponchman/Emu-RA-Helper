@@ -37,7 +37,7 @@ class DownloadService : Service() {
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("EmuHelper")
-            .setContentText("Downloading ROMs in the background")
+            .setContentText("Downloading in the background")
             .setContentIntent(pending)
             .setOngoing(true)
             .setSilent(true)
@@ -76,7 +76,7 @@ class DownloadService : Service() {
                             "Downloads",
                             NotificationManager.IMPORTANCE_LOW
                         ).apply {
-                            description = "Ongoing ROM downloads"
+                            description = "Ongoing downloads"
                             setShowBadge(false)
                         }
                     )

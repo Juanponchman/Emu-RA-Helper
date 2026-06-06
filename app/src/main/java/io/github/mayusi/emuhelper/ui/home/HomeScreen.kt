@@ -159,7 +159,7 @@ fun HomeScreen(
                             )
                         } else {
                             DropdownMenuItem(
-                                text = { Text("Sign in to archive.org") },
+                                text = { Text("Sign in") },
                                 leadingIcon = { Icon(Icons.AutoMirrored.Filled.Login, null) },
                                 onClick = { menuOpen = false; onSignIn() }
                             )
@@ -191,7 +191,7 @@ fun HomeScreen(
         ) {
             Icon(Icons.Default.Download, null, modifier = Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(6.dp))
-            Text("ROM Download Manager", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Download Manager", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(20.dp))
 
             // Two primary actions side by side (compact).
@@ -203,7 +203,7 @@ fun HomeScreen(
                     modifier = Modifier.weight(1f),
                     icon = Icons.AutoMirrored.Filled.PlaylistAdd,
                     title = "Make a list",
-                    subtitle = "Save games to download later.",
+                    subtitle = "Save items to fetch later.",
                     onClick = onMakeList
                 )
                 HubTile(

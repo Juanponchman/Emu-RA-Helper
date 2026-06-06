@@ -106,7 +106,7 @@ fun ListLibraryScreen(
                     Text("No saved lists yet", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "Make a list of games first, or import one from a .json file.",
+                        "Make a list of items first, or import one from a .json file.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
@@ -159,7 +159,7 @@ fun ListLibraryScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(list.name, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text(
-                                    "${list.count} games  ·  ${formatSize(list.totalSize)}",
+                                    "${list.count} items  ·  ${formatSize(list.totalSize)}",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )

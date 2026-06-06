@@ -73,7 +73,7 @@ fun SaveListScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(8.dp))
-            Text("${games.size} games  ·  ${formatSize(totalSize)}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            Text("${games.size} items  ·  ${formatSize(totalSize)}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             Spacer(Modifier.height(20.dp))
 
             OutlinedTextField(
@@ -91,7 +91,7 @@ fun SaveListScreen(
             Button(
                 onClick = {
                     finishing = true
-                    val finalName = name.ifBlank { "List of ${games.size} games" }
+                    val finalName = name.ifBlank { "List of ${games.size} items" }
                     viewModel.persist(viewModel.buildList(finalName, games), onSaved)
                 },
                 enabled = games.isNotEmpty(),
@@ -105,7 +105,7 @@ fun SaveListScreen(
             OutlinedButton(
                 onClick = {
                     finishing = true
-                    val finalName = name.ifBlank { "List of ${games.size} games" }
+                    val finalName = name.ifBlank { "List of ${games.size} items" }
                     // Build ONE list object; persist it now, then export that same object.
                     val list = viewModel.buildList(finalName, games)
                     viewModel.persist(list) { /* saved; export launcher will finish via onSaved */ }

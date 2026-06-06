@@ -32,8 +32,8 @@ data class DeviceInfo(
 
 /**
  * Measures real downlink throughput so the app can tell the user whether a slow
- * download is the network or the app. Tests against archive.org's own CDN with a
- * few parallel ranged requests — representative of an actual ROM download — for a
+ * download is the network or the app. Tests against a neutral endpoint with a
+ * few parallel ranged requests — representative of an actual file transfer — for a
  * fixed time budget, then reports megabits/sec + a verdict + minutes-per-GB.
  */
 @Singleton

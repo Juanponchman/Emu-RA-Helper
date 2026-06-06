@@ -98,7 +98,7 @@ fun OnboardingScreen(
             ) {
                 Icon(Icons.Default.SdCard, null, modifier = Modifier.size(56.dp), tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.height(12.dp))
-                Text("Where should ROMs go?", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.Center)
+                Text("Where should downloads go?", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(8.dp))
                 Text(
                     "Pick a folder you can find later in your file manager. " +

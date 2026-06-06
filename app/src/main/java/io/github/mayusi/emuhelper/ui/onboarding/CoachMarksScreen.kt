@@ -50,9 +50,9 @@ fun CoachMarksScreen(
     var step by remember { mutableIntStateOf(0) }
 
     val steps = listOf(
-        CoachMarkStep(Icons.AutoMirrored.Filled.PlaylistAdd, "Two ways to get games", "Make a list to save games for later, or Instant install to download right now."),
-        CoachMarkStep(Icons.Default.FlashOn, "Pick your games", "Choose a console, the app scans archive.org, then you tick the games you want."),
-        CoachMarkStep(Icons.Default.Download, "Download", "Files download in the background into per-console folders (e.g. ROMs/SNES). You can leave the app; force-closing stops them."),
+        CoachMarkStep(Icons.AutoMirrored.Filled.PlaylistAdd, "Two ways to get items", "Make a list to save items for later, or Instant install to download right now."),
+        CoachMarkStep(Icons.Default.FlashOn, "Pick your items", "Choose a category, the app scans the source, then you tick the items you want."),
+        CoachMarkStep(Icons.Default.Download, "Download", "Files download in the background into per-category folders (e.g. downloads/SNES). You can leave the app; force-closing stops them."),
         CoachMarkStep(Icons.Default.Settings, "Tune speed anytime", "Use ⋮ → Settings to change connections, run a speed test, and see device info.")
     )
 

@@ -108,7 +108,7 @@ fun GamePickerScreen(
                     Spacer(Modifier.height(8.dp))
                     Text(
                         if (scanState.totalSources > 0) "${scanState.completedSources}/${scanState.totalSources} sources · ${scanState.totalFiles} files"
-                        else "Fetching from Archive.org…",
+                        else "Fetching…",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -127,7 +127,7 @@ fun GamePickerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Pick Games", style = MaterialTheme.typography.titleLarge) },
+                title = { Text("Pick Items", style = MaterialTheme.typography.titleLarge) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
@@ -205,7 +205,7 @@ fun GamePickerScreen(
                 OutlinedTextField(
                     value = searchQuery, onValueChange = { searchQuery = it },
                     modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.ScreenHorizontal, vertical = 6.dp),
-                    placeholder = { Text("Search games...") }, singleLine = true,
+                    placeholder = { Text("Search...") }, singleLine = true,
                     shape = RoundedCornerShape(10.dp),
                     colors = OutlinedTextFieldDefaults.colors(focusedContainerColor = MaterialTheme.colorScheme.surfaceVariant, unfocusedContainerColor = MaterialTheme.colorScheme.surfaceVariant)
                 )
@@ -306,7 +306,7 @@ fun GamePickerScreen(
 
                 if (filtered.isEmpty()) {
                     Box(Modifier.fillMaxWidth().padding(vertical = 32.dp, horizontal = 24.dp), contentAlignment = Alignment.Center) {
-                        Text("No games match these filters", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("No items match these filters", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
 

@@ -35,7 +35,7 @@ fun SkipExplainerScreen(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Internet Archive only allows ROM downloads when you're signed in. Making an account is free and takes a minute at archive.org. You can browse and build lists without an account, but downloads will fail until you sign in. If you skip now, you can sign in anytime later using the ⋮ menu in the top-right corner of the home screen.",
+                    "The configured source only allows downloads when you're signed in. Making an account is free. You can browse and build lists without an account, but downloads will fail until you sign in. If you skip now, you can sign in anytime later using the ⋮ menu in the top-right corner of the home screen.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center

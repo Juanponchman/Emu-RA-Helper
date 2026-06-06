@@ -64,7 +64,7 @@ fun ConsoleSelectScreen(
         ) {
             item {
                 Text(
-                    "Select which consoles to scan on Archive.org. The app fetches live metadata to find all available ROM files.",
+                    "Select which categories to scan. The app fetches live metadata to find all available files.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 4.dp)

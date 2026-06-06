@@ -117,9 +117,9 @@ fun LoginScreen(onLoggedIn: () -> Unit, onSkip: () -> Unit = onLoggedIn, viewMod
             Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(Icons.Default.Lock, null, modifier = Modifier.size(44.dp), tint = MaterialTheme.colorScheme.primary)
                 Spacer(Modifier.height(12.dp))
-                Text("Internet Archive Login", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
+                Text("Account Sign-In", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
                 Spacer(Modifier.height(4.dp))
-                Text("Sign in to download ROMs from archive.org", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                Text("Sign in to access the configured source", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(20.dp))
 
                 OutlinedTextField(

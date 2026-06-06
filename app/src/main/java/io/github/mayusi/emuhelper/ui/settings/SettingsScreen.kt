@@ -110,7 +110,7 @@ fun SettingsScreen(
             SettingCard(title = "Download speed") {
                 Text("Connections per file: $segments", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
                 Text(
-                    "archive.org limits each connection to ~1 MB/s, so more connections = faster (up to your wifi's limit).",
+                    "Some sources limit each connection's speed, so more connections can be faster (up to your link's limit).",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Slider(
@@ -194,7 +194,7 @@ fun SettingsScreen(
             }
 
             Text(
-                "Note: GameHub/GameNative download from Steam/Epic/GOG (commercial CDNs). EmuHelper pulls ROMs from archive.org, which is slower per-connection — but multi-connection + your wifi set the real limit.",
+                "Download speed depends on the source server and your connection. Multi-connection + your link set the real limit.",
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
