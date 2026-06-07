@@ -82,8 +82,8 @@ class HomeViewModel @Inject constructor(
             val pwd = authStore.getSavedPassword()
             if (pwd.isBlank()) return@launch
             when (source.login(email, pwd)) {
-                is LoginResult.Success -> Log.i("EmuHelper", "silent auto-relogin OK for $email")
-                is LoginResult.Failed -> Log.w("EmuHelper", "silent auto-relogin failed for $email")
+                is LoginResult.Success -> Log.i("EmuHelper", "silent auto-relogin OK")
+                is LoginResult.Failed -> Log.w("EmuHelper", "silent auto-relogin failed")
             }
             // login() populates the cookie jar, which flips cookieJar.loggedIn reactively.
         }

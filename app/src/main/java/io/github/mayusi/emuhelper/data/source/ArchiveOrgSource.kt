@@ -92,7 +92,7 @@ class ArchiveOrgSource @Inject constructor(
             for (attempt in 0 until 4) {
                 val (code, body) = postCreds()
                 lastCode = code
-                Log.i("EmuHelper", "login attempt $attempt: code=$code hasCookies=${cookieJar.hasCookies()} bodyHead=${body.take(80).replace('\n',' ')}")
+                Log.i("EmuHelper", "login attempt $attempt: code=$code hasCookies=${cookieJar.hasCookies()}")
 
                 if (cookieJar.hasCookies()) {
                     return@withContext LoginResult.Success
@@ -384,6 +384,21 @@ class ArchiveOrgSource @Inject constructor(
                                 .build()
                             okHttpClient.newCall(req).execute().use { resp ->
                                 if (resp.code != 206) throw IOException("No range (HTTP ${resp.code})")
+                                // Guard against stale metadata: the file was pre-sized to
+                                // expectedSize and segment offsets were sliced from it. If the
+                                // server's real total differs, those offsets are wrong and we'd
+                                // silently write corrupt data (the caller's >=99% check can still
+                                // pass). Content-Range looks like "bytes start-end/total". Only
+                                // abort on a CLEAR, parseable mismatch — many servers omit the
+                                // header, so absent/unparseable means fall back to old behavior.
+                                resp.header("Content-Range")?.let { cr ->
+                                    val serverTotal = cr.substringAfterLast('/', "").trim().toLongOrNull()
+                                    if (serverTotal != null && serverTotal > 0 && serverTotal != expectedSize) {
+                                        throw IOException(
+                                            "Server file size changed; expected $expectedSize but server reports $serverTotal"
+                                        )
+                                    }
+                                }
                                 val body = resp.body ?: throw IOException("empty body")
                                 // Each coroutine opens its own handle and seeks to its slice.
                                 RandomAccessFile(destFile, "rw").use { raf ->

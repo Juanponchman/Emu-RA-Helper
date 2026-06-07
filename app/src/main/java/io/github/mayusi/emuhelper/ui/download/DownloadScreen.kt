@@ -1,8 +1,13 @@
 package io.github.mayusi.emuhelper.ui.download
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.provider.DocumentsContract
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.animateFloatAsState
@@ -118,6 +123,20 @@ fun DownloadScreen(
         }
     }
 
+    // Request POST_NOTIFICATIONS once on Android 13+ so the foreground-download
+    // notification isn't silently suppressed. Downloads begin on this screen.
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { /* granted or not — downloads proceed regardless */ }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     // Start only if the manager isn't already working on this batch.
     LaunchedEffect(games) { if (tasks.isEmpty() && games.isNotEmpty()) viewModel.start(games) }
 
@@ -210,20 +229,37 @@ fun DownloadScreen(
                     if (hasFailures) {
                         OutlinedButton(
                             onClick = {
-                                val toRetry = tasks.filter { it.status == DownloadStatus.FAILED }
-                                    .map { t ->
-                                        CuratedGame(
-                                            name = t.filename,
-                                            filename = t.filename,
-                                            size = t.size,
-                                            identifier = t.identifier
-                                        )
-                                    }
-                                viewModel.cancelAll()
-                                viewModel.start(toRetry)
+                                // Reuse the SAME per-task retry path the row button uses
+                                // (manager.retry(id)) so the original task — including its
+                                // resolved per-console subfolder — is reused instead of
+                                // reconstructing a CuratedGame (which would drop `console`
+                                // and re-derive the subfolder, risking the wrong location).
+                                tasks.filter { it.status == DownloadStatus.FAILED }
+                                    .forEach { viewModel.retryTask(it) }
                             },
                             modifier = Modifier.weight(1f)
                         ) { Text("Retry failed") }
+                    }
+                    customFolder?.let { folderUri ->
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(folderUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    // Fallback: open the system Downloads/Files app.
+                                    try {
+                                        context.startActivity(
+                                            Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
+                                        )
+                                    } catch (_: Exception) {}
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Open folder") }
                     }
                     Button(
                         onClick = { viewModel.clearQueue(); onDone() },

@@ -105,6 +105,35 @@ class DownloadManager @Inject constructor(
             val defaultRoot = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "ROMs")
                 .apply { mkdirs() }
 
+            // Upfront SAF permission check: if the user picked a custom folder but the
+            // persisted grant was revoked (or the folder is no longer writable), every
+            // file would otherwise download fully to cache and only THEN fail at the
+            // copy step with "Could not create file in chosen folder". Detect that here
+            // and abort the whole batch with one clear message instead of N late failures.
+            if (chosenUri != null) {
+                val grantHeld = try {
+                    appContext.contentResolver.persistedUriPermissions.any {
+                        it.uri == chosenUri && it.isWritePermission
+                    }
+                } catch (e: Exception) {
+                    Log.w("EmuHelper", "Checking persisted URI permissions failed", e)
+                    false
+                }
+                val writable = try {
+                    grantHeld && customRoot?.canWrite() == true
+                } catch (e: Exception) {
+                    Log.w("EmuHelper", "Checking folder writability failed", e)
+                    false
+                }
+                if (!writable) {
+                    _statusText.value =
+                        "Storage folder access was lost — please re-pick your download folder in the menu."
+                    _isRunning.value = false
+                    DownloadService.stop(appContext)
+                    return@launch
+                }
+            }
+
             val taskList = games.map { g ->
                 val safeName = File(g.filename).name
                 val url = source.buildDownloadUrl(g.identifier, g.filename)

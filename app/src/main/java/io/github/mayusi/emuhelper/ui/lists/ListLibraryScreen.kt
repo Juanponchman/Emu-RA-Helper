@@ -63,6 +63,9 @@ fun ListLibraryScreen(
         }
     }
 
+    // Holds the list pending deletion; non-null shows the confirmation dialog.
+    var deleteTarget by remember { mutableStateOf<GameList?>(null) }
+
     // Export: remember which list, then write its JSON to the chosen file.
     var exportTarget by remember { mutableStateOf<GameList?>(null) }
     val exporter = rememberLauncherForActivityResult(
@@ -181,7 +184,7 @@ fun ListLibraryScreen(
                                     DropdownMenuItem(
                                         text = { Text("Delete") },
                                         leadingIcon = { Icon(Icons.Default.Delete, null) },
-                                        onClick = { menuOpen = false; viewModel.delete(list.id) }
+                                        onClick = { menuOpen = false; deleteTarget = list }
                                     )
                                 }
                             }
@@ -190,5 +193,21 @@ fun ListLibraryScreen(
                 }
             }
         }
+    }
+
+    deleteTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            title = { Text("Delete this list?") },
+            text = { Text("\"${target.name}\" will be removed. This can't be undone.") },
+            confirmButton = {
+                TextButton(onClick = { viewModel.delete(target.id); deleteTarget = null }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+            }
+        )
     }
 }

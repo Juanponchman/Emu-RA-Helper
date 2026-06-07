@@ -122,7 +122,7 @@ fun SettingsScreen(
                 Slider(
                     value = concurrency.toFloat(),
                     onValueChange = { viewModel.setConcurrency(it.toInt()) },
-                    valueRange = 1f..8f, steps = 6
+                    valueRange = 1f..4f, steps = 2
                 )
                 Spacer(Modifier.height(8.dp))
                 Button(
