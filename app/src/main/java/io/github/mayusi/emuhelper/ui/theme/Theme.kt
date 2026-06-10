@@ -19,7 +19,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 
 // "Modern dark, vibrant accent" — near-black canvas, electric violet accent with
-// cyan + green supports. Tuned for OLED and a game-console / emulator feel.
+// cyan + green supports. Tuned for OLED and a modern media-app feel.
 private val DarkScheme = darkColorScheme(
     primary = Color(0xFF8B7CFF),            // electric violet
     onPrimary = Color(0xFF12101F),

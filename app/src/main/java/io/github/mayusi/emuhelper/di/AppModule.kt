@@ -21,28 +21,28 @@ import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
 
 /**
- * Cookie jar tailored for archive.org, with on-disk persistence so a logged-in
- * session survives app restarts (no re-login, no re-typing credentials).
+ * Cookie jar with on-disk persistence so a logged-in session survives app
+ * restarts (no re-login, no re-typing credentials).
  *
- * Archive.org sets cookies on `domain=.archive.org` and routes downloads through
- * per-request CDN hosts (e.g. `dn721009.ca.archive.org`). Three things must hold:
+ * The configured source host routes downloads through per-request CDN nodes.
+ * Three things must hold:
  *
- *  1. Cookies set for `.archive.org` must be sent to EVERY `*.archive.org` host,
+ *  1. Cookies set for the root domain must be sent to EVERY subdomain host,
  *     not just the exact host that set them. (CDN nodes need the auth cookies.)
  *  2. The login flow sets a cookie, then immediately "deletes" it in the same
  *     response by re-setting the same name with an expiry in 1970. We must MERGE
  *     by name and DROP expired cookies, otherwise the `=deleted` sentinels
  *     (and stale values from earlier requests) clobber the real auth cookies and
- *     archive.org treats us as logged-out -> 401 on restricted items.
- *  3. The auth cookies (logged-in-user/logged-in-sig) are persistent (multi-year
+ *     the source host treats us as logged-out -> 401 on restricted items.
+ *  3. The session cookies (logged-in-user/logged-in-sig) are persistent (multi-year
  *     expiry). Persisting them to disk lets us restore the session on a cold
  *     start instead of doing a fresh network login every launch.
  *
- * Stored flat (not per-host) keyed by cookie name, because all archive.org
+ * Stored flat (not per-host) keyed by cookie name, because all session
  * cookies share the same registrable domain.
  */
-class IaCookieJar(context: Context) : CookieJar {
-    // name -> most recent non-expired cookie for the archive.org domain
+class PersistentCookieJar(context: Context) : CookieJar {
+    // name -> most recent non-expired cookie for the configured source domain
     private val store = ConcurrentHashMap<String, Cookie>()
 
     // Reactive login state so the UI can update the instant the (async, off-main)
@@ -128,17 +128,17 @@ class IaCookieJar(context: Context) : CookieJar {
     }
 
     /**
-     * True only when we hold the cookie archive.org uses to prove a logged-in
-     * session, with a real (non-"deleted") value and not yet expired.
+     * True only when we hold the session cookies used by the configured source host
+     * to prove a logged-in session, with a real (non-"deleted") value and not yet expired.
      */
     fun hasCookies(): Boolean = computeHasCookies()
 
     private fun computeHasCookies(): Boolean {
         val now = System.currentTimeMillis()
-        // IMPORTANT: `ia-auth` is a CSRF token that archive.org sets even on a FAILED
-        // login, so it must NOT be treated as proof of a session. The real
-        // logged-in cookies are `logged-in-sig` / `logged-in-user`, which appear ONLY
-        // after a successful login. Require one of those.
+        // IMPORTANT: some hosts set an auth/CSRF token cookie even on a FAILED login,
+        // so it must NOT be treated as proof of a session. The real session cookies
+        // are `logged-in-sig` / `logged-in-user`, which appear ONLY after a successful
+        // login. Require one of those.
         val authNames = listOf("logged-in-sig", "logged-in-user")
         return authNames.any { name ->
             val c = store[name]
@@ -202,9 +202,9 @@ class IaCookieJar(context: Context) : CookieJar {
     }
 
     companion object {
-        private const val KEY_COOKIES = "ia_cookies_v1"
-        // Delimiter that cannot occur in an archive.org cookie field (name/value/
-        // domain/path use [A-Za-z0-9._/=-]); this triple token is collision-proof.
+        private const val KEY_COOKIES = "app_cookies_v1"
+        // Delimiter that cannot occur in a cookie field (name/value/domain/path
+        // use [A-Za-z0-9._/=-]); this triple token is collision-proof.
         private const val SEP = "|~|"
     }
 }
@@ -215,11 +215,11 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideCookieJar(@ApplicationContext context: Context): IaCookieJar = IaCookieJar(context)
+    fun provideCookieJar(@ApplicationContext context: Context): PersistentCookieJar = PersistentCookieJar(context)
 
     @Provides
     @Singleton
-    fun provideOkHttpClient(cookieJar: IaCookieJar): OkHttpClient {
+    fun provideOkHttpClient(cookieJar: PersistentCookieJar): OkHttpClient {
         // Raise OkHttp's tiny default maxRequestsPerHost=5 so multi-connection downloads
         // work — but keep a SANE backstop. The DownloadManager already hard-caps total
         // connections to 24; these limits sit just above that so a runaway can't spawn

@@ -19,7 +19,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.model.CuratedGame
-import io.github.mayusi.emuhelper.data.source.ArchiveOrgSource
+import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.cleanGameName
@@ -31,7 +31,7 @@ import javax.inject.Inject
 @HiltViewModel
 class DownloadPreviewViewModel @Inject constructor(
     private val scanState: ScanStateHolder,
-    private val source: ArchiveOrgSource
+    private val source: RemoteSource
 ) : ViewModel() {
 
     /** The games loaded from the chosen saved list. */

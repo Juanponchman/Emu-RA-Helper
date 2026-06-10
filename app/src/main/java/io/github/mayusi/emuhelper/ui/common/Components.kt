@@ -45,7 +45,7 @@ fun getBaseGameName(name: String): String {
     return base.trim()
 }
 
-/** Coarse region bucket parsed from a ROM filename's tags. */
+/** Coarse region bucket parsed from a filename's tags. */
 enum class Region { USA, EUR, JPN, OTHER }
 
 fun detectRegion(filename: String): Region {

@@ -18,7 +18,7 @@ data class CuratedGame(
     val size: Long = 0,
     val identifier: String = "",
     val source: String = "built_in",
-    /** Console key (e.g. "snes", "gcn") so downloads can be filed into a per-console
+    /** Platform key (e.g. "snes", "gcn") so downloads can be filed into a per-platform
      *  subfolder. Defaulted for backward-compat with lists exported before this field. */
     val console: String = ""
 ) : Serializable
@@ -52,10 +52,10 @@ data class DownloadTask(
     val filename: String,
     val size: Long = 0,
     val identifier: String = "",
-    /** Full relative path within the IA item (may include subdirs) — used for mirrors. */
+    /** Full relative path within the source item (may include subdirs) — used for mirrors. */
     val relativeName: String = "",
     val region: String = "",
-    /** Per-console subfolder name this file is filed under, e.g. "SNES". */
+    /** Per-platform subfolder name this file is filed under, e.g. "SNES". */
     val subfolder: String = "",
     val downloaded: Long = 0,
     val speed: Double = 0.0,

@@ -31,12 +31,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.mayusi.emuhelper.data.source.ArchiveOrgSource
+import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.data.source.LoginResult
 import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.data.storage.GameListStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
-import io.github.mayusi.emuhelper.di.IaCookieJar
+import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -51,8 +51,8 @@ class HomeViewModel @Inject constructor(
     listStore: GameListStore,
     private val settings: SettingsStore,
     private val authStore: AuthStore,
-    private val source: ArchiveOrgSource,
-    private val cookieJar: IaCookieJar
+    private val source: RemoteSource,
+    private val cookieJar: PersistentCookieJar
 ) : ViewModel() {
 
     data class HomeUi(val listCount: Int = 0, val loggedIn: Boolean = false, val email: String = "")

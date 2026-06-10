@@ -1,0 +1,52 @@
+# Changelog
+
+All notable changes to EmuHelper are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/), and the project follows a
+semantic-style versioning scheme while in alpha.
+
+## [0.1.6] — 2026-06-08
+
+### Changed
+- Repository hygiene & project-health pass: added contributing, security, and
+  code-of-conduct guidelines, issue and pull-request templates, and this
+  changelog.
+- Internal cleanup and tidying across the project.
+
+## [0.1.5] — 2026-06-07
+
+### Changed
+- **Privacy & stability:** stopped writing sensitive details to the device log;
+  hardened optimized release builds for serialized data.
+- **More reliable downloads:** detect lost storage-folder access up front
+  instead of failing late; verify file size mid-transfer to prevent corrupt
+  files; "Retry failed" now preserves each file's target folder.
+- **UX:** confirm before deleting a saved list; "Open folder" button after a
+  batch finishes; request notification permission on Android 13+; corrected a
+  settings slider range.
+- Full README overhaul.
+
+## [0.1.4] — 2026-06-06
+
+### Changed
+- Archive extraction is now **off by default**.
+- Case-insensitive folder matching: downloads merge into an existing folder of a
+  different letter case instead of creating a duplicate.
+- The "already downloaded, skip" check and per-file overwrite are now
+  case-insensitive as well.
+
+## [0.1.3] — 2026-06-06
+
+### Added
+- Guided file-staging helper: copies files you select from your own device into
+  another app's import folder, with on-screen instructions.
+- Project logo.
+
+### Changed
+- Dead-code cleanup.
+
+## [0.1.2] — 2026-06-06
+
+### Added
+- App version shown on the home screen.
+
+[Releases]: https://github.com/mayusi/EmuHelper/releases

@@ -53,3 +53,9 @@ _*.sh
 *.apk
 *.aab
 docs/superpowers/
+
+# ─── Curated content lists & internal specs (never public) ──────────────────
+app/src/main/assets/curated.json
+curated.json
+docs/*-spec.md
+docs/specs/

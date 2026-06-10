@@ -15,7 +15,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Stores the Internet Archive credentials.
+ * Stores the user credentials for the configured source host.
  *
  * ALL fields — email, remember-me, AND password — live in ONE EncryptedSharedPreferences
  * file (AES-256, app-private). Previously email/rememberMe used a separate DataStore that

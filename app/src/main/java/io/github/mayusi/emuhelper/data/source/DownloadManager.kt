@@ -37,13 +37,13 @@ import javax.inject.Singleton
  * Strategy for speed + correctness:
  *  - Download each file with multi-connection ranged requests into APP CACHE (a real
  *    local File supporting random-access seek), then copy the finished file into the
- *    user's chosen folder (SAF) or app-private ROMs dir in one sequential pass.
- *  - Files are organised into per-console subfolders (e.g. ROMs/SNES/).
+ *    user's chosen folder (SAF) or app-private downloads dir in one sequential pass.
+ *  - Files are organised into per-platform subfolders (e.g. Downloads/SNES/).
  */
 @Singleton
 class DownloadManager @Inject constructor(
     @ApplicationContext private val appContext: Context,
-    private val source: ArchiveOrgSource,
+    private val source: RemoteSource,
     private val settings: SettingsStore
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -74,7 +74,7 @@ class DownloadManager @Inject constructor(
     // HARD SAFETY CEILING on simultaneous HTTP connections across ALL files+segments.
     // Without this, concurrentFiles(16) × segmentsPerFile(32) = 512 sockets + 128 MB of
     // buffers could peg the CPU/network and thermally force-shutdown a handheld (which
-    // is exactly what happened). archive.org plateaus ~5-6 MB/s anyway, so 24 is plenty.
+    // is exactly what happened). 24 simultaneous connections is plenty for typical use.
     private val MAX_TOTAL_CONNECTIONS = 24
     private val connectionBudget = kotlinx.coroutines.sync.Semaphore(MAX_TOTAL_CONNECTIONS)
 
@@ -92,7 +92,7 @@ class DownloadManager @Inject constructor(
         batchJob = scope.launch {
             val chosenUri = settings.downloadFolder.first()
             // Clamp to SAFE ceilings. Files-at-once is the dangerous multiplier, so cap
-            // it low (downloads are network-bound; 2-3 files saturates archive.org).
+            // it low (downloads are network-bound; 2-3 files saturates the source host).
             concurrentFiles = settings.concurrency.first().coerceIn(1, 4)
             segmentsPerFile = settings.segments.first().coerceIn(1, 16)
             // Ensure files × segments can never exceed the global connection budget.

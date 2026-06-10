@@ -42,9 +42,9 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     val concurrency: Flow<Int> = context.settingsStore.data.map { it[KEY_CONCURRENCY] ?: 2 }
 
-    /** Parallel HTTP connections per file. archive.org throttles each connection to
-     *  ~1 MB/s and caps per-node ~5-6 MB/s, so a high count to fast nodes wins.
-     *  Default 16; allow up to 32 (Max throughput). */
+    /** Parallel HTTP connections per file. The source host may throttle each connection;
+     *  spreading load across multiple connections to fast nodes maximises throughput.
+     *  Default 16; allow up to 32 (max throughput). */
     val segments: Flow<Int> = context.settingsStore.data.map { it[KEY_SEGMENTS] ?: 16 }
 
     val extractArchives: Flow<Boolean> = context.settingsStore.data.map { it[KEY_EXTRACT] ?: false }

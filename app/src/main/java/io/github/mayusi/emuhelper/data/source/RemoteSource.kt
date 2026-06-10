@@ -2,7 +2,7 @@ package io.github.mayusi.emuhelper.data.source
 
 import android.util.Log
 import io.github.mayusi.emuhelper.data.model.GameFile
-import io.github.mayusi.emuhelper.di.IaCookieJar
+import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -26,9 +26,9 @@ import javax.inject.Singleton
 import kotlin.math.min
 
 @Singleton
-class ArchiveOrgSource @Inject constructor(
+class RemoteSource @Inject constructor(
     private val okHttpClient: OkHttpClient,
-    private val cookieJar: IaCookieJar
+    private val cookieJar: PersistentCookieJar
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
@@ -36,9 +36,8 @@ class ArchiveOrgSource @Inject constructor(
         private val SKIP_EXTS = setOf(".xml", ".json", ".sqlite", ".txt", ".md", ".torrent", ".log", ".csv", ".pdf", ".jpg", ".png", ".gif", ".ico")
         private const val MIN_FILE_SIZE = 102400L
         private const val MAX_ATTEMPTS = 5
-        // Browser-like UA. Archive.org occasionally serves different content
-        // to non-browser UAs and the working Python reference uses this exact
-        // pattern (see EmuHelper.py get_headers()).
+        // Browser-like UA. The configured source host occasionally serves different
+        // content to non-browser UAs; this pattern maximises compatibility.
         private const val USER_AGENT =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -47,9 +46,9 @@ class ArchiveOrgSource @Inject constructor(
 
     suspend fun login(email: String, password: String): LoginResult = withContext(Dispatchers.IO) {
         try {
-            // archive.org's login uses a "cookie-acceptance" handshake: the FIRST POST
-            // sets `test-cookie=1` (and an `ia-auth` CSRF token) but just re-serves the
-            // login form; only a SECOND POST — once test-cookie is present — actually
+            // The source host uses a "cookie-acceptance" handshake: the FIRST POST
+            // sets a test cookie (and possibly a CSRF token) but just re-serves the
+            // login form; only a SECOND POST — once the test cookie is present — actually
             // authenticates. That's the classic "fails first time, works on retry".
             // So we prime the cookies (GET + a throwaway POST), then POST credentials,
             // and retry up to 3x until the session cookie (logged-in-sig) appears.
@@ -85,7 +84,7 @@ class ArchiveOrgSource @Inject constructor(
             var lastCode = 0
             // The SUCCESS oracle is the auth cookie appearing (hasCookies()). The first
             // POST is the cookie-acceptance round (sets test-cookie, no auth yet) and
-            // re-serves the login HTML — which contains the word "Invalid" in validation
+            // re-serves the login HTML — which may contain the word "Invalid" in validation
             // markup, so we must NOT treat loose HTML text as a failure. Only an explicit
             // JSON error ({"status":"error"}) or a clear bad-credentials JSON message is
             // a real failure. We always run the full handshake up to 4 times.
@@ -98,7 +97,7 @@ class ArchiveOrgSource @Inject constructor(
                     return@withContext LoginResult.Success
                 }
                 // Only stop early on a DEFINITIVE bad-credentials signal (JSON, or the
-                // specific archive.org error phrases — not the generic word "Invalid").
+                // specific error phrases from the source host — not the generic word "Invalid").
                 val definiteFail =
                     body.contains("\"status\":\"error\"", ignoreCase = true) ||
                     body.contains("incorrect username or password", ignoreCase = true) ||
@@ -123,21 +122,20 @@ class ArchiveOrgSource @Inject constructor(
     }
 
     fun getIdentifier(url: String): String {
-        // Matches both archive.org/details/<id> and archive.org/download/<id>[/subpath...]
+        // Matches both /details/<id> and /download/<id>[/subpath...] paths
         val m = Regex("archive\\.org/(?:details|download)/([^/?#]+)").find(url)
         return m?.groupValues?.get(1)?.trim()
             ?: url.trim().trimEnd('/').substringAfterLast('/')
     }
 
     /**
-     * Builds the canonical download URL for a file inside an IA item.
+     * Builds the canonical download URL for a file inside a remote item.
      *
      * [relativeName] is the file's `name` from the metadata, which may include a
-     * subdirectory path (e.g. "CHD-PSX-USA/Crash Bandicoot (USA).chd"). We must
-     * percent-encode each path SEGMENT but keep the "/" separators, exactly like
-     * the working Python reference's `quote(name, safe="/")`. Using
-     * java.net.URLEncoder here is wrong — it encodes "/" as %2F and "+" handling
-     * differs, which breaks every file that lives in a subdirectory.
+     * subdirectory path (e.g. "subdir/Filename.chd"). We must percent-encode each
+     * path SEGMENT but keep the "/" separators, like `quote(name, safe="/")`.
+     * Using java.net.URLEncoder here is wrong — it encodes "/" as %2F and "+"
+     * handling differs, which breaks every file that lives in a subdirectory.
      */
     fun buildDownloadUrl(identifier: String, relativeName: String): String {
         val encodedPath = relativeName.split('/').joinToString("/") { encodeSegment(it) }
@@ -145,13 +143,13 @@ class ArchiveOrgSource @Inject constructor(
     }
 
     /**
-     * All mirror URLs that serve this file. archive.org's metadata exposes several
+     * All mirror URLs that serve this file. The source host's metadata exposes several
      * hosts per item — the primary `download` endpoint plus direct `d1`/`d2`
      * datanodes and any `workable` CDN nodes. Returning them all lets the downloader
      * spread segments across hosts and fail a slow/broken node over to another.
      *
-     * The canonical `archive.org/download/...` URL is always first (it redirects to a
-     * live node and is the safest default).
+     * The canonical download URL is always first (it redirects to a live node and
+     * is the safest default).
      */
     suspend fun mirrorUrls(identifier: String, relativeName: String): List<String> = withContext(Dispatchers.IO) {
         val encodedPath = relativeName.split('/').joinToString("/") { encodeSegment(it) }
@@ -191,7 +189,7 @@ class ArchiveOrgSource @Inject constructor(
         val sb = StringBuilder(segment.length + 16)
         for (b in segment.toByteArray(Charsets.UTF_8)) {
             val c = b.toInt() and 0xFF
-            // RFC 3986 "unreserved" plus the sub-delims IA leaves intact in paths.
+            // RFC 3986 "unreserved" characters safe to leave unencoded in URL paths.
             val safe = c.toChar().let { ch ->
                 ch in 'A'..'Z' || ch in 'a'..'z' || ch in '0'..'9' ||
                     ch == '-' || ch == '_' || ch == '.' || ch == '~'
@@ -203,7 +201,7 @@ class ArchiveOrgSource @Inject constructor(
     }
 
     /**
-     * Fetches the list of game files for an Archive.org identifier.
+     * Fetches the list of game files for a remote source identifier.
      * Returns an empty list when the item is valid but contains no usable game files.
      * Throws on network/parse failures so the caller can surface them.
      */
@@ -265,11 +263,11 @@ class ArchiveOrgSource @Inject constructor(
     /**
      * Multi-connection download into a LOCAL file using parallel HTTP Range requests.
      *
-     * archive.org throttles a single TCP stream, so one connection caps at ~1-2 MB/s.
-     * Pulling N ranges in parallel multiplies throughput dramatically on big files.
-     * We write to a real local File via RandomAccessFile (random-access seek) — SAF
-     * content URIs can't seek reliably, so the caller downloads to app cache and then
-     * copies the finished file to the user's chosen folder in one sequential pass.
+     * The source host may throttle a single TCP stream; pulling N ranges in parallel
+     * multiplies throughput dramatically on big files. We write to a real local File
+     * via RandomAccessFile (random-access seek) — SAF content URIs can't seek
+     * reliably, so the caller downloads to app cache and then copies the finished
+     * file to the user's chosen folder in one sequential pass.
      *
      * Falls back to single-stream if the server won't honour Range or size is unknown.
      *
@@ -282,9 +280,8 @@ class ArchiveOrgSource @Inject constructor(
      * than the best are dropped. Returns a weighted pool where faster hosts appear
      * more often, so segments get distributed toward the fast nodes.
      *
-     * This is the key to archive.org speed: its CDN node (dn*.ca) is often
-     * rate-limited while the datanodes ( iaNNN.us) are faster, and naive even
-     * splitting lets a slow node bottleneck the whole file.
+     * CDN nodes are often rate-limited while datanodes are faster; naive even
+     * splitting lets a slow node bottleneck the whole file, so we weight by speed.
      */
     private suspend fun rankHosts(resolvedHosts: List<String>): List<String> = withContext(Dispatchers.IO) {
         if (resolvedHosts.size <= 1) return@withContext resolvedHosts
@@ -323,7 +320,7 @@ class ArchiveOrgSource @Inject constructor(
             val weight = ((p.bytesPerMs / best) * 4).toInt().coerceIn(1, 4)
             repeat(weight) { pool.add(p.url) }
         }
-        Log.i("EmuHelper", "rankHosts: " + good.joinToString { "${it.url.substringAfter("//").substringBefore('/')}=${"%.0f".format(it.bytesPerMs)}B/ms" })
+        Log.i("EmuHelper", "rankHosts: " + good.joinToString { "${it.url.substringAfter("//").substringBefore('/')}=${"%.0f".format(it.bytesPerMs)}B/ms (ranked)" })
         pool.ifEmpty { listOf(good.first().url) }
     }
 
@@ -441,7 +438,7 @@ class ArchiveOrgSource @Inject constructor(
         total
     }
 
-    /** Follow archive.org's 302 once and return the final CDN URL (or null on failure). */
+    /** Follow a redirect once and return the final CDN URL (or null on failure). */
     private fun resolveFinalUrl(url: String): String? = try {
         val req = Request.Builder().url(url)
             .header("User-Agent", USER_AGENT)

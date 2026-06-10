@@ -19,7 +19,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.config.Catalog
 import io.github.mayusi.emuhelper.data.model.GameFile
-import io.github.mayusi.emuhelper.data.source.ArchiveOrgSource
+import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -58,7 +58,7 @@ data class ScanUiState(
 @HiltViewModel
 class BrowseViewModel @Inject constructor(
     application: Application,
-    private val source: ArchiveOrgSource,
+    private val source: RemoteSource,
     private val stateHolder: ScanStateHolder
 ) : AndroidViewModel(application) {
 
@@ -181,7 +181,7 @@ class BrowseViewModel @Inject constructor(
                 stateHolder.scannedFiles.value = allFiles
                 stateHolder.selectedGames.value = selMap
                 val emptyMsg = if (allFiles.isEmpty()) {
-                    if (failures.isEmpty()) "No files matched the filter on Archive.org for the selected consoles."
+                    if (failures.isEmpty()) "No files matched the filter for the selected platforms."
                     else "No files found — every source failed. See details below."
                 } else ""
                 stateHolder.uiState.value = ScanUiState(

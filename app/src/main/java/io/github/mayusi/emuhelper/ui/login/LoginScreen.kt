@@ -24,7 +24,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.mayusi.emuhelper.data.source.ArchiveOrgSource
+import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.data.source.LoginResult
 import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
@@ -36,7 +36,7 @@ import javax.inject.Inject
 
 @HiltViewModel
 class LoginViewModel @Inject constructor(
-    private val archiveOrgSource: ArchiveOrgSource,
+    private val remoteSource: RemoteSource,
     private val authStore: AuthStore
 ) : ViewModel() {
 
@@ -53,7 +53,7 @@ class LoginViewModel @Inject constructor(
             try {
                 val savedEmail = authStore.savedEmail.first()
                 val remember = authStore.rememberMe.first()
-                if (archiveOrgSource.isLoggedIn()) {
+                if (remoteSource.isLoggedIn()) {
                     _state.value = LoginState(isLoggedIn = true, savedEmail = savedEmail, rememberMe = remember)
                 } else if (remember && savedEmail.isNotBlank()) {
                     val savedPassword = authStore.getSavedPassword()
@@ -62,7 +62,7 @@ class LoginViewModel @Inject constructor(
                         return@launch
                     }
                     _state.value = LoginState(isLoading = true, savedEmail = savedEmail, rememberMe = true)
-                    when (val r = archiveOrgSource.login(savedEmail, savedPassword)) {
+                    when (val r = remoteSource.login(savedEmail, savedPassword)) {
                         is LoginResult.Success -> _state.value = LoginState(isLoggedIn = true, savedEmail = savedEmail, rememberMe = true)
                         is LoginResult.Failed -> _state.value = LoginState(savedEmail = savedEmail, rememberMe = true, error = "Auto-login failed: ${r.message}")
                     }
@@ -80,7 +80,7 @@ class LoginViewModel @Inject constructor(
         viewModelScope.launch {
             _state.value = _state.value.copy(isLoading = true, error = "")
             try {
-                when (val r = archiveOrgSource.login(email, password)) {
+                when (val r = remoteSource.login(email, password)) {
                     is LoginResult.Success -> {
                         authStore.saveCredentials(email, password, rememberMe)
                         _state.value = _state.value.copy(isLoggedIn = true, isLoading = false, rememberMe = rememberMe)
@@ -125,7 +125,7 @@ fun LoginScreen(onLoggedIn: () -> Unit, onSkip: () -> Unit = onLoggedIn, viewMod
                 OutlinedTextField(
                     value = email, onValueChange = { email = it },
                     label = { Text("Email address") },
-                    supportingText = { Text("Case-sensitive  —  matches your IA account exactly", style = MaterialTheme.typography.labelSmall) },
+                    supportingText = { Text("Case-sensitive  —  matches your account exactly", style = MaterialTheme.typography.labelSmall) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email, imeAction = ImeAction.Next),

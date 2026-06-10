@@ -17,7 +17,7 @@ EmuHelper is a generic, **source-agnostic** download and transfer manager for An
 
 It ships with **no endpoints and no content**. The "bring-your-own-endpoints" model is the whole idea: EmuHelper is the machinery for browsing and retrieving large files; *what* you point it at is entirely up to you and supplied at build time.
 
-> **Status: Early / Alpha — v0.1.4.** Still new and actively being built. Expect rough edges, and please file issues.
+> **Status: Early / Alpha — v0.1.6.** Still new and actively being built. Expect rough edges, and please file issues.
 
 ---
 
@@ -104,9 +104,39 @@ Output APK: `app/build/outputs/apk/debug/app-debug.apk`. Or just open the projec
 
 ---
 
+## ❓ FAQ
+
+**Does it come with any download sources?**
+No. EmuHelper ships with **no endpoints and no content**. You supply your own endpoints at build time.
+
+**Why isn't `Catalog.kt` in the repository?**
+Endpoints are operator-supplied. Keeping them out of version control is deliberate, so every clone starts from an empty, buildable project. You generate `Catalog.kt` from the committed template.
+
+**Can I build it without setting up any endpoints?**
+Yes. Clone, copy the template to `Catalog.kt`, and run `./gradlew :app:assembleDebug`. The app runs fine with empty lists — entries only appear once you add your own endpoints.
+
+**What permissions does it need?**
+Internet access, notification permission (Android 13+), and Storage Access Framework (SAF) access to a folder you pick. Nothing more.
+
+---
+
+## 🗺️ Roadmap
+
+EmuHelper is actively developed. Things on the horizon:
+
+- In-app update check so you always know when a new release is out
+- Download history and a completed-transfers log
+- Richer notification controls (pause / cancel from the shade)
+- In-app theme selection (light / dark / system)
+- Per-list management (rename, sort) and quality-of-life polish across the UI
+
+Have an idea? Open a [feature request](https://github.com/mayusi/EmuHelper/issues/new/choose).
+
+---
+
 ## 🤝 Contributing & issues
 
-This is an early alpha, and feedback is genuinely welcome. Bug reports, reproduction steps, and feature ideas all help — please open an [issue](https://github.com/mayusi/EmuHelper/issues). If you'd like to send a fix, small focused pull requests are easiest to review.
+This is an early alpha, and feedback is genuinely welcome. Bug reports, reproduction steps, and feature ideas all help — please open an [issue](https://github.com/mayusi/EmuHelper/issues). See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, and [CHANGELOG.md](CHANGELOG.md) for the release history. If you'd like to send a fix, small focused pull requests are easiest to review.
 
 ---
 

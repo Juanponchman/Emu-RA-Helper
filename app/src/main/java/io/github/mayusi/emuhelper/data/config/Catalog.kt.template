@@ -5,14 +5,14 @@
  *  To build EmuHelper you must create the real source list:
  *
  *      1. Copy this file to `Catalog.kt` in the same directory.
- *      2. Fill in the `IA_LINKS` map below with the download URLs for the
- *         collections you want the app to scan.
+ *      2. Fill in the `IA_LINKS` map below with the endpoint URLs you configure
+ *         for each platform key.
  *
  *  `Catalog.kt` is git-ignored on purpose so that source URLs are NOT published
- *  in the repository. Everything else (console metadata, colours, ordering, and
+ *  in the repository. Everything else (platform metadata, colours, ordering, and
  *  the helper functions) is shared here and can be used as-is.
  *
- *  Each entry maps a console key to a list of "download endpoint" URLs that
+ *  Each entry maps a platform key to a list of "download endpoint" URLs that
  *  return a directory listing / metadata the scanner can read. Example shape:
  *
  *      "snes" to listOf(
@@ -25,10 +25,10 @@ package io.github.mayusi.emuhelper.data.config
 object Catalog {
 
     /**
-     * Console key -> list of source URLs the scanner reads.
+     * Platform key -> list of endpoint URLs you configure for the scanner.
      *
      * LEFT EMPTY IN THE TEMPLATE. Add your own sources in your local `Catalog.kt`.
-     * The app compiles and runs with empty lists; consoles simply report zero
+     * The app compiles and runs with empty lists; platforms simply report zero
      * sources until you populate them.
      */
     val IA_LINKS: Map<String, List<String>> = mapOf(
@@ -59,7 +59,7 @@ object Catalog {
         CONSOLES[consoleKey]?.folder ?: consoleKey.ifBlank { "Other" }.uppercase()
 
     /**
-     * Best-effort reverse lookup: which console key owns a given source identifier.
+     * Best-effort reverse lookup: which platform key owns a given source identifier.
      * Used only for older saved lists whose games predate the stored `console` field.
      */
     fun consoleForIdentifier(identifier: String): String? {
@@ -73,29 +73,29 @@ object Catalog {
     }
 
     val CONSOLES: Map<String, ConsoleDesc> = mapOf(
-        "ps1"       to ConsoleDesc("ps1",       "PS1 - PlayStation",   "PS1",        "DuckStation"),
-        "ps2"       to ConsoleDesc("ps2",       "PS2 - PlayStation 2", "PS2",        "AetherSX2"),
-        "psp"       to ConsoleDesc("psp",       "PSP",                 "PSP",        "PPSSPP"),
-        "wii"       to ConsoleDesc("wii",       "Wii",                 "Wii",        "Dolphin"),
-        "wiiu"      to ConsoleDesc("wiiu",      "Wii U",               "Wii U",      "Cemu Android"),
-        "3ds"       to ConsoleDesc("3ds",       "3DS",                 "3DS",        "Citra"),
-        "ds"        to ConsoleDesc("ds",        "DS",                  "DS",         "Drastic"),
-        "snes"      to ConsoleDesc("snes",      "SNES",                "SNES",       "Snes9x"),
-        "gba"       to ConsoleDesc("gba",       "Game Boy Advance",    "GBA",        "mGBA"),
-        "gb"        to ConsoleDesc("gb",        "Game Boy / Color",    "GB",         "mGBA"),
-        "genesis"   to ConsoleDesc("genesis",   "Genesis",             "Genesis",    "MD.emu"),
-        "dreamcast" to ConsoleDesc("dreamcast", "Dreamcast",           "Dreamcast",  "Flycast"),
-        "saturn"    to ConsoleDesc("saturn",    "Saturn",              "Saturn",     "YabaSanshiro"),
-        "arcade"    to ConsoleDesc("arcade",    "Arcade",              "Arcade",     "MAME4droid"),
-        "vita"      to ConsoleDesc("vita",      "PS Vita",             "Vita",       "Vita3K"),
-        "bios"      to ConsoleDesc("bios",      "BIOS / Firmware",     "BIOS",       "All emulators"),
-        "switch"    to ConsoleDesc("switch",    "Nintendo Switch",     "Switch",     "Yuzu"),
-        "n64"       to ConsoleDesc("n64",       "Nintendo 64",         "N64",        "Mupen64Plus"),
-        "gcn"       to ConsoleDesc("gcn",       "GameCube",            "GameCube",   "Dolphin"),
-        "gamecube"  to ConsoleDesc("gamecube",  "GameCube",            "GameCube",   "Dolphin"),
-        "xbox"      to ConsoleDesc("xbox",      "Xbox",                "XBOX",       "Xemu"),
-        "xbox360"   to ConsoleDesc("xbox360",   "Xbox 360",            "XBOX360",    "Xenia"),
-        "retro"     to ConsoleDesc("retro",     "Retro",               "Retro",      "Various"),
+        "ps1"       to ConsoleDesc("ps1",       "PS1 - PlayStation",   "PS1",        ""),
+        "ps2"       to ConsoleDesc("ps2",       "PS2 - PlayStation 2", "PS2",        ""),
+        "psp"       to ConsoleDesc("psp",       "PSP",                 "PSP",        ""),
+        "wii"       to ConsoleDesc("wii",       "Wii",                 "Wii",        ""),
+        "wiiu"      to ConsoleDesc("wiiu",      "Wii U",               "Wii U",      ""),
+        "3ds"       to ConsoleDesc("3ds",       "3DS",                 "3DS",        ""),
+        "ds"        to ConsoleDesc("ds",        "DS",                  "DS",         ""),
+        "snes"      to ConsoleDesc("snes",      "SNES",                "SNES",       ""),
+        "gba"       to ConsoleDesc("gba",       "Game Boy Advance",    "GBA",        ""),
+        "gb"        to ConsoleDesc("gb",        "Game Boy / Color",    "GB",         ""),
+        "genesis"   to ConsoleDesc("genesis",   "Genesis",             "Genesis",    ""),
+        "dreamcast" to ConsoleDesc("dreamcast", "Dreamcast",           "Dreamcast",  ""),
+        "saturn"    to ConsoleDesc("saturn",    "Saturn",              "Saturn",     ""),
+        "arcade"    to ConsoleDesc("arcade",    "Arcade",              "Arcade",     ""),
+        "vita"      to ConsoleDesc("vita",      "PS Vita",             "Vita",       ""),
+        "bios"      to ConsoleDesc("bios",      "System Files",        "System",     ""),
+        "switch"    to ConsoleDesc("switch",    "Switch",              "Switch",     ""),
+        "n64"       to ConsoleDesc("n64",       "Nintendo 64",         "N64",        ""),
+        "gcn"       to ConsoleDesc("gcn",       "GameCube",            "GameCube",   ""),
+        "gamecube"  to ConsoleDesc("gamecube",  "GameCube",            "GameCube",   ""),
+        "xbox"      to ConsoleDesc("xbox",      "Xbox",                "XBOX",       ""),
+        "xbox360"   to ConsoleDesc("xbox360",   "Xbox 360",            "XBOX360",    ""),
+        "retro"     to ConsoleDesc("retro",     "Retro",               "Retro",      ""),
     )
 
     val CONSOLE_COLORS: Map<String, Long> = mapOf(
