@@ -4,6 +4,16 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.2.1] — 2026-06-11
+
+### Added
+- Re-download from history: tap a past download to fetch it again.
+- Search and sort in the saved-list library, plus a creation date on each list.
+- Settings: "Reset to defaults" for speed controls and a Storage section to
+  view, change, or revert the download folder.
+- A confirmation prompt before downloading a batch that may not fit in the
+  available space, and a rough scan-size hint when choosing categories.
+
 ## [0.2.0] — 2026-06-11
 
 ### Performance
