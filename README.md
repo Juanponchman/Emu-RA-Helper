@@ -17,7 +17,7 @@ EmuHelper is a generic, **source-agnostic** download and transfer manager for An
 
 It ships with **no endpoints and no content**. The "bring-your-own-endpoints" model is the whole idea: EmuHelper is the machinery for browsing and retrieving large files; *what* you point it at is entirely up to you and supplied at build time.
 
-> **Status: Early / Alpha — v0.1.7.** Still new and actively being built. Expect rough edges, and please file issues.
+> **Status: Early / Alpha — v0.1.8.** Still new and actively being built. Expect rough edges, and please file issues.
 
 ---
 
@@ -122,13 +122,13 @@ Internet access, notification permission (Android 13+), and Storage Access Frame
 
 ## 🗺️ Roadmap
 
-EmuHelper is actively developed. Things on the horizon:
+EmuHelper is actively developed. Recently shipped: in-app updates (with patch notes and one-tap install), download history, notification controls, an in-app theme toggle, and per-list management.
 
-- In-app update check so you always know when a new release is out
-- Download history and a completed-transfers log
-- Richer notification controls (pause / cancel from the shade)
-- In-app theme selection (light / dark / system)
-- Per-list management (rename, sort) and quality-of-life polish across the UI
+On the horizon:
+
+- List sorting and search within large lists
+- Smarter transfer scheduling and retry behavior
+- Continued UI and accessibility polish
 
 Have an idea? Open a [feature request](https://github.com/mayusi/EmuHelper/issues/new/choose).
 

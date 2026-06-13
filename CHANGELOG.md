@@ -4,6 +4,17 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.1.8] — 2026-06-11
+
+### Added
+- **In-app updates** — the update system now shows the new release's patch
+  notes inside the app, downloads the new build with a progress bar, and hands
+  it to the installer so you can update without leaving the app. Routes you to
+  grant install permission if needed, and falls back to opening the release page
+  if a build has no installable asset.
+- A dismissed update is remembered per version, so it won't keep re-appearing
+  until a newer release is out.
+
 ## [0.1.7] — 2026-06-11
 
 ### Added
