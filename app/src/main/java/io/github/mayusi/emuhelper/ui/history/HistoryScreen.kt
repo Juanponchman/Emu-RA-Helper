@@ -127,13 +127,17 @@ fun HistoryScreen(
                 }
             }
         } else {
-            // Group entries by relative day label (Today / Yesterday / date)
-            val grouped: List<Pair<String, List<HistoryEntry>>> = remember(entries) {
-                entries.groupBy { relativeDay(it.timestampMillis) }
+            // Group entries by relative day label (Today / Yesterday / date).
+            // B9: Key on absolute date string (yyyy-MM-dd derived from the earliest timestamp
+            // in each group) so LazyColumn keys remain stable across midnight rollover — the
+            // visible label is still relative ("Today"/"Yesterday") but the key never changes.
+            val grouped: List<Triple<String, String, List<HistoryEntry>>> = remember(entries) {
+                // Group by absolute date string for stable keys.
+                val absDateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                entries.groupBy { absDateFmt.format(Date(it.timestampMillis)) }
                     .entries
-                    .map { (k, v) -> Pair(k, v) }
-                    // Keep order: Today first, then Yesterday, then older (already newest-first from store)
-                    .sortedByDescending { (_, list) -> list.maxOf { it.timestampMillis } }
+                    .map { (absDate, list) -> Triple(absDate, relativeDay(list.maxOf { it.timestampMillis }), list) }
+                    .sortedByDescending { (_, _, list) -> list.maxOf { it.timestampMillis } }
             }
 
             LazyColumn(
@@ -141,8 +145,9 @@ fun HistoryScreen(
                 contentPadding = PaddingValues(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                grouped.forEach { (dayLabel, dayEntries) ->
-                    item(key = "header_$dayLabel") {
+                grouped.forEach { (absDate, dayLabel, dayEntries) ->
+                    // B9: key on absolute date, not relative label.
+                    item(key = "header_$absDate") {
                         Text(
                             dayLabel,
                             style = MaterialTheme.typography.labelLarge,
@@ -150,7 +155,7 @@ fun HistoryScreen(
                             modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
                         )
                     }
-                    items(dayEntries, key = { "${it.timestampMillis}_${it.filename}" }) { entry ->
+                    items(dayEntries, key = { entry -> "${entry.timestampMillis}_${entry.filename}" }) { entry ->
                         HistoryEntryCard(entry, Modifier.animateItem())
                     }
                 }

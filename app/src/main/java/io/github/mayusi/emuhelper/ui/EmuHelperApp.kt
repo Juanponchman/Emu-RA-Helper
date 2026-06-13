@@ -22,9 +22,11 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.about.AboutScreen
 import io.github.mayusi.emuhelper.ui.browse.ConsoleSelectScreen
+import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.history.HistoryScreen
 import io.github.mayusi.emuhelper.ui.browse.GamePickerScreen
 import io.github.mayusi.emuhelper.ui.browse.ScanProgressScreen
@@ -90,7 +92,8 @@ object Routes {
 
 @HiltViewModel
 class AppShellViewModel @Inject constructor(
-    private val settings: SettingsStore
+    private val settings: SettingsStore,
+    private val scanStateHolder: ScanStateHolder
 ) : ViewModel() {
     // null = still loading, true/false = known. REACTIVE so completing onboarding
     // immediately flips it (the old one-shot read stayed stale -> onboarding looped).
@@ -105,6 +108,11 @@ class AppShellViewModel @Inject constructor(
 
     fun markDisclaimerSeen() {
         viewModelScope.launch { settings.setSeenSetupDisclaimer(true) }
+    }
+
+    /** Seed an interrupted queue back into the download flow so the user can resume it. */
+    fun seedResumeQueue(games: List<CuratedGame>) {
+        scanStateHolder.downloadQueue.value = games
     }
 }
 
@@ -167,7 +175,13 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
                             navController.navigate(Routes.EMULATOR_SETUP_DISCLAIMER)
                         }
                     },
-                    onAbout = { navController.navigate(Routes.ABOUT) }
+                    onAbout = { navController.navigate(Routes.ABOUT) },
+                    onResume = { queue ->
+                        // Seed the interrupted queue into the download flow, then navigate
+                        // to the preview screen (mirrors how the normal instant-install flow works).
+                        shellVm.seedResumeQueue(queue)
+                        navController.navigate(Routes.DOWNLOAD_PREVIEW)
+                    }
                 )
             }
 

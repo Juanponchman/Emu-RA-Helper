@@ -20,10 +20,14 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.config.Catalog
 import io.github.mayusi.emuhelper.data.model.GameFile
 import io.github.mayusi.emuhelper.data.source.RemoteSource
+import io.github.mayusi.emuhelper.data.storage.HistoryStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withPermit
@@ -59,13 +63,22 @@ data class ScanUiState(
 class BrowseViewModel @Inject constructor(
     application: Application,
     private val source: RemoteSource,
-    private val stateHolder: ScanStateHolder
+    private val stateHolder: ScanStateHolder,
+    historyStore: HistoryStore
 ) : AndroidViewModel(application) {
 
     val scannedFiles: StateFlow<Map<String, List<GameFile>>> = stateHolder.scannedFiles
     val selectedGames: StateFlow<Map<String, MutableSet<String>>> = stateHolder.selectedGames
     val uiState: StateFlow<ScanUiState> = stateHolder.uiState
     val downloadQueue: StateFlow<List<io.github.mayusi.emuhelper.data.model.CuratedGame>> = stateHolder.downloadQueue
+
+    /**
+     * Set of filenames the user has already downloaded (status == "DONE" in history).
+     * Used by [GamePickerScreen] to show a subtle "Already downloaded" badge per row.
+     */
+    val downloadedFilenames: StateFlow<Set<String>> = historyStore.entries
+        .map { entries -> entries.filter { it.status == "DONE" }.map { it.filename }.toSet() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
 
     fun queueDownloads(games: List<io.github.mayusi.emuhelper.data.model.CuratedGame>) {
         stateHolder.downloadQueue.value = games

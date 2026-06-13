@@ -34,7 +34,12 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
         private const val KEY_REMEMBER = "remember"
     }
 
-    private val prefs: SharedPreferences by lazy {
+    /**
+     * Null when secure storage is unavailable (EncryptedSharedPreferences init failed).
+     * In that state all reads return empty/defaults and all writes are NO-OPS — credentials
+     * are never written to plaintext storage. The user will simply log in fresh each session.
+     */
+    private val prefs: SharedPreferences? by lazy {
         try {
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -47,8 +52,8 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
             )
         } catch (e: Exception) {
-            Log.e("EmuHelper", "EncryptedSharedPreferences init failed; using plain prefs", e)
-            context.getSharedPreferences("emuhelper_secrets_fallback", Context.MODE_PRIVATE)
+            Log.w("EmuHelper", "Secure storage unavailable; credentials will not be persisted this session", e)
+            null // No plaintext fallback — credentials simply won't persist.
         }
     }
 
@@ -59,11 +64,11 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
     private val _remember = MutableStateFlow(readRemember())
     val rememberMe: Flow<Boolean> = _remember.asStateFlow()
 
-    private fun readEmail(): String = try { prefs.getString(KEY_EMAIL, "") ?: "" } catch (e: Exception) { "" }
-    private fun readRemember(): Boolean = try { prefs.getBoolean(KEY_REMEMBER, true) } catch (e: Exception) { true }
+    private fun readEmail(): String = try { prefs?.getString(KEY_EMAIL, "") ?: "" } catch (e: Exception) { "" }
+    private fun readRemember(): Boolean = try { prefs?.getBoolean(KEY_REMEMBER, true) ?: true } catch (e: Exception) { true }
 
     suspend fun getSavedPassword(): String = withContext(Dispatchers.IO) {
-        try { prefs.getString(KEY_PWD, "") ?: "" } catch (e: Exception) { "" }
+        try { prefs?.getString(KEY_PWD, "") ?: "" } catch (e: Exception) { "" }
     }
 
     /** Synchronous email getter for the cold-start auto-login path. */
@@ -72,7 +77,8 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
 
     suspend fun saveCredentials(email: String, password: String, remember: Boolean) {
         withContext(Dispatchers.IO) {
-            prefs.edit().apply {
+            // If secure storage is unavailable, skip persistence — never write to plaintext.
+            prefs?.edit()?.apply {
                 if (remember) {
                     putString(KEY_EMAIL, email)
                     putString(KEY_PWD, password)
@@ -82,7 +88,7 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
                     remove(KEY_PWD)
                     putBoolean(KEY_REMEMBER, false)
                 }
-            }.commit() // commit() (not apply) so it's flushed to disk before we continue
+            }?.commit() // commit() (not apply) so it's flushed to disk before we continue
         }
         _email.value = if (remember) email else ""
         _remember.value = remember
@@ -90,7 +96,7 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
 
     suspend fun clearCredentials() {
         withContext(Dispatchers.IO) {
-            prefs.edit().remove(KEY_EMAIL).remove(KEY_PWD).putBoolean(KEY_REMEMBER, false).commit()
+            prefs?.edit()?.remove(KEY_EMAIL)?.remove(KEY_PWD)?.putBoolean(KEY_REMEMBER, false)?.commit()
         }
         _email.value = ""
         _remember.value = false

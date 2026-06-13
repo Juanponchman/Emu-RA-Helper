@@ -21,6 +21,7 @@ import io.github.mayusi.emuhelper.data.source.SpeedResult
 import io.github.mayusi.emuhelper.data.source.SpeedTester
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
+import io.github.mayusi.emuhelper.ui.common.appVersionString
 import io.github.mayusi.emuhelper.ui.theme.ThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -86,13 +87,7 @@ fun SettingsScreen(
     val device = remember { viewModel.device }
 
     val context = LocalContext.current
-    val appVersion = remember {
-        try {
-            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-            val code = if (android.os.Build.VERSION.SDK_INT >= 28) pInfo.longVersionCode else @Suppress("DEPRECATION") pInfo.versionCode.toLong()
-            "${pInfo.versionName} ($code)"
-        } catch (e: Exception) { "—" }
-    }
+    val appVersion = remember { context.appVersionString(includeCode = true) }
 
     Scaffold(
         topBar = {

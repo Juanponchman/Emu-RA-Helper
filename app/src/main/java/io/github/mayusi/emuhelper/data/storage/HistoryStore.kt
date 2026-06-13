@@ -36,9 +36,10 @@ data class HistoryEntry(
  * - Thread-safe: DataStore serialises all edits internally.
  */
 @Singleton
-class HistoryStore @Inject constructor(@ApplicationContext private val context: Context) {
-
-    private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
+class HistoryStore @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val json: Json
+) {
 
     companion object {
         private val KEY_HISTORY = stringPreferencesKey("download_history_v1")

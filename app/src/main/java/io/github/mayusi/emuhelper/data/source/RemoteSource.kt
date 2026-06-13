@@ -1,6 +1,7 @@
 package io.github.mayusi.emuhelper.data.source
 
 import android.util.Log
+import io.github.mayusi.emuhelper.BuildConfig
 import io.github.mayusi.emuhelper.data.model.GameFile
 import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import kotlinx.coroutines.CancellationException
@@ -91,7 +92,7 @@ class RemoteSource @Inject constructor(
             for (attempt in 0 until 4) {
                 val (code, body) = postCreds()
                 lastCode = code
-                Log.i("EmuHelper", "login attempt $attempt: code=$code hasCookies=${cookieJar.hasCookies()}")
+                if (BuildConfig.DEBUG) { Log.i("EmuHelper", "login attempt $attempt: code=$code hasCookies=${cookieJar.hasCookies()}") }
 
                 if (cookieJar.hasCookies()) {
                     return@withContext LoginResult.Success
@@ -228,16 +229,6 @@ class RemoteSource @Inject constructor(
             val root = json.parseToJsonElement(body).jsonObject
             val files = root["files"]?.jsonArray
                 ?: throw IOException("Item '$identifier' has no files (may be dead or restricted)")
-
-            // ---- DIAGNOSTIC: sample the first few raw entries ----
-            files.take(3).forEachIndexed { i, f ->
-                val obj = f.jsonObject
-                val n = obj["name"]?.jsonPrimitive?.content
-                val s = obj["size"]?.jsonPrimitive?.content
-                val src = obj["source"]?.jsonPrimitive?.content
-                Log.i("EmuHelper", "scan/$identifier  sample[$i]: name=$n size=$s source=$src")
-            }
-            // -----------------------------------------------------
 
             val kept = files.mapNotNull { f ->
                 val obj = f.jsonObject
@@ -536,8 +527,6 @@ class RemoteSource @Inject constructor(
         }
     }
 }
-
-data class DownloadFileProgress(val bytesDownloaded: Long, val bytesPerSecond: Double, val complete: Boolean = false)
 
 sealed class LoginResult {
     data object Success : LoginResult()

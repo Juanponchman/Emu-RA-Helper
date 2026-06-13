@@ -25,9 +25,10 @@ private val Context.gameListStore: DataStore<Preferences> by preferencesDataStor
  * at this scale. The same JSON encoding is reused for file export/import.
  */
 @Singleton
-class GameListStore @Inject constructor(@ApplicationContext private val context: Context) {
-
-    private val json = Json { ignoreUnknownKeys = true; prettyPrint = false }
+class GameListStore @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val json: Json
+) {
 
     companion object {
         private val KEY_LISTS = stringPreferencesKey("game_lists_v1")

@@ -1,6 +1,5 @@
 package io.github.mayusi.emuhelper.ui.common
 
-import androidx.compose.ui.graphics.Color
 import java.io.File
 
 fun formatSize(bytes: Long): String {
@@ -38,13 +37,6 @@ fun cleanGameName(filename: String): String {
     return name.trim()
 }
 
-fun getBaseGameName(name: String): String {
-    var base = Regex("\\s+(I{2,}|IV|V|X|2|3|4|5|6|7|8|9|10)\\s*$", RegexOption.IGNORE_CASE).replace(name.trim(), "")
-    base = Regex("\\s+Part\\s+\\d+\\s*$", RegexOption.IGNORE_CASE).replace(base, "")
-    base = Regex("\\s+Episode\\s+\\d+\\s*$", RegexOption.IGNORE_CASE).replace(base, "")
-    return base.trim()
-}
-
 /** Coarse region bucket parsed from a filename's tags. */
 enum class Region { USA, EUR, JPN, OTHER }
 
@@ -58,18 +50,3 @@ fun detectRegion(filename: String): Region {
     }
 }
 
-fun getConsoleColor(consoleKey: String): Color {
-    return when (consoleKey) {
-        "ps1" -> Color(0xFF89b4fa)
-        "ps2" -> Color(0xFFcba6f7)
-        "psp" -> Color(0xFFf5c2e7)
-        "wii", "wiiu", "3ds", "ds", "gcn", "gamecube" -> Color(0xFF94e2d5)
-        "snes" -> Color(0xFFfab387)
-        "genesis" -> Color(0xFFf9e2af)
-        "dreamcast" -> Color(0xFF74c7ec)
-        "saturn" -> Color(0xFF89dceb)
-        "arcade" -> Color(0xFFf38ba8)
-        "vita" -> Color(0xFFf5c2e7)
-        else -> Color(0xFF6c7086)
-    }
-}

@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.NewReleases
 import androidx.compose.material.icons.filled.PhoneAndroid
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -34,12 +35,14 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.source.AppUpdater
 import io.github.mayusi.emuhelper.data.source.LoginResult
 import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.data.source.UpdateChecker
 import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.data.storage.GameListStore
+import io.github.mayusi.emuhelper.data.storage.QueueStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import io.github.mayusi.emuhelper.ui.common.Dimens
@@ -52,6 +55,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
@@ -64,7 +68,8 @@ class HomeViewModel @Inject constructor(
     private val source: RemoteSource,
     private val cookieJar: PersistentCookieJar,
     private val updateChecker: UpdateChecker,
-    private val appUpdater: AppUpdater
+    private val appUpdater: AppUpdater,
+    private val queueStore: QueueStore
 ) : ViewModel() {
 
     data class HomeUi(val listCount: Int = 0, val loggedIn: Boolean = false, val email: String = "")
@@ -79,7 +84,18 @@ class HomeViewModel @Inject constructor(
     val dismissedUpdateTag: StateFlow<String> = settings.dismissedUpdateTag
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
+    /** The interrupted batch queue, if any. Non-empty only when the app was killed mid-batch. */
+    val pendingQueue: StateFlow<List<CuratedGame>> = queueStore.pendingQueue
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** User dismissed the resume banner — clear the persisted queue. */
+    fun dismissQueue() {
+        viewModelScope.launch { queueStore.clear() }
+    }
+
     private var downloadedApkFile: File? = null
+    // B3: Keep a reference to the in-flight download job so cancelDownload() can cancel it.
+    private var downloadJob: Job? = null
 
     val ui: StateFlow<HomeUi> = combine(
         listStore.lists,
@@ -123,8 +139,6 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun refreshLogin() { /* cookieJar.loggedIn updates itself */ }
-
     fun logout() {
         viewModelScope.launch {
             authStore.clearCredentials()
@@ -140,13 +154,23 @@ class HomeViewModel @Inject constructor(
         viewModelScope.launch { settings.setDismissedUpdateTag(tag) }
     }
 
-    fun startDownload(apkUrl: String, apkSize: Long) {
+    fun startDownload(apkUrl: String, apkSize: Long, expectedSha256: String? = null) {
         if (_updateFlow.value is UpdateFlowState.Downloading) return
         _updateFlow.value = UpdateFlowState.Downloading(0f)
         downloadedApkFile = null
-        viewModelScope.launch {
-            val file = appUpdater.downloadApk(apkUrl, apkSize) { progress ->
-                _updateFlow.value = UpdateFlowState.Downloading(progress)
+        // B3: Store the Job so cancelDownload() can cancel it.
+        downloadJob = viewModelScope.launch {
+            val file = try {
+                // B3/B7: downloadApk uses withContext(IO); structured cancellation interrupts
+                // the read loop. AppUpdater.downloadApk deletes the partial file on its own
+                // IOException/Exception paths. On CancellationException the partial file is
+                // also cleaned up inside downloadApk's finally block (added in B7 fix).
+                appUpdater.downloadApk(apkUrl, apkSize, expectedSha256) { progress ->
+                    _updateFlow.value = UpdateFlowState.Downloading(progress)
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Cancelled by cancelDownload() — flow already reset there; just return.
+                return@launch
             }
             if (file != null) {
                 downloadedApkFile = file
@@ -155,6 +179,13 @@ class HomeViewModel @Inject constructor(
                 _updateFlow.value = UpdateFlowState.Error("Download failed. Check your connection and try again.")
             }
         }
+    }
+
+    /** B3: Cancel the in-flight download and reset the dialog to Idle. */
+    fun cancelDownload() {
+        downloadJob?.cancel()
+        downloadJob = null
+        _updateFlow.value = UpdateFlowState.Idle
     }
 
     fun installDownloadedApk() {
@@ -191,12 +222,16 @@ fun HomeScreen(
     onOpenDownloads: () -> Unit = {},
     onEmulatorSetup: () -> Unit = {},
     onAbout: () -> Unit = {},
+    /** Called when the user taps "Resume" on the interrupted-batch banner.
+     *  The queue is already seeded into [ScanStateHolder.downloadQueue] before this fires. */
+    onResume: ((List<CuratedGame>) -> Unit)? = null,
     viewModel: HomeViewModel = hiltViewModel()
 ) {
     val ui by viewModel.ui.collectAsState()
     val updateInfo by viewModel.updateInfo.collectAsState()
     val updateFlow by viewModel.updateFlow.collectAsState()
     val dismissedTag by viewModel.dismissedUpdateTag.collectAsState()
+    val pendingQueue by viewModel.pendingQueue.collectAsState()
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
@@ -204,9 +239,6 @@ fun HomeScreen(
     // Compute whether the banner should be visible.
     val info = updateInfo
     val bannerVisible = info != null && info.isNewer && dismissedTag != info.latestTag
-
-    // Re-check login whenever Home becomes the active screen again.
-    LaunchedEffect(Unit) { viewModel.refreshLogin() }
 
     val folderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -232,12 +264,14 @@ fun HomeScreen(
             flowState = updateFlow,
             onDownload = {
                 val url = info.apkUrl ?: return@UpdateDialog
-                viewModel.startDownload(url, info.apkSize)
+                // B3: thread SHA-256 from UpdateInfo into the download call.
+                viewModel.startDownload(url, info.apkSize, info.apkSha256)
             },
             onInstall = { viewModel.installDownloadedApk() },
             onDismiss = {
+                // B3: cancel any in-flight download when the dialog is dismissed.
+                viewModel.cancelDownload()
                 showUpdateDialog = false
-                viewModel.resetUpdateFlow()
             }
         )
     }
@@ -348,6 +382,56 @@ fun HomeScreen(
                                 Icons.Default.Close,
                                 contentDescription = "Dismiss",
                                 tint = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            // Resume interrupted batch banner — shown when there's a saved queue and no
+            // download is currently running (isRunning would mean we're already active).
+            if (pendingQueue.isNotEmpty() && onResume != null) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
+                    shape = MaterialTheme.shapes.small
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.CardPadding, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(Dimens.IconSmall + 4.dp)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Resume interrupted download? (${pendingQueue.size} item${if (pendingQueue.size != 1) "s" else ""})",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "A previous batch was interrupted",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                            )
+                        }
+                        TextButton(onClick = { onResume(pendingQueue) }) {
+                            Text("Resume", color = MaterialTheme.colorScheme.onSecondaryContainer)
+                        }
+                        IconButton(
+                            onClick = { viewModel.dismissQueue() },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = "Dismiss",
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f),
                                 modifier = Modifier.size(18.dp)
                             )
                         }

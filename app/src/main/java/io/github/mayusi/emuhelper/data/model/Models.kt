@@ -21,7 +21,18 @@ data class CuratedGame(
     /** Platform key (e.g. "snes", "gcn") so downloads can be filed into a per-platform
      *  subfolder. Defaulted for backward-compat with lists exported before this field. */
     val console: String = ""
-) : Serializable
+) : Serializable {
+    /**
+     * Stable composite key distinguishing games across consoles.
+     * Deduplicated from 3 inline usages:
+     *   - DownloadPreviewViewModel.keyOf()  (private fun on line ~51)
+     *   - DownloadPreviewScreen ~126        (inline: "${it.identifier}/${it.filename}")
+     *   - DownloadPreviewScreen ~207        (LazyColumn key lambda)
+     *   - DownloadPreviewScreen ~212        (isOn check)
+     * Adopt by replacing `"${g.identifier}/${g.filename}"` with `g.key`.
+     */
+    val key: String get() = "$identifier/$filename"
+}
 
 /**
  * A named, reusable selection of games the user can build once and download later.

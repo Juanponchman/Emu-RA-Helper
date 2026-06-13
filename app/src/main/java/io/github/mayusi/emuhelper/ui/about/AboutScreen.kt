@@ -30,6 +30,7 @@ import io.github.mayusi.emuhelper.data.source.AppUpdater
 import io.github.mayusi.emuhelper.data.source.UpdateChecker
 import io.github.mayusi.emuhelper.ui.common.UpdateDialog
 import io.github.mayusi.emuhelper.ui.common.UpdateFlowState
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +59,8 @@ class AboutViewModel @Inject constructor(
     val updateFlow: StateFlow<UpdateFlowState> = _updateFlow.asStateFlow()
 
     private var downloadedApkFile: File? = null
+    // B3: Keep a reference to the in-flight download job so cancelDownload() can cancel it.
+    private var downloadJob: Job? = null
 
     fun checkForUpdates(currentVersion: String) {
         if (_updateState.value is UpdateState.Checking) return
@@ -72,13 +75,18 @@ class AboutViewModel @Inject constructor(
         }
     }
 
-    fun startDownload(apkUrl: String, apkSize: Long) {
+    fun startDownload(apkUrl: String, apkSize: Long, expectedSha256: String? = null) {
         if (_updateFlow.value is UpdateFlowState.Downloading) return
         _updateFlow.value = UpdateFlowState.Downloading(0f)
         downloadedApkFile = null
-        viewModelScope.launch {
-            val file = appUpdater.downloadApk(apkUrl, apkSize) { progress ->
-                _updateFlow.value = UpdateFlowState.Downloading(progress)
+        // B3: Store the Job so cancelDownload() can cancel it.
+        downloadJob = viewModelScope.launch {
+            val file = try {
+                appUpdater.downloadApk(apkUrl, apkSize, expectedSha256) { progress ->
+                    _updateFlow.value = UpdateFlowState.Downloading(progress)
+                }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                return@launch
             }
             if (file != null) {
                 downloadedApkFile = file
@@ -87,6 +95,13 @@ class AboutViewModel @Inject constructor(
                 _updateFlow.value = UpdateFlowState.Error("Download failed. Check your connection and try again.")
             }
         }
+    }
+
+    /** B3: Cancel the in-flight download and reset the dialog to Idle. */
+    fun cancelDownload() {
+        downloadJob?.cancel()
+        downloadJob = null
+        _updateFlow.value = UpdateFlowState.Idle
     }
 
     fun installDownloadedApk() {
@@ -145,12 +160,14 @@ fun AboutScreen(
             flowState = updateFlow,
             onDownload = {
                 val url = availableState.info.apkUrl ?: return@UpdateDialog
-                viewModel.startDownload(url, availableState.info.apkSize)
+                // B3: thread SHA-256 from UpdateInfo into the download call.
+                viewModel.startDownload(url, availableState.info.apkSize, availableState.info.apkSha256)
             },
             onInstall = { viewModel.installDownloadedApk() },
             onDismiss = {
+                // B3: cancel any in-flight download when the dialog is dismissed.
+                viewModel.cancelDownload()
                 showUpdateDialog = false
-                viewModel.resetUpdateFlow()
             }
         )
     }

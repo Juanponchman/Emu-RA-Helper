@@ -7,18 +7,23 @@ import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.model.GameList
 import io.github.mayusi.emuhelper.data.storage.GameListStore
 import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.util.UUID
 import javax.inject.Inject
 
 @HiltViewModel
 class ListViewModel @Inject constructor(
     private val store: GameListStore,
-    private val scanState: ScanStateHolder
+    private val scanState: ScanStateHolder,
+    private val okHttpClient: OkHttpClient
 ) : ViewModel() {
 
     val lists: StateFlow<List<GameList>> =
@@ -79,6 +84,49 @@ class ListViewModel @Inject constructor(
         viewModelScope.launch {
             store.save(copy)
             _message.value = "Imported \"${copy.name}\" (${copy.count} games)."
+        }
+    }
+
+    /**
+     * Fetch a JSON list from [url] and import it.
+     * - Only http/https schemes are permitted.
+     * - A cookie-jar-free OkHttpClient is used so session cookies are never sent to
+     *   arbitrary hosts.
+     * - Runs on [Dispatchers.IO]; calls [onResult] on the main thread with
+     *   (true, successMsg) or (false, errorMsg).
+     */
+    fun importFromUrl(url: String, onResult: (Boolean, String) -> Unit) {
+        val scheme = url.trim().substringBefore("://").lowercase()
+        if (scheme != "http" && scheme != "https") {
+            onResult(false, "Only http/https URLs are supported.")
+            return
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                try {
+                    // Use a new client without the session cookie jar so no cookies
+                    // are sent to (or stored from) arbitrary third-party hosts.
+                    val safeClient = okHttpClient.newBuilder()
+                        .cookieJar(okhttp3.CookieJar.NO_COOKIES)
+                        .build()
+                    val request = Request.Builder().url(url.trim()).get().build()
+                    safeClient.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) {
+                            return@withContext false to "Server returned ${response.code}."
+                        }
+                        val body = response.body?.string()
+                            ?: return@withContext false to "Empty response from server."
+                        val parsed = store.decodeOne(body)
+                            ?: return@withContext false to "Couldn't parse the list at that URL."
+                        val copy = parsed.copy(id = UUID.randomUUID().toString(), createdAt = System.currentTimeMillis())
+                        store.save(copy)
+                        true to "Imported \"${copy.name}\" (${copy.count} items)."
+                    }
+                } catch (e: Exception) {
+                    false to "Network error: ${e.message ?: e.javaClass.simpleName}"
+                }
+            }
+            onResult(result.first, result.second)
         }
     }
 }

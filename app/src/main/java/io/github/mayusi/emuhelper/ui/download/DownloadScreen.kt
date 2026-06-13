@@ -41,9 +41,9 @@ import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatEta
 import io.github.mayusi.emuhelper.ui.common.formatSize
 import io.github.mayusi.emuhelper.ui.common.formatSpeed
-import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -69,11 +69,10 @@ class DownloadViewModel @Inject constructor(
     val isRunning = manager.isRunning
     val isPaused = manager.isPaused
 
-    val customFolder = MutableStateFlow<Uri?>(null)
-
-    init {
-        viewModelScope.launch { customFolder.value = settings.downloadFolder.first() }
-    }
+    // B10: Use stateIn so the persisted folder value is reflected immediately on first
+    // frame — no async-init race that briefly shows null while the launch{} completes.
+    val customFolder: StateFlow<Uri?> = settings.downloadFolder
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     fun start(games: List<CuratedGame>) = manager.start(games)
     fun cancelAll() = manager.cancelAll()
@@ -87,7 +86,8 @@ class DownloadViewModel @Inject constructor(
     }
 
     fun setFolder(uri: Uri?) {
-        customFolder.value = uri
+        // B10: customFolder is now driven by stateIn from settings; just persist to DataStore
+        // and the StateFlow will update automatically.
         viewModelScope.launch { settings.setDownloadFolder(uri) }
     }
 }
@@ -110,6 +110,9 @@ fun DownloadScreen(
     val isPaused by viewModel.isPaused.collectAsState()
     val customFolder by viewModel.customFolder.collectAsState()
     val context = LocalContext.current
+    // B11: Snackbar host for transient "open folder" error feedback.
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
     val folderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -145,6 +148,7 @@ fun DownloadScreen(
     LaunchedEffect(games) { if (tasks.isEmpty() && games.isNotEmpty()) viewModel.start(games) }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text("Downloads", style = MaterialTheme.typography.titleLarge) },
@@ -253,19 +257,29 @@ fun DownloadScreen(
                     customFolder?.let { folderUri ->
                         OutlinedButton(
                             onClick = {
+                                var opened = false
                                 try {
                                     val intent = Intent(Intent.ACTION_VIEW).apply {
                                         setDataAndType(folderUri, DocumentsContract.Document.MIME_TYPE_DIR)
                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                     }
                                     context.startActivity(intent)
-                                } catch (e: Exception) {
+                                    opened = true
+                                } catch (_: Exception) { /* try fallback */ }
+                                if (!opened) {
                                     // Fallback: open the system Downloads/Files app.
                                     try {
                                         context.startActivity(
                                             Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS)
                                         )
-                                    } catch (_: Exception) {}
+                                        opened = true
+                                    } catch (_: Exception) { /* both paths failed */ }
+                                }
+                                // B11: Surface a brief message if neither intent resolved.
+                                if (!opened) {
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar("Couldn't open folder")
+                                    }
                                 }
                             },
                             modifier = Modifier.weight(1f)

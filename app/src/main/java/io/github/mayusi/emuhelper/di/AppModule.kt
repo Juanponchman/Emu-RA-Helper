@@ -12,6 +12,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.json.Json
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.HttpUrl
@@ -57,9 +58,14 @@ class PersistentCookieJar(context: Context) : CookieJar {
     // KeyStore op, so we never want it on the main thread. Both the initial load
     // and every persist run on a background thread.
     private val appContext = context.applicationContext
-    private val prefs: SharedPreferences by lazy { openPrefs(appContext) }
+    private val prefs: SharedPreferences? by lazy { openPrefs(appContext) }
 
-    private fun openPrefs(ctx: Context): SharedPreferences = try {
+    /**
+     * Returns an EncryptedSharedPreferences for cookie persistence, or null if secure
+     * storage is unavailable. In the null case cookies are held only in memory for the
+     * session and are never written to plaintext storage.
+     */
+    private fun openPrefs(ctx: Context): SharedPreferences? = try {
         val masterKey = MasterKey.Builder(ctx)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
@@ -71,8 +77,8 @@ class PersistentCookieJar(context: Context) : CookieJar {
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         )
     } catch (e: Exception) {
-        Log.e("EmuHelper", "Encrypted cookie store init failed; using plain prefs", e)
-        ctx.getSharedPreferences("emuhelper_cookies_fallback", Context.MODE_PRIVATE)
+        Log.w("EmuHelper", "Secure cookie store unavailable; cookies will not persist this session", e)
+        null // No plaintext fallback — cookies stay in-memory only.
     }
 
     init {
@@ -102,6 +108,12 @@ class PersistentCookieJar(context: Context) : CookieJar {
     override fun loadForRequest(url: HttpUrl): List<Cookie> {
         val now = System.currentTimeMillis()
         val host = url.host
+        // Defense in depth: only send cookies to archive.org and its CDN subdomains.
+        // This ensures session cookies never travel to github.com or any other host,
+        // even if a misconfigured client instance has the cookie jar attached.
+        val isArchiveHost = host == "archive.org" || host.endsWith(".archive.org")
+        if (!isArchiveHost) return emptyList()
+
         val result = ArrayList<Cookie>(store.size)
         val expiredNames = ArrayList<String>()
         for ((name, cookie) in store) {
@@ -123,7 +135,7 @@ class PersistentCookieJar(context: Context) : CookieJar {
         store.clear() // in-memory flips immediately so hasCookies() is correct now
         refreshLoggedIn()
         Thread {
-            try { prefs.edit().remove(KEY_COOKIES).apply() } catch (_: Exception) {}
+            try { prefs?.edit()?.remove(KEY_COOKIES)?.apply() } catch (_: Exception) {}
         }.apply { isDaemon = true; start() }
     }
 
@@ -150,12 +162,13 @@ class PersistentCookieJar(context: Context) : CookieJar {
 
     private fun persistToDisk() {
         try {
+            val p = prefs ?: return // secure storage unavailable — skip persistence
             val now = System.currentTimeMillis()
             val serialized = store.values
                 .filter { it.expiresAt > now && it.persistent } // only durable cookies worth restoring
                 .map { serialize(it) }
                 .toSet()
-            prefs.edit().putStringSet(KEY_COOKIES, serialized).apply()
+            p.edit().putStringSet(KEY_COOKIES, serialized).apply()
         } catch (e: Exception) {
             Log.w("EmuHelper", "Persisting cookies failed", e)
         }
@@ -163,8 +176,9 @@ class PersistentCookieJar(context: Context) : CookieJar {
 
     private fun loadFromDisk() {
         try {
+            val p = prefs ?: return // secure storage unavailable — nothing to load
             val now = System.currentTimeMillis()
-            val saved = prefs.getStringSet(KEY_COOKIES, emptySet()) ?: emptySet()
+            val saved = p.getStringSet(KEY_COOKIES, emptySet()) ?: emptySet()
             for (line in saved) {
                 val c = deserialize(line) ?: continue
                 if (c.expiresAt > now) store[c.name] = c
@@ -212,6 +226,15 @@ class PersistentCookieJar(context: Context) : CookieJar {
 @Module
 @InstallIn(SingletonComponent::class)
 object AppModule {
+
+    /**
+     * Shared [Json] instance for DataStore serialisation (GameListStore, HistoryStore).
+     * Uses [ignoreUnknownKeys] so both stores can evolve their models without breaking
+     * existing persisted data.
+     */
+    @Provides
+    @Singleton
+    fun provideJson(): Json = Json { ignoreUnknownKeys = true; prettyPrint = false }
 
     @Provides
     @Singleton

@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -45,11 +46,15 @@ private enum class SizeBucket(val label: String, val minBytes: Long, val maxByte
 
 private enum class SelFilter { ALL, ONLY_SELECTED, HIDE_SELECTED }
 
+private const val ALL_CONSOLES_KEY = "__all__"
+
 private data class PickRow(
     val display: String,
     val displayLower: String,
     val region: Region,
-    val file: GameFile
+    val file: GameFile,
+    /** Non-null only when currentConsole == ALL_CONSOLES_KEY; holds the console key the file came from. */
+    val consoleKey: String? = null
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,6 +68,7 @@ fun GamePickerScreen(
     val scannedFiles by viewModel.scannedFiles.collectAsState()
     val selectedGames by viewModel.selectedGames.collectAsState()
     val scanState by viewModel.uiState.collectAsState()
+    val downloadedFilenames by viewModel.downloadedFilenames.collectAsState()
     var currentConsole by remember { mutableStateOf("") }
     var searchQuery by remember { mutableStateOf("") }
     // Filter / sort state
@@ -73,11 +79,22 @@ fun GamePickerScreen(
     var sizeMenuOpen by remember { mutableStateOf(false) }
     var sortMenuOpen by remember { mutableStateOf(false) }
     LaunchedEffect(scannedFiles.keys) {
-        if (currentConsole.isBlank() || currentConsole !in scannedFiles) {
+        // Keep ALL_CONSOLES_KEY as a valid selection; only reset when the chosen
+        // console key disappears AND it isn't the synthetic "All" entry.
+        if (currentConsole.isBlank() ||
+            (currentConsole != ALL_CONSOLES_KEY && currentConsole !in scannedFiles)
+        ) {
             currentConsole = scannedFiles.keys.firstOrNull() ?: ""
         }
     }
-    val files = scannedFiles[currentConsole] ?: emptyList()
+
+    // In "All" mode flatten every console's list; otherwise scope to the selected console.
+    val isAllMode = currentConsole == ALL_CONSOLES_KEY
+    val files: List<GameFile> = if (isAllMode) {
+        remember(scannedFiles) { scannedFiles.values.flatten() }
+    } else {
+        scannedFiles[currentConsole] ?: emptyList()
+    }
 
     // Debounce search query to avoid filtering on every keystroke
     var debouncedQuery by remember { mutableStateOf("") }
@@ -86,11 +103,23 @@ fun GamePickerScreen(
         debouncedQuery = searchQuery.trim().lowercase()
     }
 
-    // Precompute expensive operations (cleanGameName, detectRegion, lowercase) once per file list
-    val precomputed = remember(files) {
-        files.map { f ->
-            val name = cleanGameName(f.filename)
-            PickRow(name, name.lowercase(), detectRegion(f.filename), f)
+    // Precompute expensive operations (cleanGameName, detectRegion, lowercase) once per file list.
+    // In "All" mode we also record which console each file came from so rows can show a label.
+    val precomputed = if (isAllMode) {
+        remember(scannedFiles) {
+            scannedFiles.entries.flatMap { (consoleKey, list) ->
+                list.map { f ->
+                    val name = cleanGameName(f.filename)
+                    PickRow(name, name.lowercase(), detectRegion(f.filename), f, consoleKey)
+                }
+            }
+        }
+    } else {
+        remember(files) {
+            files.map { f ->
+                val name = cleanGameName(f.filename)
+                PickRow(name, name.lowercase(), detectRegion(f.filename), f)
+            }
         }
     }
 
@@ -145,8 +174,20 @@ fun GamePickerScreen(
                         Text("${scannedFiles.values.sumOf { it.size }} total files", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        TextButton(onClick = { viewModel.selectAll(currentConsole, files) }) { Text("All") }
-                        TextButton(onClick = { viewModel.selectNone(currentConsole) }) { Text("None") }
+                        TextButton(onClick = {
+                            if (isAllMode) {
+                                scannedFiles.forEach { (c, fl) -> viewModel.selectAll(c, fl) }
+                            } else {
+                                viewModel.selectAll(currentConsole, files)
+                            }
+                        }) { Text("All") }
+                        TextButton(onClick = {
+                            if (isAllMode) {
+                                scannedFiles.keys.forEach { viewModel.selectNone(it) }
+                            } else {
+                                viewModel.selectNone(currentConsole)
+                            }
+                        }) { Text("None") }
                     }
                     Button(
                         onClick = {
@@ -174,15 +215,21 @@ fun GamePickerScreen(
         Row(modifier = Modifier.fillMaxSize().padding(padding)) {
             // Console sidebar — a LazyColumn so it SCROLLS when many consoles were
             // scanned (a plain Column overflowed and couldn't scroll past ~5).
-            val consoleKeys = remember(scannedFiles.keys) { scannedFiles.keys.sorted() }
+            // The first entry is a synthetic "All" that combines every console's files.
+            val consoleKeys = remember(scannedFiles.keys) {
+                listOf(ALL_CONSOLES_KEY) + scannedFiles.keys.sorted()
+            }
             LazyColumn(
                 modifier = Modifier.width(Dimens.SidebarWidth).fillMaxHeight().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
                 contentPadding = PaddingValues(6.dp),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 items(consoleKeys, key = { it }) { console ->
-                    val count = scannedFiles[console]?.size ?: 0
-                    val sel = selectedGames[console]?.size ?: 0
+                    val isAll = console == ALL_CONSOLES_KEY
+                    val count = if (isAll) scannedFiles.values.sumOf { it.size }
+                               else scannedFiles[console]?.size ?: 0
+                    val sel = if (isAll) selectedGames.values.sumOf { it.size }
+                              else selectedGames[console]?.size ?: 0
                     val active = console == currentConsole
                     val backgroundColor by animateColorAsState(
                         targetValue = if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
@@ -194,8 +241,16 @@ fun GamePickerScreen(
                         shape = MaterialTheme.shapes.extraSmall
                     ) {
                         Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
-                            Text(Catalog.CONSOLES[console]?.display ?: console, style = MaterialTheme.typography.bodyMedium, color = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface)
-                            Text("$sel / $count", style = MaterialTheme.typography.labelSmall, color = if (active) MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                if (isAll) "All" else (Catalog.CONSOLES[console]?.display ?: console),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                "$sel / $count",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (active) MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }
@@ -211,7 +266,12 @@ fun GamePickerScreen(
                 )
 
                 // ---- Filter / sort bar (scrolls horizontally) ----
-                val selectedSet = selectedGames[currentConsole] ?: emptySet()
+                // In All-mode we check the per-console selected maps together.
+                val selectedSet: Set<String> = if (isAllMode) {
+                    remember(selectedGames) { selectedGames.values.fold(mutableSetOf<String>()) { acc, s -> acc.also { it.addAll(s) } } }
+                } else {
+                    selectedGames[currentConsole] ?: emptySet()
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth()
                         .horizontalScroll(rememberScrollState())
@@ -281,7 +341,7 @@ fun GamePickerScreen(
                 }
                 Spacer(Modifier.height(4.dp))
 
-                val filtered = remember(precomputed, debouncedQuery, regionFilter, sizeBucket, selFilter, sortMode, selectedSet) {
+                val filtered = remember(precomputed, debouncedQuery, regionFilter, sizeBucket, selFilter, sortMode, selectedSet, isAllMode) {
                     var seq = precomputed.asSequence()
                         .filter { debouncedQuery.isEmpty() || debouncedQuery in it.displayLower }
                     if (regionFilter.isNotEmpty()) {
@@ -350,23 +410,51 @@ fun GamePickerScreen(
                     items(filtered) { row ->
                         val displayName = row.display
                         val file = row.file
-                        val sel = file.filename in (selectedGames[currentConsole] ?: emptySet())
+                        // In All mode each row carries its owning console key; fall back to currentConsole.
+                        val rowConsole = if (isAllMode) row.consoleKey ?: "" else currentConsole
+                        val sel = file.filename in (selectedGames[rowConsole] ?: emptySet())
                         val backgroundColor by animateColorAsState(
                             targetValue = if (sel) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f) else MaterialTheme.colorScheme.surface,
                             animationSpec = tween(durationMillis = 150)
                         )
+                        val alreadyDownloaded = file.filename in downloadedFilenames
                         Surface(
-                            modifier = Modifier.fillMaxWidth().animateItem().clickable { viewModel.toggleGame(currentConsole, file.filename) },
+                            modifier = Modifier.fillMaxWidth().animateItem().clickable { viewModel.toggleGame(rowConsole, file.filename) },
                             color = backgroundColor,
                             shape = MaterialTheme.shapes.small
                         ) {
                             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Checkbox(checked = sel, onCheckedChange = { viewModel.toggleGame(currentConsole, file.filename) }, modifier = Modifier.padding(end = 6.dp))
+                                Checkbox(checked = sel, onCheckedChange = { viewModel.toggleGame(rowConsole, file.filename) }, modifier = Modifier.padding(end = 6.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(displayName, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text(file.filename, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(file.filename, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                        // In All mode show a small console tag so the user knows where each item comes from.
+                                        if (isAllMode && row.consoleKey != null) {
+                                            val consoleLabel = Catalog.CONSOLES[row.consoleKey]?.display ?: row.consoleKey
+                                            Text(
+                                                consoleLabel,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier
+                                                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f), MaterialTheme.shapes.extraSmall)
+                                                    .padding(horizontal = 4.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
                                 }
                                 Text(formatSize(file.size), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp))
+                                // "Already downloaded" badge — subtle icon shown when this file
+                                // appears in the user's download history with status DONE.
+                                if (alreadyDownloaded) {
+                                    Spacer(Modifier.width(4.dp))
+                                    Icon(
+                                        Icons.Default.CheckCircle,
+                                        contentDescription = "Already downloaded",
+                                        tint = MaterialTheme.colorScheme.tertiary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
                     }

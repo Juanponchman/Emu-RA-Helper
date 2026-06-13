@@ -39,7 +39,8 @@ sealed class UpdateFlowState {
  *                      the download and emit [UpdateFlowState.Downloading] progress.
  * @param onInstall     Called when download finished and user taps "Install". ViewModel
  *                      should invoke [AppUpdater.installApk].
- * @param onDismiss     Called when the user taps "Later" or closes the dialog.
+ * @param onDismiss     Called when the user taps "Later" or closes the dialog (also cancels
+ *                      any in-flight download via the ViewModel before this is called).
  */
 @Composable
 fun UpdateDialog(
@@ -56,8 +57,9 @@ fun UpdateDialog(
     val isError = flowState is UpdateFlowState.Error
     val readyToInstall = flowState == UpdateFlowState.Installing || isInstalling
 
+    // B3: Allow dismissal during download — onDismiss is responsible for cancelling.
     AlertDialog(
-        onDismissRequest = { if (!isDownloading) onDismiss() },
+        onDismissRequest = { onDismiss() },
         title = { Text("Update available: ${info.latestTag}") },
         text = {
             Column(
@@ -143,8 +145,8 @@ fun UpdateDialog(
                         }
                     }
                     isDownloading -> {
-                        // Downloading — show cancel/wait.
-                        TextButton(onClick = onDismiss, enabled = false) { Text("Update now") }
+                        // B3: Show an active Cancel button during download so the user isn't locked in.
+                        OutlinedButton(onClick = onDismiss) { Text("Cancel") }
                     }
                     flowState is UpdateFlowState.Installing || isNeedsPermission -> {
                         Button(onClick = onInstall) { Text("Install") }
@@ -182,6 +184,8 @@ fun UpdateDialog(
             }
         },
         dismissButton = {
+            // B3: Always show a dismiss option; during download the confirm-area Cancel
+            // button already handles cancellation, so hide the redundant "Later" there.
             if (!isDownloading) {
                 TextButton(onClick = onDismiss) { Text("Later") }
             }

@@ -41,13 +41,15 @@ class SpeedTester @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val okHttpClient: OkHttpClient
 ) {
-    // A neutral, content-agnostic throughput endpoint (Cloudflare's speed-test
-    // service returns a stream of N bytes). Using this instead of a real content
-    // source keeps the measurement independent of any download collection.
-    private val testUrl = "https://speed.cloudflare.com/__down?bytes=104857600" // 100 MB
+    companion object {
+        // A neutral, content-agnostic throughput endpoint (Cloudflare's speed-test
+        // service returns a stream of N bytes). Using this instead of a real content
+        // source keeps the measurement independent of any download collection.
+        private const val TEST_URL = "https://speed.cloudflare.com/__down?bytes=104857600" // 100 MB
+    }
 
     suspend fun run(connections: Int = 6, budgetMs: Long = 6000): SpeedResult = withContext(Dispatchers.IO) {
-        val url = testUrl
+        val url = TEST_URL
 
         val totalBytes = java.util.concurrent.atomic.AtomicLong(0)
         val start = System.currentTimeMillis()

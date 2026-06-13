@@ -12,6 +12,7 @@ import io.github.mayusi.emuhelper.data.model.DownloadStatus
 import io.github.mayusi.emuhelper.data.model.DownloadTask
 import io.github.mayusi.emuhelper.data.storage.HistoryEntry
 import io.github.mayusi.emuhelper.data.storage.HistoryStore
+import io.github.mayusi.emuhelper.data.storage.QueueStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -26,6 +27,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.zip.ZipInputStream
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -47,7 +50,8 @@ class DownloadManager @Inject constructor(
     @ApplicationContext private val appContext: Context,
     private val source: RemoteSource,
     private val settings: SettingsStore,
-    private val historyStore: HistoryStore
+    private val historyStore: HistoryStore,
+    private val queueStore: QueueStore
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -68,8 +72,9 @@ class DownloadManager @Inject constructor(
 
     @Volatile private var cancelRequested = false
     private var batchJob: Job? = null
-    /** Guards against double-recording history for the same batch. */
-    @Volatile private var batchHistoryRecorded = false
+    /** Guards against double-recording history for the same batch. AtomicBoolean + CAS so
+     *  concurrent callers (batch-end path and clear()) never double-record. */
+    private val batchHistoryRecorded = AtomicBoolean(false)
 
     /** Caller-tunable. Loaded from settings on each start(). */
     @Volatile private var segmentsPerFile = 4
@@ -87,15 +92,22 @@ class DownloadManager @Inject constructor(
     @Volatile private var smoothedSpeed = 0.0
 
     fun start(games: List<CuratedGame>) {
-        if (_isRunning.value) return
-        if (games.isEmpty()) return
-        _isRunning.value = true
+        // B2: Atomic check-and-set prevents two concurrent callers (e.g. LaunchedEffect
+        // refiring) from both passing the guard and spinning up duplicate batch jobs.
+        synchronized(this) {
+            if (_isRunning.value) return
+            if (games.isEmpty()) return
+            _isRunning.value = true
+        }
         _isPaused.value = false
         cancelRequested = false
-        batchHistoryRecorded = false
+        batchHistoryRecorded.set(false)
         DownloadService.start(appContext)
 
         batchJob = scope.launch {
+            // Persist the queue immediately so a force-close/crash/reboot doesn't lose it.
+            // Cleared only when the batch completes successfully (below) or clear() is called.
+            launch { queueStore.save(games) }
             val chosenUri = settings.downloadFolder.first()
             // Clamp to SAFE ceilings. Files-at-once is the dangerous multiplier, so cap
             // it low (downloads are network-bound; 2-3 files saturates the source host).
@@ -111,33 +123,13 @@ class DownloadManager @Inject constructor(
             val defaultRoot = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "ROMs")
                 .apply { mkdirs() }
 
-            // Upfront SAF permission check: if the user picked a custom folder but the
-            // persisted grant was revoked (or the folder is no longer writable), every
-            // file would otherwise download fully to cache and only THEN fail at the
-            // copy step with "Could not create file in chosen folder". Detect that here
-            // and abort the whole batch with one clear message instead of N late failures.
-            if (chosenUri != null) {
-                val grantHeld = try {
-                    appContext.contentResolver.persistedUriPermissions.any {
-                        it.uri == chosenUri && it.isWritePermission
-                    }
-                } catch (e: Exception) {
-                    Log.w("EmuHelper", "Checking persisted URI permissions failed", e)
-                    false
-                }
-                val writable = try {
-                    grantHeld && customRoot?.canWrite() == true
-                } catch (e: Exception) {
-                    Log.w("EmuHelper", "Checking folder writability failed", e)
-                    false
-                }
-                if (!writable) {
-                    _statusText.value =
-                        "Storage folder access was lost — please re-pick your download folder in the menu."
-                    _isRunning.value = false
-                    DownloadService.stop(appContext)
-                    return@launch
-                }
+            // Upfront SAF permission check via shared helper (also used by retry()).
+            val permError = checkFolderPermission(chosenUri)
+            if (permError != null) {
+                _statusText.value = permError
+                _isRunning.value = false
+                DownloadService.stop(appContext)
+                return@launch
             }
 
             val taskList = games.map { g ->
@@ -174,33 +166,95 @@ class DownloadManager @Inject constructor(
                 else -> "Done: $done · Failed: $failed"
             }
             recordBatchHistory(_tasks.value)
+            // Clear the persisted queue — batch reached its terminal state successfully,
+            // so there is nothing to resume. An interrupted batch (app killed mid-batch)
+            // leaves the queue set because this line is never reached.
+            queueStore.clear()
             _isRunning.value = false
             DownloadService.stop(appContext)
         }
     }
 
     fun retry(taskId: String) {
-        updateTask(taskId) {
-            if (it.status != DownloadStatus.FAILED && it.status != DownloadStatus.CANCELLED) it
-            else it.copy(status = DownloadStatus.QUEUED, downloaded = 0, speed = 0.0, error = "")
+        // B1: Snapshot status BEFORE mutating, then guard on the original value.
+        // Wrap the whole check-and-launch block in synchronized so rapid double-taps
+        // can't both pass the guard and spawn duplicate coroutines.
+        val shouldLaunch: Boolean
+        synchronized(this) {
+            val originalStatus = _tasks.value.firstOrNull { it.id == taskId }?.status ?: return
+            // Only retry tasks that were genuinely terminal.
+            if (originalStatus != DownloadStatus.FAILED && originalStatus != DownloadStatus.CANCELLED) return
+            // Mark as queued now, while holding the lock.
+            updateTask(taskId) {
+                it.copy(status = DownloadStatus.QUEUED, downloaded = 0, speed = 0.0, error = "")
+            }
+            shouldLaunch = !_isRunning.value
+            if (shouldLaunch) {
+                _isRunning.value = true
+                cancelRequested = false
+            }
         }
-        val t = _tasks.value.firstOrNull { it.id == taskId } ?: return
-        if (t.status != DownloadStatus.QUEUED) return
-
-        if (!_isRunning.value) { _isRunning.value = true; cancelRequested = false; DownloadService.start(appContext) }
+        if (shouldLaunch) DownloadService.start(appContext)
         scope.launch {
             val chosenUri = settings.downloadFolder.first()
+            // B11: Re-run the SAF folder-permission check before re-downloading.
+            val permError = checkFolderPermission(chosenUri)
+            if (permError != null) {
+                updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, error = permError) }
+                synchronized(this@DownloadManager) {
+                    if (_tasks.value.none {
+                            it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED
+                        }
+                    ) {
+                        _isRunning.value = false
+                        DownloadService.stop(appContext)
+                    }
+                }
+                return@launch
+            }
             val customRoot = chosenUri?.let { DocumentFile.fromTreeUri(appContext, it) }
             val defaultRoot = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "ROMs").apply { mkdirs() }
             try {
                 downloadOne(taskId, customRoot, defaultRoot)
             } finally {
-                if (_tasks.value.none { it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED }) {
-                    _isRunning.value = false
-                    DownloadService.stop(appContext)
+                synchronized(this@DownloadManager) {
+                    if (_tasks.value.none {
+                            it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED
+                        }
+                    ) {
+                        _isRunning.value = false
+                        DownloadService.stop(appContext)
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * B11 / B2 helper: verify that the persisted SAF folder grant is still held and the
+     * folder is writable. Returns a human-readable error string if something is wrong,
+     * or null if everything is fine (including when no custom folder is set).
+     */
+    private fun checkFolderPermission(chosenUri: android.net.Uri?): String? {
+        if (chosenUri == null) return null
+        val grantHeld = try {
+            appContext.contentResolver.persistedUriPermissions.any {
+                it.uri == chosenUri && it.isWritePermission
+            }
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "Checking persisted URI permissions failed", e)
+            false
+        }
+        val writable = try {
+            val root = DocumentFile.fromTreeUri(appContext, chosenUri)
+            grantHeld && root?.canWrite() == true
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "Checking folder writability failed", e)
+            false
+        }
+        return if (!writable)
+            "Storage folder access was lost — please re-pick your download folder in the menu."
+        else null
     }
 
     fun pause() {
@@ -222,19 +276,30 @@ class DownloadManager @Inject constructor(
     /** Reset visible state when the user leaves a finished batch. */
     fun clear() {
         if (_isRunning.value) return
-        // Record any terminal tasks not yet captured at batch-complete time (e.g. partial
-        // retry batches, or if the user cancels mid-way and taps Done).
+        // B4: Attempt to record history via the same CAS guard used at batch-end.
+        // If batch-end already recorded, the CAS in recordBatchHistory returns early (no-op).
+        // Reset the AtomicBoolean BEFORE launching so the next batch starts clean,
+        // but only after the snapshot is captured.
         val snapshot = _tasks.value
         if (snapshot.isNotEmpty()) {
-            scope.launch { recordBatchHistory(snapshot) }
+            scope.launch {
+                recordBatchHistory(snapshot)
+                // Also clear persisted queue — if the user explicitly clears a batch
+                // (even a cancelled one), there is nothing meaningful to resume.
+                queueStore.clear()
+            }
         }
+        // Reset AFTER launch so the coroutine above can still CAS-acquire the guard.
+        // The next call to start() resets the flag at its own start, so this reset is
+        // a belt-and-suspenders safety net for the edge case where the app never calls
+        // start() again before another clear().
+        batchHistoryRecorded.set(false)
         _tasks.value = emptyList()
         _statusText.value = "Preparing..."
         _totalProgress.value = 0f
         _totalSpeed.value = 0.0
         _eta.value = "--"
         smoothedSpeed = 0.0
-        batchHistoryRecorded = false
     }
 
     // ---- one file ---------------------------------------------------------
@@ -300,7 +365,14 @@ class DownloadManager @Inject constructor(
         } catch (e: Exception) {
             Log.w("EmuHelper", "Download failed: $filename", e)
             cacheFile.delete()
-            updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, speed = 0.0, error = e.message ?: e.javaClass.simpleName) }
+            // B11: Detect out-of-disk-space and surface a clear message.
+            val errorMessage = if (e is IOException) {
+                val msg = e.message ?: ""
+                if (msg.contains("ENOSPC", ignoreCase = true) || msg.contains("No space", ignoreCase = true))
+                    "Storage full — free some space and retry"
+                else msg.ifBlank { e.javaClass.simpleName }
+            } else e.message ?: e.javaClass.simpleName
+            updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, speed = 0.0, error = errorMessage) }
         }
     }
 
@@ -366,6 +438,22 @@ class DownloadManager @Inject constructor(
                             val relativePath = entry.name.split('/').filter { it.isNotEmpty() && it != ".." }
                                 .joinToString("/")
                             val outFile = File(File(defaultRootBase, subfolder), relativePath)
+                            // Canonical-path zip-slip guard: verify the resolved path stays
+                            // inside the intended destination directory before writing.
+                            val canonicalOut = try { outFile.canonicalPath } catch (e: java.io.IOException) {
+                                Log.w("EmuHelper", "zip: canonicalPath failed for ${entry.name}, skipping", e)
+                                zis.closeEntry(); entry = zis.nextEntry; continue
+                            }
+                            val canonicalBase = try {
+                                File(defaultRootBase, subfolder).canonicalPath + File.separator
+                            } catch (e: java.io.IOException) {
+                                Log.w("EmuHelper", "zip: canonicalPath for base failed, skipping entry", e)
+                                zis.closeEntry(); entry = zis.nextEntry; continue
+                            }
+                            if (!canonicalOut.startsWith(canonicalBase)) {
+                                Log.w("EmuHelper", "zip: path traversal blocked for ${entry.name}")
+                                zis.closeEntry(); entry = zis.nextEntry; continue
+                            }
                             outFile.parentFile?.mkdirs()
                             outFile.outputStream().buffered().use { os ->
                                 zis.copyTo(os, 1 shl 20)
@@ -411,14 +499,15 @@ class DownloadManager @Inject constructor(
      * Records only DONE/FAILED/CANCELLED tasks; skips QUEUED/DOWNLOADING/PAUSED.
      */
     private suspend fun recordBatchHistory(tasks: List<DownloadTask>) {
-        if (batchHistoryRecorded) return
+        // B4: compareAndSet is the single atomic gate — only the first caller records.
+        // Subsequent calls (batch-end racing clear()) are no-ops.
+        if (!batchHistoryRecorded.compareAndSet(false, true)) return
         val terminal = tasks.filter {
             it.status == DownloadStatus.DONE ||
             it.status == DownloadStatus.FAILED ||
             it.status == DownloadStatus.CANCELLED
         }
         if (terminal.isEmpty()) return
-        batchHistoryRecorded = true
         val now = System.currentTimeMillis()
         val entries = terminal.map { task ->
             HistoryEntry(

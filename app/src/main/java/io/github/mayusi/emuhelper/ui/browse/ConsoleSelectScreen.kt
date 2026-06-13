@@ -14,6 +14,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import io.github.mayusi.emuhelper.data.config.Catalog
 import io.github.mayusi.emuhelper.ui.common.Dimens
+import kotlinx.coroutines.flow.first
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -24,10 +25,12 @@ fun ConsoleSelectScreen(
 ) {
     val consoles = Catalog.DISPLAY_ORDER.filter { it in Catalog.IA_LINKS }
     val selected = remember { mutableStateMapOf<String, Boolean>().also { map -> consoles.forEach { map[it] = false } } }
-    val savedConsoles by viewModel.lastSelectedConsoles.collectAsState()
 
-    // Pre-tick consoles from the saved set on first composition.
-    LaunchedEffect(savedConsoles) {
+    // B8: Apply the saved selection ONCE on first composition only, so subsequent
+    // DataStore emissions don't overwrite the user's in-progress checkbox changes.
+    // LaunchedEffect(Unit) runs exactly once per composition lifecycle.
+    LaunchedEffect(Unit) {
+        val savedConsoles = viewModel.lastSelectedConsoles.first()
         if (savedConsoles.isNotEmpty()) {
             consoles.forEach { console ->
                 selected[console] = console in savedConsoles

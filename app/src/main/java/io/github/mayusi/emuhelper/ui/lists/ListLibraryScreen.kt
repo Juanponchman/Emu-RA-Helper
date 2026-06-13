@@ -65,6 +65,11 @@ fun ListLibraryScreen(
         }
     }
 
+    // Controls the "Import from URL" dialog.
+    var showUrlImportDialog by remember { mutableStateOf(false) }
+    var urlImportText by remember { mutableStateOf("") }
+    var urlImporting by remember { mutableStateOf(false) }
+
     // Holds the list pending deletion; non-null shows the confirmation dialog.
     var deleteTarget by remember { mutableStateOf<GameList?>(null) }
 
@@ -102,6 +107,9 @@ fun ListLibraryScreen(
                         Icon(Icons.Default.FileUpload, contentDescription = "Import list", modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("Import")
+                    }
+                    TextButton(onClick = { urlImportText = ""; showUrlImportDialog = true }) {
+                        Text("URL")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
@@ -254,6 +262,61 @@ fun ListLibraryScreen(
             },
             dismissButton = {
                 TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showUrlImportDialog) {
+        val focusRequester = remember { FocusRequester() }
+        AlertDialog(
+            onDismissRequest = { if (!urlImporting) showUrlImportDialog = false },
+            title = { Text("Import from URL") },
+            text = {
+                Column {
+                    Text(
+                        "Paste a direct link to a .json list file (https://…).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = urlImportText,
+                        onValueChange = { urlImportText = it },
+                        label = { Text("URL") },
+                        placeholder = { Text("https://example.com/mylist.json") },
+                        singleLine = true,
+                        enabled = !urlImporting,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester)
+                    )
+                    if (urlImporting) {
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        urlImporting = true
+                        viewModel.importFromUrl(urlImportText.trim()) { success, msg ->
+                            urlImporting = false
+                            showUrlImportDialog = false
+                            scope.launch { snackbar.showSnackbar(msg) }
+                        }
+                    },
+                    enabled = !urlImporting && urlImportText.trim().let {
+                        it.startsWith("http://") || it.startsWith("https://")
+                    }
+                ) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showUrlImportDialog = false },
+                    enabled = !urlImporting
+                ) { Text("Cancel") }
             }
         )
     }
