@@ -4,6 +4,28 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.1.9] — 2026-06-11
+
+### Security
+- The in-app updater now verifies updates before installing: it only accepts
+  APKs from the official GitHub release host and checks a published SHA-256
+  when available, discarding anything that doesn't match.
+- Stored credentials are never written to unencrypted storage as a fallback.
+- Hardened archive extraction against path-escape, and scoped session cookies
+  strictly to their source.
+
+### Added
+- Resume an interrupted download batch after a crash or restart.
+- "Already downloaded" indicator on files you've fetched before.
+- Search across all scanned categories at once.
+- Import a saved list from a URL.
+
+### Fixed
+- Several download-engine races (duplicate retries, history miscounts).
+- Update download can now be cancelled; partial files are cleaned up.
+- Clear "storage full" message; retry re-checks folder access first.
+- Version comparison handles pre-release tags; assorted UI state fixes.
+
 ## [0.1.8] — 2026-06-11
 
 ### Added
