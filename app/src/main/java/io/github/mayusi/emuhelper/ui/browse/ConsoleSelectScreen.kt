@@ -92,6 +92,11 @@ fun ConsoleSelectScreen(
                 val info = Catalog.CONSOLES[console] ?: return@items
                 val count = Catalog.IA_LINKS[console]?.size ?: 0
                 val checked = selected[console] ?: true
+                val scanHint = when {
+                    count <= 3  -> "quick scan"
+                    count <= 10 -> "medium scan"
+                    else        -> "large scan"
+                }
 
                 Card(
                     modifier = Modifier.fillMaxWidth().animateItem(),
@@ -107,7 +112,11 @@ fun ConsoleSelectScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(info.display, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
-                            Text("${info.emulator}  ·  $count sources", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "${info.emulator}  ·  $count source${if (count != 1) "s" else ""}  ·  $scanHint",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                         // Pass a real onCheckedChange so accessibility services don't read this as disabled
                         Checkbox(checked = checked, onCheckedChange = { selected[console] = it })

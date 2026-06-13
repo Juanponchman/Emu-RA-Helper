@@ -23,9 +23,11 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.storage.HistoryEntry
 import io.github.mayusi.emuhelper.data.storage.HistoryStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
+import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatSize
 import kotlinx.coroutines.flow.SharingStarted
@@ -42,7 +44,8 @@ import javax.inject.Inject
 @HiltViewModel
 class HistoryViewModel @Inject constructor(
     private val historyStore: HistoryStore,
-    private val settings: SettingsStore
+    private val settings: SettingsStore,
+    private val scanStateHolder: ScanStateHolder
 ) : ViewModel() {
 
     val entries: StateFlow<List<HistoryEntry>> = historyStore.entries
@@ -54,6 +57,26 @@ class HistoryViewModel @Inject constructor(
 
     /** Returns the persisted SAF folder URI, or null if none is set. */
     suspend fun downloadFolderUri(): Uri? = settings.downloadFolder.first()
+
+    /**
+     * Seeds [scanStateHolder.downloadQueue] with a single [CuratedGame] reconstructed from
+     * [entry] so the standard Download flow can pick it up. Only meaningful when
+     * [entry.identifier] is non-blank (older entries lack an identifier and cannot be
+     * re-downloaded; the UI should not offer this action for those entries).
+     *
+     * Returns the reconstructed [CuratedGame] for the caller to navigate to DOWNLOAD_PREVIEW.
+     */
+    fun prepareReDownload(entry: HistoryEntry): CuratedGame {
+        val game = CuratedGame(
+            name = entry.name.ifBlank { entry.filename },
+            filename = entry.filename,
+            size = entry.sizeBytes,
+            identifier = entry.identifier,
+            console = entry.console
+        )
+        scanStateHolder.downloadQueue.value = listOf(game)
+        return game
+    }
 }
 
 // ---- date-label helpers --------------------------------------------------
@@ -84,6 +107,9 @@ private fun formatTime(timestampMillis: Long): String =
 @Composable
 fun HistoryScreen(
     onBack: () -> Unit,
+    /** Called after the download queue has been seeded from a history entry; callers should
+     *  navigate to DOWNLOAD_PREVIEW so the user can confirm and start the re-download. */
+    onReDownload: (() -> Unit)? = null,
     viewModel: HistoryViewModel = hiltViewModel()
 ) {
     val entries by viewModel.entries.collectAsState()
@@ -148,6 +174,23 @@ fun HistoryScreen(
                     Icon(Icons.Default.ContentCopy, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("Copy filename")
+                }
+                // Re-download action — only available when the entry has an identifier.
+                // Legacy entries recorded before this field was added will have a blank
+                // identifier and therefore cannot be re-downloaded.
+                if (entry.identifier.isNotBlank() && onReDownload != null) {
+                    TextButton(
+                        onClick = {
+                            actionEntry = null
+                            viewModel.prepareReDownload(entry)
+                            onReDownload()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Refresh, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Re-download")
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
             }

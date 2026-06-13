@@ -11,6 +11,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -129,6 +130,30 @@ fun DownloadPreviewScreen(
         free != null && free > 0 && selSize > (free * 0.95).toLong()
     }
 
+    // U-C: confirmation dialog when tapping Download with a space warning
+    var showSpaceConfirm by remember { mutableStateOf(false) }
+    var pendingConfirmAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    if (showSpaceConfirm) {
+        AlertDialog(
+            onDismissRequest = { showSpaceConfirm = false; pendingConfirmAction = null },
+            title = { Text("Limited storage space") },
+            text = { Text("This may not fit in the available space. Download anyway?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showSpaceConfirm = false
+                    pendingConfirmAction?.invoke()
+                    pendingConfirmAction = null
+                }) { Text("Download anyway") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSpaceConfirm = false; pendingConfirmAction = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -149,6 +174,14 @@ fun DownloadPreviewScreen(
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            if (spaceWarning) {
+                                Icon(
+                                    Icons.Default.Warning,
+                                    contentDescription = "Storage warning",
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                             Text(
                                 "Free: ${formatSize(free)}",
                                 style = MaterialTheme.typography.labelMedium,
@@ -175,8 +208,16 @@ fun DownloadPreviewScreen(
                         }
                         Button(
                             onClick = {
-                                val remaining = viewModel.confirmSelection()
-                                if (remaining > 0) onConfirm(!viewModel.isLoggedIn())
+                                val doConfirm = {
+                                    val remaining = viewModel.confirmSelection()
+                                    if (remaining > 0) onConfirm(!viewModel.isLoggedIn())
+                                }
+                                if (spaceWarning) {
+                                    pendingConfirmAction = doConfirm
+                                    showSpaceConfirm = true
+                                } else {
+                                    doConfirm()
+                                }
                             },
                             enabled = selCount > 0,
                             modifier = Modifier.height(Dimens.ButtonMinHeight),

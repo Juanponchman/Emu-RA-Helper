@@ -331,7 +331,15 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
             }
 
             composable(Routes.HISTORY) {
-                HistoryScreen(onBack = { navController.popBackStack() })
+                HistoryScreen(
+                    onBack = { navController.popBackStack() },
+                    onReDownload = {
+                        // Queue is already seeded by HistoryViewModel.prepareReDownload().
+                        // Navigate to the preview screen so the user can confirm the
+                        // re-download before it starts — same path as a normal download.
+                        navController.navigate(Routes.DOWNLOAD_PREVIEW)
+                    }
+                )
             }
 
             // ---- Emulator Setup -------------------------------------------------

@@ -68,6 +68,11 @@ data class DownloadTask(
     val region: String = "",
     /** Per-platform subfolder name this file is filed under, e.g. "SNES". */
     val subfolder: String = "",
+    /** Platform key (e.g. "snes", "gcn") — carried from [CuratedGame.console] so history can
+     *  reconstruct a [CuratedGame] for re-download without a separate lookup. */
+    val console: String = "",
+    /** Human-readable game name — carried from [CuratedGame.name] for display in history. */
+    val name: String = "",
     val downloaded: Long = 0,
     val speed: Double = 0.0,
     val status: DownloadStatus = DownloadStatus.QUEUED,

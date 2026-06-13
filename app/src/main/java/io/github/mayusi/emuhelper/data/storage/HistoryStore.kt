@@ -25,7 +25,14 @@ data class HistoryEntry(
     val sizeBytes: Long,
     /** String form of [io.github.mayusi.emuhelper.data.model.DownloadStatus], e.g. "DONE" or "FAILED". */
     val status: String,
-    val timestampMillis: Long
+    val timestampMillis: Long,
+    /** Source identifier (e.g. "nointro-snes"). Blank for entries recorded before this field was added.
+     *  When blank, re-download is not offered since there is no identifier to reconstruct a URL. */
+    val identifier: String = "",
+    /** Platform key (e.g. "snes", "gcn"). Blank for legacy entries. */
+    val console: String = "",
+    /** Human-readable game name. Falls back to [filename] in the UI when blank. */
+    val name: String = ""
 )
 
 /**

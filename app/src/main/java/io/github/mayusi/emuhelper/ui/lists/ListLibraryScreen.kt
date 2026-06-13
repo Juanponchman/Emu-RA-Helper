@@ -29,6 +29,13 @@ import io.github.mayusi.emuhelper.data.model.GameList
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatSize
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private enum class ListSortMode { NEWEST, NAME, LARGEST }
+
+private val listDateFmt = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,6 +50,19 @@ fun ListLibraryScreen(
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
+
+    var searchQuery by remember { mutableStateOf("") }
+    var sortMode by remember { mutableStateOf(ListSortMode.NEWEST) }
+
+    val displayedLists = remember(lists, searchQuery, sortMode) {
+        val filtered = if (searchQuery.isBlank()) lists
+        else lists.filter { it.name.contains(searchQuery, ignoreCase = true) }
+        when (sortMode) {
+            ListSortMode.NEWEST  -> filtered.sortedByDescending { it.createdAt }
+            ListSortMode.NAME    -> filtered.sortedBy { it.name.lowercase() }
+            ListSortMode.LARGEST -> filtered.sortedByDescending { it.totalSize }
+        }
+    }
 
     LaunchedEffect(message) {
         if (message.isNotBlank()) {
@@ -158,7 +178,65 @@ fun ListLibraryScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 contentPadding = PaddingValues(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap)
             ) {
-                items(lists, key = { it.id }) { list ->
+                // ---- Search + sort controls ----
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            label = { Text("Search lists") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "Sort:",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FilterChip(
+                                selected = sortMode == ListSortMode.NEWEST,
+                                onClick = { sortMode = ListSortMode.NEWEST },
+                                label = { Text("Newest") },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            )
+                            FilterChip(
+                                selected = sortMode == ListSortMode.NAME,
+                                onClick = { sortMode = ListSortMode.NAME },
+                                label = { Text("Name") },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            )
+                            FilterChip(
+                                selected = sortMode == ListSortMode.LARGEST,
+                                onClick = { sortMode = ListSortMode.LARGEST },
+                                label = { Text("Largest") },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                            )
+                        }
+                        if (displayedLists.isEmpty()) {
+                            Text(
+                                "No lists match \"$searchQuery\".",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        }
+                    }
+                }
+
+                items(displayedLists, key = { it.id }) { list ->
                     var menuOpen by remember { mutableStateOf(false) }
                     Card(
                         modifier = Modifier.fillMaxWidth().animateItem().clickable {
@@ -178,6 +256,11 @@ fun ListLibraryScreen(
                                 Text(
                                     "${list.count} items  ·  ${formatSize(list.totalSize)}",
                                     style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    listDateFmt.format(Date(list.createdAt)),
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }

@@ -152,7 +152,8 @@ class DownloadManager @Inject constructor(
                 DownloadTask(
                     id = "${g.identifier}/${g.filename}",
                     url = url, displayPath = displayPath, filename = safeName,
-                    size = g.size, identifier = g.identifier, relativeName = g.filename, subfolder = subfolder
+                    size = g.size, identifier = g.identifier, relativeName = g.filename,
+                    subfolder = subfolder, console = consoleKey, name = g.name
                 )
             }
             _tasks.value = taskList.sortedBy { it.filename }
@@ -530,7 +531,10 @@ class DownloadManager @Inject constructor(
                 subfolder = task.subfolder,
                 sizeBytes = task.size,
                 status = task.status.name,
-                timestampMillis = now
+                timestampMillis = now,
+                identifier = task.identifier,
+                console = task.console,
+                name = task.name
             )
         }
         historyStore.addAll(entries)

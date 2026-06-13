@@ -1,10 +1,12 @@
 package io.github.mayusi.emuhelper.ui.settings
 
+import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,6 +24,7 @@ import io.github.mayusi.emuhelper.data.source.SpeedTester
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.appVersionString
+import io.github.mayusi.emuhelper.ui.common.rememberFolderPicker
 import io.github.mayusi.emuhelper.ui.theme.ThemeMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,16 +34,30 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+// Defaults read directly from SettingsStore: segments = 16, concurrency = 2
+private const val DEFAULT_SEGMENTS = 16
+private const val DEFAULT_CONCURRENCY = 2
+
+/** Decode a SAF tree URI into a human-readable path for display. */
+private fun decodeDisplayPath(uri: String): String {
+    val s = Uri.decode(uri) ?: uri
+    val marker = "/tree/"
+    val idx = s.indexOf(marker)
+    val tail = if (idx >= 0) s.substring(idx + marker.length) else s
+    return tail.replace("primary:", "Internal/").replace(":", "/")
+}
+
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val settings: SettingsStore,
     private val speedTester: SpeedTester
 ) : ViewModel() {
 
-    val segments: StateFlow<Int> = settings.segments.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 8)
-    val concurrency: StateFlow<Int> = settings.concurrency.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 2)
+    val segments: StateFlow<Int> = settings.segments.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_SEGMENTS)
+    val concurrency: StateFlow<Int> = settings.concurrency.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_CONCURRENCY)
     val extractArchives: StateFlow<Boolean> = settings.extractArchives.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val themeMode: StateFlow<ThemeMode> = settings.themeMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.SYSTEM)
+    val downloadFolder: StateFlow<Uri?> = settings.downloadFolder.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     private val _testing = MutableStateFlow(false)
     val testing: StateFlow<Boolean> = _testing
@@ -55,6 +72,15 @@ class SettingsViewModel @Inject constructor(
     fun setConcurrency(v: Int) { viewModelScope.launch { settings.setConcurrency(v) } }
     fun setExtract(v: Boolean) { viewModelScope.launch { settings.setExtractArchives(v) } }
     fun setThemeMode(mode: ThemeMode) { viewModelScope.launch { settings.setThemeMode(mode) } }
+    fun setFolder(uri: Uri?) { viewModelScope.launch { settings.setDownloadFolder(uri) } }
+
+    /** Reset download-speed settings back to their documented defaults. */
+    fun resetDefaults() {
+        viewModelScope.launch {
+            settings.setSegments(DEFAULT_SEGMENTS)
+            settings.setConcurrency(DEFAULT_CONCURRENCY)
+        }
+    }
 
     fun maxThroughput() {
         viewModelScope.launch {
@@ -93,10 +119,13 @@ fun SettingsScreen(
     val themeMode by viewModel.themeMode.collectAsState()
     val testing by viewModel.testing.collectAsState()
     val result by viewModel.result.collectAsState()
+    val downloadFolder by viewModel.downloadFolder.collectAsState()
     val device = remember { viewModel.device }
 
     val context = LocalContext.current
     val appVersion = remember { context.appVersionString(includeCode = true) }
+
+    val folderPicker = rememberFolderPicker { uri -> viewModel.setFolder(uri) }
 
     Scaffold(
         topBar = {
@@ -160,11 +189,17 @@ fun SettingsScreen(
                     valueRange = 1f..4f, steps = 2
                 )
                 Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = { viewModel.maxThroughput() },
-                    shape = MaterialTheme.shapes.small,
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                ) { Text("Max throughput (16 conns × 2 files)") }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { viewModel.maxThroughput() },
+                        shape = MaterialTheme.shapes.small,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) { Text("Max throughput (16 conns × 2 files)") }
+                    OutlinedButton(
+                        onClick = { viewModel.resetDefaults() },
+                        shape = MaterialTheme.shapes.small
+                    ) { Text("Reset to defaults") }
+                }
                 Text(
                     "Pushes your connection hard. Helps on fast wifi; won't exceed your link's ceiling.",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -183,6 +218,52 @@ fun SettingsScreen(
                         checked = extractArchives,
                         onCheckedChange = { viewModel.setExtract(it) }
                     )
+                }
+            }
+
+            // ---- Storage ----
+            SettingCard(title = "Storage") {
+                val isCustomFolder = downloadFolder != null
+                Text(
+                    "Download folder",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Folder,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = if (isCustomFolder)
+                            decodeDisplayPath(downloadFolder.toString())
+                        else
+                            "App private storage (default)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 2
+                    )
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = { folderPicker.launch(null) },
+                        shape = MaterialTheme.shapes.small
+                    ) { Text("Change folder…") }
+                    if (isCustomFolder) {
+                        TextButton(
+                            onClick = { viewModel.setFolder(null) },
+                            shape = MaterialTheme.shapes.small
+                        ) { Text("Use default folder") }
+                    }
                 }
             }
 
