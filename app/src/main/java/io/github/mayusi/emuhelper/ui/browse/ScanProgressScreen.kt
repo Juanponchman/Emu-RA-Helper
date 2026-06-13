@@ -43,6 +43,17 @@ class ScanStateHolder @Inject constructor() {
     val downloadQueue = MutableStateFlow<List<io.github.mayusi.emuhelper.data.model.CuratedGame>>(emptyList())
     /** Games handed from the picker (BUILD mode) to the Save-list screen. */
     val pendingListGames = MutableStateFlow<List<io.github.mayusi.emuhelper.data.model.CuratedGame>>(emptyList())
+
+    /**
+     * Release the large scannedFiles map (can be 10s of MB) once the user has committed
+     * their selection and the chosen games have been copied into downloadQueue / pendingListGames.
+     * Does NOT touch selectedGames, downloadQueue, or pendingListGames — those are still
+     * needed downstream. scannedFiles is the only scan-only payload worth freeing.
+     */
+    fun clearScan() {
+        scannedFiles.value = emptyMap()
+        selectedGames.value = emptyMap()
+    }
 }
 
 data class ScanFailure(val url: String, val reason: String)
@@ -82,6 +93,9 @@ class BrowseViewModel @Inject constructor(
 
     fun queueDownloads(games: List<io.github.mayusi.emuhelper.data.model.CuratedGame>) {
         stateHolder.downloadQueue.value = games
+        // Free the large scannedFiles map now that the selection has been committed to
+        // downloadQueue. The download flow only needs downloadQueue from here on.
+        stateHolder.clearScan()
     }
 
     fun clearQueue() {
@@ -91,6 +105,9 @@ class BrowseViewModel @Inject constructor(
     /** Hand the picker's current selection to the Save-list screen (BUILD mode). */
     fun stageForSaving(games: List<io.github.mayusi.emuhelper.data.model.CuratedGame>) {
         stateHolder.pendingListGames.value = games
+        // Free the large scannedFiles map now that the selection has been committed to
+        // pendingListGames. The save-list flow only needs pendingListGames from here on.
+        stateHolder.clearScan()
     }
 
     /** Tracks the running scan so a new scan can cancel a stale one (prevents the
@@ -375,7 +392,7 @@ fun ScanProgressScreen(
                 }
                 if (state.failures.size > 5) {
                     Text(
-                        "(and ${state.failures.size - 5} more — see logcat 'EmuHelper')",
+                        "(and ${state.failures.size - 5} more sources unavailable)",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
                     )
@@ -387,6 +404,20 @@ fun ScanProgressScreen(
                     onClick = onScanComplete,
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                 ) { Text("Continue with ${state.totalFiles} files") }
+            }
+            // U4: All-fail dead-end: show back and retry actions when no files were found.
+            if (state.scanComplete && !state.isScanning && state.totalFiles == 0 && state.emptyMessage.isNotBlank()) {
+                Spacer(Modifier.height(Dimens.SectionGap))
+                OutlinedButton(
+                    onClick = onBack,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Go back to select platforms") }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { viewModel.startScan(selectedConsoles) },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) { Text("Retry scan") }
             }
         }
     }

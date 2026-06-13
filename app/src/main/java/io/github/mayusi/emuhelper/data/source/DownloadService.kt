@@ -61,6 +61,15 @@ class DownloadService : Service() {
             ACTION_RESUME   -> { downloadManager.resume();    rebuildNotification(paused = false) }
             ACTION_CANCEL   -> { downloadManager.cancelAll(); return START_NOT_STICKY }
             ACTION_REFRESH  -> { rebuildNotification(paused = downloadManager.isPaused.value) }
+            ACTION_PROGRESS -> {
+                val pct   = intent.getIntExtra(EXTRA_PERCENT, 0)
+                val speed = intent.getStringExtra(EXTRA_SPEED) ?: "--"
+                val done  = intent.getIntExtra(EXTRA_DONE, 0)
+                val total = intent.getIntExtra(EXTRA_TOTAL, 0)
+                ensureChannel(this)
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+                nm.notify(NOTIFICATION_ID, buildProgressNotification(pct, speed, done, total))
+            }
             else            -> { /* normal start */ rebuildNotification(paused = downloadManager.isPaused.value) }
         }
         return START_STICKY
@@ -124,6 +133,41 @@ class DownloadService : Service() {
             .build()
     }
 
+    private fun buildProgressNotification(
+        percent: Int, speed: String, doneCount: Int, totalCount: Int
+    ): Notification {
+        val openPending = PendingIntent.getActivity(
+            this, RC_OPEN,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val pausePending = PendingIntent.getService(
+            this, RC_PAUSE,
+            Intent(this, DownloadService::class.java).putExtra(EXTRA_ACTION, ACTION_PAUSE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val cancelPending = PendingIntent.getService(
+            this, RC_CANCEL,
+            Intent(this, DownloadService::class.java).putExtra(EXTRA_ACTION, ACTION_CANCEL),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val contentText = "$doneCount/$totalCount · $percent% · $speed"
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("EmuHelper")
+            .setContentText(contentText)
+            .setProgress(100, percent, false)
+            .setContentIntent(openPending)
+            .setOngoing(true)
+            .setSilent(true)
+            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(android.R.drawable.ic_media_pause, "Pause", pausePending)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Cancel", cancelPending)
+            .build()
+    }
+
     companion object {
         private const val CHANNEL_ID      = "downloads"
         const val NOTIFICATION_ID         = 42
@@ -135,6 +179,13 @@ class DownloadService : Service() {
         private const val ACTION_CANCEL   = "cancel"
         /** Sent by DownloadManager to refresh the notification label without re-invoking the manager. */
         private const val ACTION_REFRESH  = "refresh"
+        /** Sent by DownloadManager to update live progress. */
+        private const val ACTION_PROGRESS = "progress"
+
+        private const val EXTRA_PERCENT   = "pct"
+        private const val EXTRA_SPEED     = "spd"
+        private const val EXTRA_DONE      = "done"
+        private const val EXTRA_TOTAL     = "total"
 
         // Unique request codes per pending intent (avoids PendingIntent collisions)
         private const val RC_OPEN         = 0
@@ -159,6 +210,26 @@ class DownloadService : Service() {
         fun updatePausedState(context: Context, @Suppress("UNUSED_PARAMETER") paused: Boolean) {
             val intent = Intent(context, DownloadService::class.java)
                 .putExtra(EXTRA_ACTION, ACTION_REFRESH)
+            ContextCompat.startForegroundService(context, intent)
+        }
+
+        /**
+         * Push a live progress update onto the notification. Throttling (to ~once per 1.5–2 s)
+         * is handled by the caller ([DownloadManager]).
+         */
+        fun updateProgress(
+            context: Context,
+            percent: Int,
+            speed: String,
+            doneCount: Int,
+            totalCount: Int
+        ) {
+            val intent = Intent(context, DownloadService::class.java)
+                .putExtra(EXTRA_ACTION,  ACTION_PROGRESS)
+                .putExtra(EXTRA_PERCENT, percent)
+                .putExtra(EXTRA_SPEED,   speed)
+                .putExtra(EXTRA_DONE,    doneCount)
+                .putExtra(EXTRA_TOTAL,   totalCount)
             ContextCompat.startForegroundService(context, intent)
         }
 

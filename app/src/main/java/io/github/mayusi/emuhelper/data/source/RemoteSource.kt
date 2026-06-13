@@ -33,6 +33,16 @@ class RemoteSource @Inject constructor(
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
+    /**
+     * Process-lifetime cache of parsed metadata JSON roots, keyed by identifier.
+     * Eliminates redundant network + parse work when mirrorUrls(), fetchFileList(), and
+     * fetchFileSize() are called for the same identifier during a batch (e.g. mirrorUrls
+     * is called once per file, so a 30-file batch would otherwise hit the endpoint 30×).
+     * ConcurrentHashMap gives thread-safe reads; the putIfAbsent pattern avoids a
+     * double-fetch race while never blocking a reader.
+     */
+    private val metadataCache = java.util.concurrent.ConcurrentHashMap<String, kotlinx.serialization.json.JsonObject>()
+
     companion object {
         private val SKIP_EXTS = setOf(".xml", ".json", ".sqlite", ".txt", ".md", ".torrent", ".log", ".csv", ".pdf", ".jpg", ".png", ".gif", ".ico")
         private const val MIN_FILE_SIZE = 102400L
@@ -144,6 +154,31 @@ class RemoteSource @Inject constructor(
     }
 
     /**
+     * Fetch (or return cached) parsed metadata JSON root for [identifier].
+     * The metadata endpoint is public and the payload is stable within a process lifetime,
+     * so caching aggressively eliminates repeated network + parse overhead during a batch
+     * where mirrorUrls() is called once per file for the same identifier.
+     */
+    private suspend fun fetchMetadata(identifier: String): kotlinx.serialization.json.JsonObject? {
+        metadataCache[identifier]?.let { return it }
+        return try {
+            val req = Request.Builder().url("https://archive.org/metadata/$identifier")
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/json")
+                .build()
+            okHttpClient.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: return null
+                val root = json.parseToJsonElement(body).jsonObject
+                // putIfAbsent so a concurrent caller's result wins safely; either is fine.
+                metadataCache.putIfAbsent(identifier, root) ?: root
+            }
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "fetchMetadata failed for $identifier", e)
+            null
+        }
+    }
+
+    /**
      * All mirror URLs that serve this file. The source host's metadata exposes several
      * hosts per item — the primary `download` endpoint plus direct `d1`/`d2`
      * datanodes and any `workable` CDN nodes. Returning them all lets the downloader
@@ -157,26 +192,21 @@ class RemoteSource @Inject constructor(
         val result = LinkedHashSet<String>()
         result.add("https://archive.org/download/$identifier/$encodedPath")
         try {
-            val req = Request.Builder().url("https://archive.org/metadata/$identifier")
-                .header("User-Agent", USER_AGENT).build()
-            okHttpClient.newCall(req).execute().use { resp ->
-                val body = resp.body?.string() ?: return@use
-                val root = json.parseToJsonElement(body).jsonObject
-                val dir = root["dir"]?.jsonPrimitive?.contentOrNull
-                fun add(host: String?, d: String?) {
-                    if (!host.isNullOrBlank() && !d.isNullOrBlank()) {
-                        result.add("https://$host${d.trimEnd('/')}/$encodedPath")
-                    }
+            val root = fetchMetadata(identifier) ?: return@withContext result.toList()
+            val dir = root["dir"]?.jsonPrimitive?.contentOrNull
+            fun add(host: String?, d: String?) {
+                if (!host.isNullOrBlank() && !d.isNullOrBlank()) {
+                    result.add("https://$host${d.trimEnd('/')}/$encodedPath")
                 }
-                add(root["d1"]?.jsonPrimitive?.contentOrNull, dir)
-                add(root["d2"]?.jsonPrimitive?.contentOrNull, dir)
-                // workable / alternate CDN nodes carry their own dir
-                root["alternate_locations"]?.jsonObject?.get("workable")?.let { wk ->
-                    runCatching {
-                        wk.jsonArray.forEach { node ->
-                            val o = node.jsonObject
-                            add(o["server"]?.jsonPrimitive?.contentOrNull, o["dir"]?.jsonPrimitive?.contentOrNull)
-                        }
+            }
+            add(root["d1"]?.jsonPrimitive?.contentOrNull, dir)
+            add(root["d2"]?.jsonPrimitive?.contentOrNull, dir)
+            // workable / alternate CDN nodes carry their own dir
+            root["alternate_locations"]?.jsonObject?.get("workable")?.let { wk ->
+                runCatching {
+                    wk.jsonArray.forEach { node ->
+                        val o = node.jsonObject
+                        add(o["server"]?.jsonPrimitive?.contentOrNull, o["dir"]?.jsonPrimitive?.contentOrNull)
                     }
                 }
             }
@@ -208,47 +238,50 @@ class RemoteSource @Inject constructor(
      */
     suspend fun fetchFileList(iaUrl: String): List<GameFile> = withContext(Dispatchers.IO) {
         val identifier = getIdentifier(iaUrl)
-        val request = Request.Builder()
-            .url("https://archive.org/metadata/$identifier")
-            .header("User-Agent", USER_AGENT)
-            .header("Accept", "application/json")
-            .build()
-
-        okHttpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code} for $identifier")
+        // Use the shared metadata cache to avoid re-fetching when multiple sources share
+        // the same identifier, and so subsequent mirrorUrls/fetchFileSize calls are free.
+        val root = metadataCache[identifier] ?: run {
+            val request = Request.Builder()
+                .url("https://archive.org/metadata/$identifier")
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", "application/json")
+                .build()
+            okHttpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IOException("HTTP ${response.code} for $identifier")
+                }
+                val body = response.body?.string()
+                    ?: throw IOException("Empty body for $identifier")
+                if (!body.trimStart().startsWith("{")) {
+                    Log.w("EmuHelper", "Non-JSON metadata for $identifier: ${body.take(200)}")
+                    throw IOException("Non-JSON metadata for $identifier")
+                }
+                val parsed = json.parseToJsonElement(body).jsonObject
+                metadataCache.putIfAbsent(identifier, parsed) ?: parsed
             }
-            val body = response.body?.string()
-                ?: throw IOException("Empty body for $identifier")
-
-            if (!body.trimStart().startsWith("{")) {
-                Log.w("EmuHelper", "Non-JSON metadata for $identifier: ${body.take(200)}")
-                throw IOException("Non-JSON metadata for $identifier")
-            }
-
-            val root = json.parseToJsonElement(body).jsonObject
-            val files = root["files"]?.jsonArray
-                ?: throw IOException("Item '$identifier' has no files (may be dead or restricted)")
-
-            val kept = files.mapNotNull { f ->
-                val obj = f.jsonObject
-                val name = obj["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                if (name.endsWith("/")) return@mapNotNull null
-                val ext = File(name).extension.lowercase()
-                if (".$ext" in SKIP_EXTS) return@mapNotNull null
-                val size = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
-                if (size < MIN_FILE_SIZE) return@mapNotNull null
-                GameFile(
-                    name = name,
-                    filename = File(name).name,
-                    size = size,
-                    identifier = identifier,
-                    sourceUrl = iaUrl
-                )
-            }
-            Log.i("EmuHelper", "scan/$identifier  bodyLen=${body.length} rawFiles=${files.size} kept=${kept.size}")
-            kept
         }
+
+        val files = root["files"]?.jsonArray
+            ?: throw IOException("Item '$identifier' has no files (may be dead or restricted)")
+
+        val kept = files.mapNotNull { f ->
+            val obj = f.jsonObject
+            val name = obj["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
+            if (name.endsWith("/")) return@mapNotNull null
+            val ext = File(name).extension.lowercase()
+            if (".$ext" in SKIP_EXTS) return@mapNotNull null
+            val size = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
+            if (size < MIN_FILE_SIZE) return@mapNotNull null
+            GameFile(
+                name = name,
+                filename = File(name).name,
+                size = size,
+                identifier = identifier,
+                sourceUrl = iaUrl
+            )
+        }
+        Log.i("EmuHelper", "scan/$identifier  rawFiles=${files.size} kept=${kept.size}")
+        kept
     }
 
     /**
@@ -358,6 +391,9 @@ class RemoteSource @Inject constructor(
         coroutineScope {
             ranges.mapIndexed { idx, (start, end) ->
                 async {
+                    // Allocate the read buffer once per segment, OUTSIDE the retry loop,
+                    // so it is reused across attempts rather than re-allocated each time.
+                    val buf = ByteArray(256 * 1024)
                     var attempt = 0
                     while (attempt < MAX_ATTEMPTS) {
                         val host = if (attempt == 0) hosts[idx % hosts.size]
@@ -392,7 +428,6 @@ class RemoteSource @Inject constructor(
                                 RandomAccessFile(destFile, "rw").use { raf ->
                                     raf.seek(start)
                                     body.byteStream().use { input ->
-                                        val buf = ByteArray(256 * 1024)
                                         var read: Int
                                         while (input.read(buf).also { read = it } != -1) {
                                             if (isCancelled()) throw CancellationException()
@@ -505,22 +540,19 @@ class RemoteSource @Inject constructor(
 
     suspend fun fetchFileSize(identifier: String, filename: String): Long = withContext(Dispatchers.IO) {
         try {
-            val request = Request.Builder().url("https://archive.org/metadata/$identifier").build()
-            okHttpClient.newCall(request).execute().use { response ->
-                val body = response.body?.string() ?: return@withContext 0L
-                val data = json.parseToJsonElement(body).jsonObject
-                val files = data["files"]?.jsonArray ?: return@withContext 0L
-                val target = File(filename).name.lowercase()
-                for (f in files) {
-                    val obj = f.jsonObject
-                    val name = obj["name"]?.jsonPrimitive?.content ?: continue
-                    val cand = File(name).name.lowercase()
-                    if (cand == target) {
-                        return@withContext obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
-                    }
+            // Use cached metadata to avoid a redundant network round-trip.
+            val data = fetchMetadata(identifier) ?: return@withContext 0L
+            val files = data["files"]?.jsonArray ?: return@withContext 0L
+            val target = File(filename).name.lowercase()
+            for (f in files) {
+                val obj = f.jsonObject
+                val name = obj["name"]?.jsonPrimitive?.content ?: continue
+                val cand = File(name).name.lowercase()
+                if (cand == target) {
+                    return@withContext obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
                 }
-                0L
             }
+            0L
         } catch (e: Exception) {
             Log.w("EmuHelper", "fetchFileSize($identifier/$filename) failed", e)
             0L

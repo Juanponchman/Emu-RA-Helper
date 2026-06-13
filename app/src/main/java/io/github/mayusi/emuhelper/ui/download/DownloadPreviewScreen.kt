@@ -47,9 +47,6 @@ class DownloadPreviewViewModel @Inject constructor(
     /** The games loaded from the chosen saved list. */
     val games: StateFlow<List<CuratedGame>> = scanState.downloadQueue
 
-    // Keyed by identifier/filename so equal-named games across consoles stay distinct.
-    private fun keyOf(g: CuratedGame) = "${g.identifier}/${g.filename}"
-
     private val _checked = MutableStateFlow<Set<String>>(emptySet())
     val checked: StateFlow<Set<String>> = _checked
 
@@ -57,29 +54,29 @@ class DownloadPreviewViewModel @Inject constructor(
     /** First time we see the list, check everything by default. */
     fun seedIfNeeded(list: List<CuratedGame>) {
         if (!seeded && list.isNotEmpty()) {
-            _checked.value = list.map { keyOf(it) }.toSet()
+            _checked.value = list.map { it.key }.toSet()
             seeded = true
         }
     }
 
     fun toggle(g: CuratedGame) {
-        val k = keyOf(g)
+        val k = g.key
         val cur = _checked.value.toMutableSet()
         if (k in cur) cur.remove(k) else cur.add(k)
         _checked.value = cur
     }
 
-    fun isChecked(g: CuratedGame) = keyOf(g) in _checked.value
+    fun isChecked(g: CuratedGame) = g.key in _checked.value
 
     fun setAll(list: List<CuratedGame>, value: Boolean) {
-        _checked.value = if (value) list.map { keyOf(it) }.toSet() else emptySet()
+        _checked.value = if (value) list.map { it.key }.toSet() else emptySet()
     }
 
     fun isLoggedIn(): Boolean = source.isLoggedIn()
 
     /** Narrow the download queue to only the checked games. Returns how many remain. */
     fun confirmSelection(): Int {
-        val keep = scanState.downloadQueue.value.filter { keyOf(it) in _checked.value }
+        val keep = scanState.downloadQueue.value.filter { it.key in _checked.value }
         scanState.downloadQueue.value = keep
         return keep.size
     }
@@ -123,7 +120,7 @@ fun DownloadPreviewScreen(
         if (games.isEmpty()) onBack() else viewModel.seedIfNeeded(games)
     }
 
-    val checkedGames = remember(games, checked) { games.filter { "${it.identifier}/${it.filename}" in checked } }
+    val checkedGames = remember(games, checked) { games.filter { it.key in checked } }
     val selCount = checkedGames.size
     val selSize = remember(checkedGames) { checkedGames.sumOf { it.size } }
     // Warn if selection is > 95% of free space (best-effort, may be null)
@@ -204,12 +201,12 @@ fun DownloadPreviewScreen(
                     modifier = Modifier.padding(vertical = 6.dp)
                 )
             }
-            items(games, key = { "${it.identifier}/${it.filename}" }) { game ->
+            items(games, key = { it.key }) { game ->
                 // Read from the tracked `checked` set (collected above) so each row
                 // recomposes when selection changes. Calling viewModel.isChecked()
                 // here would read state OUTSIDE Compose tracking → rows never update
                 // → "can't deselect".
-                val isOn = "${game.identifier}/${game.filename}" in checked
+                val isOn = game.key in checked
                 val backgroundColor by animateColorAsState(
                     targetValue = if (isOn) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f) else MaterialTheme.colorScheme.surface,
                     animationSpec = tween(durationMillis = 150)

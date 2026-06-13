@@ -30,6 +30,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -51,6 +52,14 @@ class EmulatorSetupFirmwareViewModel @Inject constructor(
 
     private val _copyState = MutableStateFlow<CopyState>(CopyState.Idle)
     val copyState: StateFlow<CopyState> = _copyState
+
+    private var copyJob: Job? = null
+
+    fun cancelCopy() {
+        copyJob?.cancel()
+        copyJob = null
+        _copyState.value = CopyState.Idle
+    }
 
     fun onFilePicked(uri: Uri) {
         try {
@@ -74,7 +83,7 @@ class EmulatorSetupFirmwareViewModel @Inject constructor(
 
     fun copyToStaging(context: Context) {
         val pickedUri = _pickedFileUri.value ?: return
-        viewModelScope.launch(Dispatchers.IO) {
+        copyJob = viewModelScope.launch(Dispatchers.IO) {
             _copyState.value = CopyState.Copying(0f)
             try {
                 val displayName = DocumentFile.fromSingleUri(context, pickedUri)?.name ?: "firmware.zip"
@@ -311,7 +320,14 @@ fun EmulatorSetupFirmwareScreen(
                         progress = { state.progress },
                         modifier = Modifier.fillMaxWidth()
                     )
-                    Text("Copying…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Copying…", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { viewModel.cancelCopy() }) { Text("Cancel") }
+                    }
                 }
                 is CopyState.Done -> {
                     Text(
@@ -333,6 +349,11 @@ fun EmulatorSetupFirmwareScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.error
                     )
+                    Spacer(Modifier.height(4.dp))
+                    Button(
+                        onClick = { viewModel.copyToStaging(context) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Retry") }
                 }
                 else -> Unit
             }

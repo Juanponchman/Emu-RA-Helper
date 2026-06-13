@@ -475,6 +475,16 @@ fun HomeScreen(
                     style = MaterialTheme.typography.titleSmall
                 )
             }
+            // U7: When no lists exist, show a subtle hint so the button's purpose is clear.
+            if (ui.listCount == 0) {
+                Text(
+                    "Make a list first to use this option",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp)
+                )
+            }
 
             Spacer(Modifier.height(Dimens.Large))
             Text(
@@ -484,24 +494,66 @@ fun HomeScreen(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(4.dp))
-            SuggestionChip(
-                onClick = { if (ui.loggedIn) viewModel.logout() else onSignIn() },
-                label = {
-                    Text(
-                        if (ui.loggedIn)
-                            ui.email.takeIf { it.isNotBlank() }?.let { "Signed in as $it" } ?: "Signed in"
-                        else "Not signed in — tap to sign in",
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                },
-                icon = {
-                    Icon(
-                        if (ui.loggedIn) Icons.Default.AccountCircle else Icons.Default.Lock,
-                        contentDescription = null,
-                        modifier = Modifier.size(Dimens.IconSmall)
-                    )
+
+            // U3: Show a more prominent sign-in prompt when not logged in.
+            if (!ui.loggedIn) {
+                OutlinedCard(
+                    onClick = onSignIn,
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp),
+                    colors = CardDefaults.outlinedCardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.18f)
+                    ),
+                    border = CardDefaults.outlinedCardBorder()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Lock,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(Dimens.IconSmall)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Sign in to start downloads",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                            Text(
+                                "Tap here to sign in",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Icon(
+                            Icons.AutoMirrored.Filled.Login,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+                            modifier = Modifier.size(Dimens.IconSmall)
+                        )
+                    }
                 }
-            )
+            } else {
+                SuggestionChip(
+                    onClick = { viewModel.logout() },
+                    label = {
+                        Text(
+                            ui.email.takeIf { it.isNotBlank() }?.let { "Signed in as $it" } ?: "Signed in",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    },
+                    icon = {
+                        Icon(
+                            Icons.Default.AccountCircle,
+                            contentDescription = null,
+                            modifier = Modifier.size(Dimens.IconSmall)
+                        )
+                    }
+                )
+            }
             Spacer(Modifier.height(4.dp))
             val appVersion = remember {
                 try {

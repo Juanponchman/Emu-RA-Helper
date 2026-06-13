@@ -1,5 +1,11 @@
 package io.github.mayusi.emuhelper.ui.history
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -18,10 +25,12 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.storage.HistoryEntry
 import io.github.mayusi.emuhelper.data.storage.HistoryStore
+import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatSize
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -32,7 +41,8 @@ import javax.inject.Inject
 
 @HiltViewModel
 class HistoryViewModel @Inject constructor(
-    private val historyStore: HistoryStore
+    private val historyStore: HistoryStore,
+    private val settings: SettingsStore
 ) : ViewModel() {
 
     val entries: StateFlow<List<HistoryEntry>> = historyStore.entries
@@ -41,9 +51,18 @@ class HistoryViewModel @Inject constructor(
     fun clearHistory() {
         viewModelScope.launch { historyStore.clear() }
     }
+
+    /** Returns the persisted SAF folder URI, or null if none is set. */
+    suspend fun downloadFolderUri(): Uri? = settings.downloadFolder.first()
 }
 
 // ---- date-label helpers --------------------------------------------------
+
+// Hoisted to file-level so they are created once and reused across calls.
+// These are used only on the main thread (Composable / remember blocks), so no
+// thread-safety concern with SimpleDateFormat's non-thread-safe API.
+private val sdfDayLabel = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
+private val sdfTime     = SimpleDateFormat("HH:mm", Locale.getDefault())
 
 private fun relativeDay(timestampMillis: Long): String {
     val today = Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0) }
@@ -52,12 +71,12 @@ private fun relativeDay(timestampMillis: Long): String {
     return when {
         !entryDay.before(today)     -> "Today"
         !entryDay.before(yesterday) -> "Yesterday"
-        else -> SimpleDateFormat("MMM d, yyyy", Locale.getDefault()).format(Date(timestampMillis))
+        else -> sdfDayLabel.format(Date(timestampMillis))
     }
 }
 
 private fun formatTime(timestampMillis: Long): String =
-    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(timestampMillis))
+    sdfTime.format(Date(timestampMillis))
 
 // ---- screen --------------------------------------------------------------
 
@@ -69,6 +88,71 @@ fun HistoryScreen(
 ) {
     val entries by viewModel.entries.collectAsState()
     var showClearDialog by remember { mutableStateOf(false) }
+    var actionEntry by remember { mutableStateOf<HistoryEntry?>(null) }
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    // Bottom sheet for per-entry actions.
+    actionEntry?.let { entry ->
+        ModalBottomSheet(onDismissRequest = { actionEntry = null }) {
+            Column(modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)) {
+                Text(
+                    entry.filename,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(12.dp))
+                // Open folder action
+                TextButton(
+                    onClick = {
+                        actionEntry = null
+                        coroutineScope.launch {
+                            val folderUri = viewModel.downloadFolderUri()
+                            var opened = false
+                            if (folderUri != null) {
+                                try {
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(folderUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(intent)
+                                    opened = true
+                                } catch (_: Exception) { /* fall through */ }
+                            }
+                            if (!opened) {
+                                try {
+                                    context.startActivity(Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS))
+                                } catch (_: Exception) { /* ignore */ }
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Folder, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Open folder")
+                }
+                // Copy filename action
+                TextButton(
+                    onClick = {
+                        actionEntry = null
+                        try {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("filename", entry.filename))
+                        } catch (_: Exception) { /* ignore */ }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.ContentCopy, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Copy filename")
+                }
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+    }
 
     if (showClearDialog) {
         AlertDialog(
@@ -156,7 +240,7 @@ fun HistoryScreen(
                         )
                     }
                     items(dayEntries, key = { entry -> "${entry.timestampMillis}_${entry.filename}" }) { entry ->
-                        HistoryEntryCard(entry, Modifier.animateItem())
+                        HistoryEntryCard(entry, Modifier.animateItem(), onClick = { actionEntry = entry })
                     }
                 }
             }
@@ -164,8 +248,9 @@ fun HistoryScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HistoryEntryCard(entry: HistoryEntry, modifier: Modifier = Modifier) {
+private fun HistoryEntryCard(entry: HistoryEntry, modifier: Modifier = Modifier, onClick: (() -> Unit)? = null) {
     val isDone = entry.status == "DONE"
     val isFailed = entry.status == "FAILED"
     val statusColor = when {
@@ -180,6 +265,7 @@ private fun HistoryEntryCard(entry: HistoryEntry, modifier: Modifier = Modifier)
     }
 
     Card(
+        onClick = onClick ?: {},
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = MaterialTheme.shapes.small

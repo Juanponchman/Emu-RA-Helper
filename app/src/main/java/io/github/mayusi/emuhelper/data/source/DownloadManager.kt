@@ -91,6 +91,16 @@ class DownloadManager @Inject constructor(
     /** Smoothed speed for stable ETA calculations. Prevents jitter when concurrent files start/stop. */
     @Volatile private var smoothedSpeed = 0.0
 
+    /** Timestamp of the last full recomputeAggregates() call (millis). Used to throttle
+     *  aggregate recomputes to at most ~3×/sec during active progress updates. */
+    @Volatile private var lastAggregateMs = 0L
+    private val AGGREGATE_INTERVAL_MS = 333L
+
+    /** Timestamp of the last notification progress push (millis). Throttled independently
+     *  to ~once per 1.5 s so we don't flood the NotificationManager. */
+    @Volatile private var lastNotifProgressMs = 0L
+    private val NOTIF_PROGRESS_INTERVAL_MS = 1500L
+
     fun start(games: List<CuratedGame>) {
         // B2: Atomic check-and-set prevents two concurrent callers (e.g. LaunchedEffect
         // refiring) from both passing the guard and spinning up duplicate batch jobs.
@@ -336,10 +346,15 @@ class DownloadManager @Inject constructor(
                 destFile = cacheFile,
                 segments = segmentsPerFile,
                 onProgress = { bytes, bps ->
-                    // honour pause: block here while paused
+                    // honour pause: suspend until unpaused instead of busy-polling every 200ms.
+                    // _isPaused is a StateFlow; .first { !it } suspends cheaply with no polling
+                    // and resumes promptly when resume() flips it to false. Structured cancellation
+                    // (CancellationException) propagates normally when cancelAll() cancels the job.
                     if (_isPaused.value) {
                         updateTask(taskId) { it.copy(status = DownloadStatus.PAUSED, speed = 0.0) }
-                        while (_isPaused.value && !cancelRequested) delay(200)
+                        if (!cancelRequested) {
+                            _isPaused.first { !it }  // suspend until unpaused; throws on cancel
+                        }
                         if (!cancelRequested) updateTask(taskId) { it.copy(status = DownloadStatus.DOWNLOADING) }
                     }
                     updateTask(taskId) { it.copy(downloaded = bytes, speed = bps) }
@@ -530,7 +545,18 @@ class DownloadManager @Inject constructor(
         if (idx < 0) return
         val updated = all.toMutableList().apply { this[idx] = transform(this[idx]) }
         _tasks.value = updated
-        recomputeAggregates(updated)
+        // Always recompute immediately on terminal status so totals are accurate at completion.
+        // During active progress, throttle to at most ~3×/sec to avoid pegging the CPU
+        // across up to 24 concurrent segment coroutines each reporting every ~256 KB.
+        val newStatus = updated[idx].status
+        val isTerminal = newStatus == DownloadStatus.DONE ||
+                         newStatus == DownloadStatus.FAILED ||
+                         newStatus == DownloadStatus.CANCELLED
+        val now = System.currentTimeMillis()
+        if (isTerminal || now - lastAggregateMs >= AGGREGATE_INTERVAL_MS) {
+            lastAggregateMs = now
+            recomputeAggregates(updated)
+        }
     }
 
     private fun recomputeAggregates(all: List<DownloadTask> = _tasks.value) {
@@ -551,5 +577,19 @@ class DownloadManager @Inject constructor(
 
         _totalSpeed.value = sp
         _eta.value = if (smoothedSpeed > 0.1) io.github.mayusi.emuhelper.ui.common.formatEta(remaining / smoothedSpeed) else "--"
+
+        // Push live progress to the notification, throttled to ~once per 1.5 s.
+        // Only update while the batch is actively running and not paused.
+        if (_isRunning.value && !_isPaused.value) {
+            val nowMs = System.currentTimeMillis()
+            if (nowMs - lastNotifProgressMs >= NOTIF_PROGRESS_INTERVAL_MS) {
+                lastNotifProgressMs = nowMs
+                val pct       = (_totalProgress.value * 100).toInt().coerceIn(0, 100)
+                val speed     = io.github.mayusi.emuhelper.ui.common.formatSpeed(sp)
+                val doneCount = all.count { it.status == io.github.mayusi.emuhelper.data.model.DownloadStatus.DONE }
+                val total     = all.size
+                DownloadService.updateProgress(appContext, pct, speed, doneCount, total)
+            }
+        }
     }
 }

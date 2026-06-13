@@ -192,15 +192,17 @@ fun DownloadScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(statusText, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
-                            val totalBytes = tasks.sumOf { it.size }
-                            val downloadedBytes = tasks.sumOf { it.downloaded }
+                            // Memoised so these O(n) sums don't run on every recomposition
+                            // (DownloadManager ticks at ~3×/sec while downloading).
+                            val totalBytes by remember(tasks) { derivedStateOf { tasks.sumOf { it.size } } }
+                            val downloadedBytes by remember(tasks) { derivedStateOf { tasks.sumOf { it.downloaded } } }
                             Text(
                                 "${formatSize(downloadedBytes)} / ${formatSize(totalBytes)}  ·  ${formatSpeed(totalSpeed)}  ·  ETA $eta",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        val done = tasks.count { it.status == DownloadStatus.DONE }
+                        val done by remember(tasks) { derivedStateOf { tasks.count { it.status == DownloadStatus.DONE } } }
                         Text(
                             "$done / ${tasks.size}",
                             style = MaterialTheme.typography.titleMedium,

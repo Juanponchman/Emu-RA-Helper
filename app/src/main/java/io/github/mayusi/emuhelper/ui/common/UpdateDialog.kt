@@ -1,7 +1,5 @@
 package io.github.mayusi.emuhelper.ui.common
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -134,11 +132,7 @@ fun UpdateDialog(
                 when {
                     info.apkUrl == null -> {
                         // No APK asset — only browser fallback.
-                        TextButton(onClick = {
-                            context.startActivity(
-                                Intent(Intent.ACTION_VIEW, Uri.parse(info.htmlUrl))
-                            )
-                        }) {
+                        TextButton(onClick = { context.openUrl(info.htmlUrl) }) {
                             Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("View on GitHub")
@@ -153,11 +147,7 @@ fun UpdateDialog(
                     }
                     isError -> {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TextButton(onClick = {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(info.htmlUrl))
-                                )
-                            }) {
+                            TextButton(onClick = { context.openUrl(info.htmlUrl) }) {
                                 Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))
                                 Text("View on GitHub")
@@ -168,11 +158,7 @@ fun UpdateDialog(
                     else -> {
                         // Idle — primary "Update now" + secondary "View on GitHub".
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            TextButton(onClick = {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(info.htmlUrl))
-                                )
-                            }) {
+                            TextButton(onClick = { context.openUrl(info.htmlUrl) }) {
                                 Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))
                                 Text("GitHub")

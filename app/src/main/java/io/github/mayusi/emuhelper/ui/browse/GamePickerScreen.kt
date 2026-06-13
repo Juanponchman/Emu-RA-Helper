@@ -164,6 +164,10 @@ fun GamePickerScreen(
         bottomBar = {
             Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 4.dp) {
                 val totalSel = selectedGames.values.sumOf { it.size }
+                // Memoised: sumOf over all scannedFiles is O(n) and scannedFiles only changes
+                // when a new scan completes — not on every selection toggle — so
+                // remember(scannedFiles) avoids recomputing on each recomposition.
+                val totalFileCount by remember(scannedFiles) { derivedStateOf { scannedFiles.values.sumOf { it.size } } }
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -171,7 +175,7 @@ fun GamePickerScreen(
                 ) {
                     Column {
                         Text("$totalSel selected", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurface)
-                        Text("${scannedFiles.values.sumOf { it.size }} total files", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("$totalFileCount total files", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         TextButton(onClick = {

@@ -1,7 +1,5 @@
 package io.github.mayusi.emuhelper.ui.about
 
-import android.content.Intent
-import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -25,11 +23,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.mayusi.emuhelper.BuildConfig
 import io.github.mayusi.emuhelper.data.source.AppUpdater
 import io.github.mayusi.emuhelper.data.source.UpdateChecker
 import io.github.mayusi.emuhelper.ui.common.UpdateDialog
 import io.github.mayusi.emuhelper.ui.common.UpdateFlowState
+import io.github.mayusi.emuhelper.ui.common.appVersionString
+import io.github.mayusi.emuhelper.ui.common.openUrl
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -138,19 +137,11 @@ fun AboutScreen(
     val updateFlow by viewModel.updateFlow.collectAsState()
     var showUpdateDialog by remember { mutableStateOf(false) }
 
-    val appVersion = remember {
-        try {
-            val pi = context.packageManager.getPackageInfo(context.packageName, 0)
-            "v${pi.versionName} (${pi.longVersionCode})"
-        } catch (e: Exception) { "v${BuildConfig.VERSION_NAME}" }
-    }
+    // appVersionString(includeCode=true) returns e.g. "0.1.9 (10)"; prefix v for display
+    val appVersion = remember { "v${context.appVersionString(includeCode = true)}" }
 
-    val currentVersionName = remember {
-        try {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName
-                ?: BuildConfig.VERSION_NAME
-        } catch (e: Exception) { BuildConfig.VERSION_NAME }
-    }
+    // versionName-only for passing to UpdateChecker.check()
+    val currentVersionName = remember { context.appVersionString(includeCode = false) }
 
     // Show the update dialog when UpdateAvailable is active and user tapped the button.
     val availableState = updateState as? AboutViewModel.UpdateState.UpdateAvailable
@@ -327,11 +318,7 @@ fun AboutScreen(
                                     }
                                 }
                                 TextButton(
-                                    onClick = {
-                                        context.startActivity(
-                                            Intent(Intent.ACTION_VIEW, Uri.parse(state.info.htmlUrl))
-                                        )
-                                    }
+                                    onClick = { context.openUrl(state.info.htmlUrl) }
                                 ) {
                                     Text("View release", color = MaterialTheme.colorScheme.onPrimaryContainer)
                                 }
@@ -361,9 +348,7 @@ private fun AboutLinkRow(
     context: android.content.Context
 ) {
     Surface(
-        onClick = {
-            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-        },
+        onClick = { context.openUrl(url) },
         color = MaterialTheme.colorScheme.surface,
         modifier = Modifier.fillMaxWidth()
     ) {

@@ -147,8 +147,11 @@ class UpdateChecker @Inject constructor(private val okHttpClient: OkHttpClient) 
     /**
      * Strips a leading 'v', splits by '.', compares numerically component-by-component.
      * Returns true if [tag] represents a version strictly newer than [current].
+     *
+     * Visibility widened to [internal] so unit tests in the same module can call it directly
+     * without going through the network-bound [check] function.
      */
-    fun isNewerVersion(tag: String, current: String): Boolean {
+    internal fun isNewerVersion(tag: String, current: String): Boolean {
         // B5: Strip pre-release suffixes (e.g. "-rc1", "+build") before splitting so that
         // "v0.1.8-rc1" yields [0,1,8] instead of [0,1] (the old code dropped the last
         // component because "8-rc1".toIntOrNull() == null). Applied symmetrically to both

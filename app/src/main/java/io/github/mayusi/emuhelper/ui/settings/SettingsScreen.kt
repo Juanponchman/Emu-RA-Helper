@@ -23,6 +23,7 @@ import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.appVersionString
 import io.github.mayusi.emuhelper.ui.theme.ThemeMode
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -48,6 +49,8 @@ class SettingsViewModel @Inject constructor(
 
     val device: DeviceInfo by lazy { speedTester.deviceInfo() }
 
+    private var speedTestJob: Job? = null
+
     fun setSegments(v: Int) { viewModelScope.launch { settings.setSegments(v) } }
     fun setConcurrency(v: Int) { viewModelScope.launch { settings.setConcurrency(v) } }
     fun setExtract(v: Boolean) { viewModelScope.launch { settings.setExtractArchives(v) } }
@@ -64,11 +67,17 @@ class SettingsViewModel @Inject constructor(
 
     fun runSpeedTest() {
         if (_testing.value) return
-        viewModelScope.launch {
+        speedTestJob = viewModelScope.launch {
             _testing.value = true
             _result.value = null
             try { _result.value = speedTester.run() } finally { _testing.value = false }
         }
+    }
+
+    fun cancelSpeedTest() {
+        speedTestJob?.cancel()
+        speedTestJob = null
+        _testing.value = false
     }
 }
 
@@ -184,18 +193,26 @@ fun SettingsScreen(
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = { viewModel.runSpeedTest() },
-                    enabled = !testing,
-                    shape = MaterialTheme.shapes.small,
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    Button(
+                        onClick = { viewModel.runSpeedTest() },
+                        enabled = !testing,
+                        shape = MaterialTheme.shapes.small,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
+                    ) {
+                        if (testing) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSecondaryContainer)
+                            Spacer(Modifier.width(8.dp))
+                            Text("Testing…")
+                        } else {
+                            Icon(Icons.Default.Speed, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Run speed test")
+                        }
+                    }
                     if (testing) {
-                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSecondaryContainer)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Testing…")
-                    } else {
-                        Icon(Icons.Default.Speed, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Run speed test")
+                        TextButton(onClick = { viewModel.cancelSpeedTest() }) { Text("Cancel") }
                     }
                 }
                 result?.let { r ->
