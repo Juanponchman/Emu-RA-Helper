@@ -17,7 +17,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -27,16 +26,21 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.BuildConfig
+import io.github.mayusi.emuhelper.data.source.AppUpdater
 import io.github.mayusi.emuhelper.data.source.UpdateChecker
+import io.github.mayusi.emuhelper.ui.common.UpdateDialog
+import io.github.mayusi.emuhelper.ui.common.UpdateFlowState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.File
 import javax.inject.Inject
 
 @HiltViewModel
 class AboutViewModel @Inject constructor(
-    private val updateChecker: UpdateChecker
+    private val updateChecker: UpdateChecker,
+    private val appUpdater: AppUpdater
 ) : ViewModel() {
 
     sealed class UpdateState {
@@ -50,6 +54,11 @@ class AboutViewModel @Inject constructor(
     private val _updateState = MutableStateFlow<UpdateState>(UpdateState.Idle)
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
 
+    private val _updateFlow = MutableStateFlow<UpdateFlowState>(UpdateFlowState.Idle)
+    val updateFlow: StateFlow<UpdateFlowState> = _updateFlow.asStateFlow()
+
+    private var downloadedApkFile: File? = null
+
     fun checkForUpdates(currentVersion: String) {
         if (_updateState.value is UpdateState.Checking) return
         _updateState.value = UpdateState.Checking
@@ -62,6 +71,45 @@ class AboutViewModel @Inject constructor(
             }
         }
     }
+
+    fun startDownload(apkUrl: String, apkSize: Long) {
+        if (_updateFlow.value is UpdateFlowState.Downloading) return
+        _updateFlow.value = UpdateFlowState.Downloading(0f)
+        downloadedApkFile = null
+        viewModelScope.launch {
+            val file = appUpdater.downloadApk(apkUrl, apkSize) { progress ->
+                _updateFlow.value = UpdateFlowState.Downloading(progress)
+            }
+            if (file != null) {
+                downloadedApkFile = file
+                _updateFlow.value = UpdateFlowState.Installing
+            } else {
+                _updateFlow.value = UpdateFlowState.Error("Download failed. Check your connection and try again.")
+            }
+        }
+    }
+
+    fun installDownloadedApk() {
+        val file = downloadedApkFile ?: run {
+            _updateFlow.value = UpdateFlowState.Error("APK not found. Please download again.")
+            return
+        }
+        when (val result = appUpdater.installApk(file)) {
+            is AppUpdater.InstallResult.Launched -> { /* system installer launched */ }
+            is AppUpdater.InstallResult.NeedsPermission -> {
+                _updateFlow.value = UpdateFlowState.NeedsPermission
+            }
+            is AppUpdater.InstallResult.Error -> {
+                _updateFlow.value = UpdateFlowState.Error(
+                    "${result.message}\n\nIf installation keeps failing, try downloading the APK from the release page."
+                )
+            }
+        }
+    }
+
+    fun resetUpdateFlow() {
+        _updateFlow.value = UpdateFlowState.Idle
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -72,6 +120,8 @@ fun AboutScreen(
 ) {
     val context = LocalContext.current
     val updateState by viewModel.updateState.collectAsState()
+    val updateFlow by viewModel.updateFlow.collectAsState()
+    var showUpdateDialog by remember { mutableStateOf(false) }
 
     val appVersion = remember {
         try {
@@ -82,8 +132,27 @@ fun AboutScreen(
 
     val currentVersionName = remember {
         try {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: BuildConfig.VERSION_NAME
+            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+                ?: BuildConfig.VERSION_NAME
         } catch (e: Exception) { BuildConfig.VERSION_NAME }
+    }
+
+    // Show the update dialog when UpdateAvailable is active and user tapped the button.
+    val availableState = updateState as? AboutViewModel.UpdateState.UpdateAvailable
+    if (showUpdateDialog && availableState != null) {
+        UpdateDialog(
+            info = availableState.info,
+            flowState = updateFlow,
+            onDownload = {
+                val url = availableState.info.apkUrl ?: return@UpdateDialog
+                viewModel.startDownload(url, availableState.info.apkSize)
+            },
+            onInstall = { viewModel.installDownloadedApk() },
+            onDismiss = {
+                showUpdateDialog = false
+                viewModel.resetUpdateFlow()
+            }
+        )
     }
 
     Scaffold(
@@ -228,14 +297,27 @@ fun AboutScreen(
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
                             Spacer(Modifier.height(8.dp))
-                            TextButton(
-                                onClick = {
-                                    context.startActivity(
-                                        Intent(Intent.ACTION_VIEW, Uri.parse(state.info.htmlUrl))
-                                    )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                // Show "Update now" only if an APK asset is available.
+                                if (state.info.apkUrl != null) {
+                                    Button(
+                                        onClick = { showUpdateDialog = true },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.primary
+                                        )
+                                    ) {
+                                        Text("Update now")
+                                    }
                                 }
-                            ) {
-                                Text("View release", color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                TextButton(
+                                    onClick = {
+                                        context.startActivity(
+                                            Intent(Intent.ACTION_VIEW, Uri.parse(state.info.htmlUrl))
+                                        )
+                                    }
+                                ) {
+                                    Text("View release", color = MaterialTheme.colorScheme.onPrimaryContainer)
+                                }
                             }
                         }
                     }
@@ -248,7 +330,7 @@ fun AboutScreen(
                         textAlign = TextAlign.Center
                     )
                 }
-                else -> {} // Idle — nothing shown
+                else -> {} // Idle or Checking — nothing extra shown
             }
         }
     }

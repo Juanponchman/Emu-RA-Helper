@@ -33,6 +33,7 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         private val KEY_SEEN_SETUP_DISCLAIMER = booleanPreferencesKey("seen_setup_disclaimer")
         private val KEY_SETUP_STAGING_FOLDER = stringPreferencesKey("setup_staging_folder_uri")
         val KEY_LAST_UPDATE_CHECK = longPreferencesKey("last_update_check_ts")
+        val KEY_DISMISSED_UPDATE_TAG = stringPreferencesKey("dismissed_update_tag")
         val KEY_LAST_CONSOLES = stringSetPreferencesKey("last_selected_consoles")
         // ---- Theme mode (Feature 1) -------------------------------------------
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
@@ -106,6 +107,14 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setLastUpdateCheck(timestamp: Long) {
         context.settingsStore.edit { it[KEY_LAST_UPDATE_CHECK] = timestamp }
+    }
+
+    // ---- Dismissed update tag (persist dismiss-per-version) ---------------
+
+    val dismissedUpdateTag: Flow<String> = context.settingsStore.data.map { it[KEY_DISMISSED_UPDATE_TAG] ?: "" }
+
+    suspend fun setDismissedUpdateTag(tag: String) {
+        context.settingsStore.edit { it[KEY_DISMISSED_UPDATE_TAG] = tag }
     }
 
     // ---- Last selected consoles -------------------------------------------

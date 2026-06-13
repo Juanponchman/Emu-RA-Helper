@@ -14,16 +14,33 @@ import javax.inject.Singleton
 @Singleton
 class UpdateChecker @Inject constructor(private val okHttpClient: OkHttpClient) {
 
+    /**
+     * @param notes   Release body text (may be empty if the release has no notes).
+     * @param apkUrl  Direct download URL for the APK asset, or null if no APK is attached.
+     * @param apkSize Size in bytes of the APK asset, or 0 if unknown.
+     */
     data class UpdateInfo(
         val latestTag: String,
         val htmlUrl: String,
-        val isNewer: Boolean
+        val isNewer: Boolean,
+        val notes: String = "",
+        val apkUrl: String? = null,
+        val apkSize: Long = 0L
+    )
+
+    @Serializable
+    private data class GithubAsset(
+        @SerialName("name") val name: String,
+        @SerialName("browser_download_url") val browserDownloadUrl: String,
+        @SerialName("size") val size: Long = 0L
     )
 
     @Serializable
     private data class GithubRelease(
         @SerialName("tag_name") val tagName: String,
-        @SerialName("html_url") val htmlUrl: String
+        @SerialName("html_url") val htmlUrl: String,
+        @SerialName("body") val body: String? = null,
+        @SerialName("assets") val assets: List<GithubAsset> = emptyList()
     )
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -46,10 +63,17 @@ class UpdateChecker @Inject constructor(private val okHttpClient: OkHttpClient) 
             val body = response.body?.string() ?: return@withContext null
             val release = json.decodeFromString<GithubRelease>(body)
             val isNewer = isNewerVersion(release.tagName, currentVersion)
+
+            // Find first .apk asset
+            val apkAsset = release.assets.firstOrNull { it.name.endsWith(".apk", ignoreCase = true) }
+
             UpdateInfo(
                 latestTag = release.tagName,
                 htmlUrl = release.htmlUrl,
-                isNewer = isNewer
+                isNewer = isNewer,
+                notes = release.body ?: "",
+                apkUrl = apkAsset?.browserDownloadUrl,
+                apkSize = apkAsset?.size ?: 0L
             )
         } catch (e: Exception) {
             Log.d("UpdateChecker", "Update check failed", e)

@@ -1,6 +1,5 @@
 package io.github.mayusi.emuhelper.ui.home
 
-import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -35,14 +34,17 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import io.github.mayusi.emuhelper.data.source.RemoteSource
+import io.github.mayusi.emuhelper.data.source.AppUpdater
 import io.github.mayusi.emuhelper.data.source.LoginResult
+import io.github.mayusi.emuhelper.data.source.RemoteSource
 import io.github.mayusi.emuhelper.data.source.UpdateChecker
 import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.data.storage.GameListStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import io.github.mayusi.emuhelper.ui.common.Dimens
+import io.github.mayusi.emuhelper.ui.common.UpdateDialog
+import io.github.mayusi.emuhelper.ui.common.UpdateFlowState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -51,6 +53,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.io.File
 import javax.inject.Inject
 
 @HiltViewModel
@@ -60,7 +63,8 @@ class HomeViewModel @Inject constructor(
     private val authStore: AuthStore,
     private val source: RemoteSource,
     private val cookieJar: PersistentCookieJar,
-    private val updateChecker: UpdateChecker
+    private val updateChecker: UpdateChecker,
+    private val appUpdater: AppUpdater
 ) : ViewModel() {
 
     data class HomeUi(val listCount: Int = 0, val loggedIn: Boolean = false, val email: String = "")
@@ -68,23 +72,26 @@ class HomeViewModel @Inject constructor(
     private val _updateInfo = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
     val updateInfo: StateFlow<UpdateChecker.UpdateInfo?> = _updateInfo.asStateFlow()
 
+    private val _updateFlow = MutableStateFlow<UpdateFlowState>(UpdateFlowState.Idle)
+    val updateFlow: StateFlow<UpdateFlowState> = _updateFlow.asStateFlow()
+
+    // Persisted dismissed tag (loaded from DataStore so it survives restarts).
+    val dismissedUpdateTag: StateFlow<String> = settings.dismissedUpdateTag
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    private var downloadedApkFile: File? = null
+
     val ui: StateFlow<HomeUi> = combine(
         listStore.lists,
         authStore.savedEmail,
-        // Observe the cookie jar's reactive login state. It flips true once the
-        // (async, off-main) disk restore completes on cold start — so a saved
-        // session shows as signed-in without the user touching anything.
         cookieJar.loggedIn
     ) { lists, email, loggedIn ->
         HomeUi(listCount = lists.size, loggedIn = loggedIn, email = email)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUi())
 
     init {
-        // Silent auto-relogin: if we have no live session but the user saved their
-        // credentials, sign in transparently in the background. This covers the case
-        // where the persisted cookies expired — the user never has to tap "Sign in".
+        // Silent auto-relogin.
         viewModelScope.launch {
-            // Give the cookie jar's async disk-restore a moment to publish state.
             kotlinx.coroutines.delay(400)
             if (cookieJar.loggedIn.value) return@launch
             val remember = authStore.rememberMe.first()
@@ -96,7 +103,6 @@ class HomeViewModel @Inject constructor(
                 is LoginResult.Success -> Log.i("EmuHelper", "silent auto-relogin OK")
                 is LoginResult.Failed -> Log.w("EmuHelper", "silent auto-relogin failed")
             }
-            // login() populates the cookie jar, which flips cookieJar.loggedIn reactively.
         }
 
         // Throttled update check: only run if >24h since last check.
@@ -117,18 +123,60 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    /** No-op kept for callers; login state is now reactive via cookieJar.loggedIn. */
     fun refreshLogin() { /* cookieJar.loggedIn updates itself */ }
 
     fun logout() {
         viewModelScope.launch {
             authStore.clearCredentials()
-            cookieJar.clear() // flips cookieJar.loggedIn -> false reactively
+            cookieJar.clear()
         }
     }
 
     fun setFolder(uri: Uri?) {
         viewModelScope.launch { settings.setDownloadFolder(uri) }
+    }
+
+    fun dismissUpdate(tag: String) {
+        viewModelScope.launch { settings.setDismissedUpdateTag(tag) }
+    }
+
+    fun startDownload(apkUrl: String, apkSize: Long) {
+        if (_updateFlow.value is UpdateFlowState.Downloading) return
+        _updateFlow.value = UpdateFlowState.Downloading(0f)
+        downloadedApkFile = null
+        viewModelScope.launch {
+            val file = appUpdater.downloadApk(apkUrl, apkSize) { progress ->
+                _updateFlow.value = UpdateFlowState.Downloading(progress)
+            }
+            if (file != null) {
+                downloadedApkFile = file
+                _updateFlow.value = UpdateFlowState.Installing
+            } else {
+                _updateFlow.value = UpdateFlowState.Error("Download failed. Check your connection and try again.")
+            }
+        }
+    }
+
+    fun installDownloadedApk() {
+        val file = downloadedApkFile ?: run {
+            _updateFlow.value = UpdateFlowState.Error("APK not found. Please download again.")
+            return
+        }
+        when (val result = appUpdater.installApk(file)) {
+            is AppUpdater.InstallResult.Launched -> { /* system installer is open */ }
+            is AppUpdater.InstallResult.NeedsPermission -> {
+                _updateFlow.value = UpdateFlowState.NeedsPermission
+            }
+            is AppUpdater.InstallResult.Error -> {
+                _updateFlow.value = UpdateFlowState.Error(
+                    "${result.message}\n\nIf installation keeps failing, try downloading the APK from the release page."
+                )
+            }
+        }
+    }
+
+    fun resetUpdateFlow() {
+        _updateFlow.value = UpdateFlowState.Idle
     }
 }
 
@@ -147,9 +195,15 @@ fun HomeScreen(
 ) {
     val ui by viewModel.ui.collectAsState()
     val updateInfo by viewModel.updateInfo.collectAsState()
+    val updateFlow by viewModel.updateFlow.collectAsState()
+    val dismissedTag by viewModel.dismissedUpdateTag.collectAsState()
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
-    var updateBannerDismissed by remember { mutableStateOf(false) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
+
+    // Compute whether the banner should be visible.
+    val info = updateInfo
+    val bannerVisible = info != null && info.isNewer && dismissedTag != info.latestTag
 
     // Re-check login whenever Home becomes the active screen again.
     LaunchedEffect(Unit) { viewModel.refreshLogin() }
@@ -161,7 +215,8 @@ fun HomeScreen(
             try {
                 context.contentResolver.takePersistableUriPermission(
                     uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 )
                 viewModel.setFolder(uri)
             } catch (e: SecurityException) {
@@ -170,12 +225,28 @@ fun HomeScreen(
         }
     }
 
+    // Update dialog
+    if (showUpdateDialog && info != null) {
+        UpdateDialog(
+            info = info,
+            flowState = updateFlow,
+            onDownload = {
+                val url = info.apkUrl ?: return@UpdateDialog
+                viewModel.startDownload(url, info.apkSize)
+            },
+            onInstall = { viewModel.installDownloadedApk() },
+            onDismiss = {
+                showUpdateDialog = false
+                viewModel.resetUpdateFlow()
+            }
+        )
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("EmuHelper", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary) },
                 actions = {
-                    // Settings gear — one tap, always visible
                     IconButton(onClick = onSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "Settings")
                     }
@@ -237,8 +308,7 @@ fun HomeScreen(
             Spacer(Modifier.height(12.dp))
 
             // Update available banner
-            val info = updateInfo
-            if (info != null && info.isNewer && !updateBannerDismissed) {
+            if (bannerVisible) {
                 Card(
                     modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
@@ -262,22 +332,16 @@ fun HomeScreen(
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
                             )
                             Text(
-                                "Tap to view release",
+                                "Tap to see what's new",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
                             )
                         }
-                        TextButton(
-                            onClick = {
-                                context.startActivity(
-                                    android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(info.htmlUrl))
-                                )
-                            }
-                        ) {
-                            Text("View", color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        TextButton(onClick = { showUpdateDialog = true }) {
+                            Text("Update", color = MaterialTheme.colorScheme.onPrimaryContainer)
                         }
                         IconButton(
-                            onClick = { updateBannerDismissed = true },
+                            onClick = { viewModel.dismissUpdate(info.latestTag) },
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
@@ -314,7 +378,6 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(12.dp))
-            // Download from a previously saved list — a primary action, full-width.
             Button(
                 onClick = onDownload,
                 modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp).height(Dimens.ButtonMinHeight),
@@ -330,7 +393,6 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(Dimens.Large))
-            // List count — static info line
             Text(
                 if (ui.listCount == 1) "1 saved list" else "${ui.listCount} saved lists",
                 style = MaterialTheme.typography.bodySmall,
@@ -338,7 +400,6 @@ fun HomeScreen(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(4.dp))
-            // Login status as a tappable chip — more legible and actionable
             SuggestionChip(
                 onClick = { if (ui.loggedIn) viewModel.logout() else onSignIn() },
                 label = {
