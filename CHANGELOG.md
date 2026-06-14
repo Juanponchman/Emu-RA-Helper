@@ -4,6 +4,22 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.3.0] — 2026-06-11
+
+### Added
+- **Updatable source catalog (optional).** The source list can now be refreshed
+  from a remote file at runtime, so it can change without shipping a new app
+  build. It's off by default and the built-in catalog is always the fallback —
+  a remote update can only add or replace sources, never remove the built-in
+  ones, and any failed or invalid fetch leaves the catalog untouched.
+- **Source health check** (in About): pings each configured endpoint and reports
+  which are reachable, so dead sources are easy to spot.
+- **Local error log** (in About): an on-device, no-network record of errors that
+  can be viewed, copied, or shared for diagnosis.
+
+### Internal
+- A release helper script that builds, tests, hashes, and drafts release notes.
+
 ## [0.2.1] — 2026-06-11
 
 ### Added
