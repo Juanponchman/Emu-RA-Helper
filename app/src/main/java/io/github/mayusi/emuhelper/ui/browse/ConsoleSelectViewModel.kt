@@ -3,16 +3,21 @@ package io.github.mayusi.emuhelper.ui.browse
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.mayusi.emuhelper.data.source.CatalogRepository
+import io.github.mayusi.emuhelper.data.source.RefreshResult
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 @HiltViewModel
 class ConsoleSelectViewModel @Inject constructor(
-    private val settings: SettingsStore
+    private val settings: SettingsStore,
+    private val catalogRepository: CatalogRepository
 ) : ViewModel() {
 
     val lastSelectedConsoles: StateFlow<Set<String>> =
@@ -22,5 +27,24 @@ class ConsoleSelectViewModel @Inject constructor(
         viewModelScope.launch {
             settings.setLastSelectedConsoles(consoles)
         }
+    }
+
+    // ---- Remote catalog refresh ------------------------------------------
+
+    /** One-shot event emitted after a manual refresh; null when idle. */
+    private val _refreshResult = MutableStateFlow<RefreshResult?>(null)
+    val refreshResult: StateFlow<RefreshResult?> = _refreshResult.asStateFlow()
+
+    fun refreshCatalog() {
+        viewModelScope.launch {
+            _refreshResult.value = null
+            val result = catalogRepository.refresh()
+            _refreshResult.value = result
+        }
+    }
+
+    /** Clear the result after the UI has consumed it (prevents re-showing on recomposition). */
+    fun clearRefreshResult() {
+        _refreshResult.value = null
     }
 }

@@ -9,6 +9,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.NewReleases
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.*
@@ -130,6 +132,8 @@ class AboutViewModel @Inject constructor(
 @Composable
 fun AboutScreen(
     onBack: () -> Unit,
+    onSourceHealth: () -> Unit = {},
+    onErrorLog: () -> Unit = {},
     viewModel: AboutViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
@@ -250,6 +254,22 @@ fun AboutScreen(
                 context = context
             )
 
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider()
+            Spacer(Modifier.height(8.dp))
+
+            // Operator tools
+            AboutActionRow(
+                icon = Icons.Default.NetworkCheck,
+                label = "Check source health",
+                onClick = onSourceHealth
+            )
+            AboutActionRow(
+                icon = Icons.Default.List,
+                label = "View error log",
+                onClick = onErrorLog
+            )
+
             Spacer(Modifier.height(16.dp))
             HorizontalDivider()
             Spacer(Modifier.height(20.dp))
@@ -336,6 +356,41 @@ fun AboutScreen(
                 }
                 else -> {} // Idle or Checking — nothing extra shown
             }
+        }
+    }
+}
+
+/** A row that navigates to an in-app screen (no URL). */
+@Composable
+private fun AboutActionRow(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        color = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 12.dp, horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.secondary,
+                modifier = Modifier.size(22.dp)
+            )
+            Spacer(Modifier.width(16.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }

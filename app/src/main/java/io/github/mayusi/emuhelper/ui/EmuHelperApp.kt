@@ -25,6 +25,8 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.about.AboutScreen
+import io.github.mayusi.emuhelper.ui.about.ErrorLogScreen
+import io.github.mayusi.emuhelper.ui.health.SourceHealthScreen
 import io.github.mayusi.emuhelper.ui.browse.ConsoleSelectScreen
 import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.history.HistoryScreen
@@ -74,6 +76,8 @@ object Routes {
     const val SETTINGS = "settings"
     const val ABOUT = "about"
     const val HISTORY = "history"
+    const val SOURCE_HEALTH = "source_health"
+    const val ERROR_LOG = "error_log"
 
     const val EMULATOR_SETUP_DISCLAIMER    = "emulator_setup_disclaimer"
     const val EMULATOR_SETUP_PICK_EMULATOR = "emulator_setup_pick_emulator"
@@ -186,7 +190,19 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
             }
 
             composable(Routes.ABOUT) {
-                AboutScreen(onBack = { navController.popBackStack() })
+                AboutScreen(
+                    onBack = { navController.popBackStack() },
+                    onSourceHealth = { navController.navigate(Routes.SOURCE_HEALTH) },
+                    onErrorLog = { navController.navigate(Routes.ERROR_LOG) }
+                )
+            }
+
+            composable(Routes.SOURCE_HEALTH) {
+                SourceHealthScreen(onBack = { navController.popBackStack() })
+            }
+
+            composable(Routes.ERROR_LOG) {
+                ErrorLogScreen(onBack = { navController.popBackStack() })
             }
 
             composable(Routes.SETTINGS) {

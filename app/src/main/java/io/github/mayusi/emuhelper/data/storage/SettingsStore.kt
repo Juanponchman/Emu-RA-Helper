@@ -37,6 +37,9 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         val KEY_LAST_CONSOLES = stringSetPreferencesKey("last_selected_consoles")
         // ---- Theme mode (Feature 1) -------------------------------------------
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
+        // ---- Remote catalog cache --------------------------------------------
+        val KEY_LAST_CATALOG_FETCH = longPreferencesKey("last_catalog_fetch_ts")
+        val KEY_CACHED_REMOTE_CATALOG = stringPreferencesKey("cached_remote_catalog_json")
     }
 
     /** Persisted SAF URI for the user-chosen download folder, or null if using app-private dir. */
@@ -135,5 +138,19 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setThemeMode(mode: ThemeMode) {
         context.settingsStore.edit { it[KEY_THEME_MODE] = mode.name }
+    }
+
+    // ---- Remote catalog cache --------------------------------------------
+
+    val lastCatalogFetch: Flow<Long> = context.settingsStore.data.map { it[KEY_LAST_CATALOG_FETCH] ?: 0L }
+
+    suspend fun setLastCatalogFetch(timestamp: Long) {
+        context.settingsStore.edit { it[KEY_LAST_CATALOG_FETCH] = timestamp }
+    }
+
+    val cachedRemoteCatalog: Flow<String> = context.settingsStore.data.map { it[KEY_CACHED_REMOTE_CATALOG] ?: "" }
+
+    suspend fun setCachedRemoteCatalog(json: String) {
+        context.settingsStore.edit { it[KEY_CACHED_REMOTE_CATALOG] = json }
     }
 }

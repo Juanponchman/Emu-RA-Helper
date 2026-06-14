@@ -59,3 +59,7 @@ app/src/main/assets/curated.json
 curated.json
 docs/*-spec.md
 docs/specs/
+
+# Local Gradle homes created for parallel-build isolation (not source)
+.gradle_home/
+.gradle_home_ps/

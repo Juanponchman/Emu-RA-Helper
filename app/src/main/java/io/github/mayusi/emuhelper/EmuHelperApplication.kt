@@ -4,10 +4,32 @@ import android.app.Application
 import android.os.StrictMode
 import android.util.Log
 import dagger.hilt.android.HiltAndroidApp
+import dagger.hilt.EntryPoint
+import dagger.hilt.InstallIn
+import dagger.hilt.android.EntryPointAccessors
+import dagger.hilt.components.SingletonComponent
+import io.github.mayusi.emuhelper.data.source.CatalogRepository
+import io.github.mayusi.emuhelper.data.storage.CrashLogStore
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import java.io.File
 
 @HiltAndroidApp
 class EmuHelperApplication : Application() {
+
+    /** Hilt entry point used to retrieve [CatalogRepository] inside onCreate. */
+    @EntryPoint
+    @InstallIn(SingletonComponent::class)
+    interface AppEntryPoint {
+        fun catalogRepository(): CatalogRepository
+        fun crashLogStore(): CrashLogStore
+    }
+
+    /** Application-scoped coroutine scope for fire-and-forget background work. */
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     override fun onCreate() {
         super.onCreate()
 
@@ -32,6 +54,13 @@ class EmuHelperApplication : Application() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, e ->
             Log.e("EmuHelper", "Uncaught on ${thread.name}", e)
+            // Record the crash to the local (no-network) error log so it can be
+            // viewed/exported from About. Best-effort — never let logging itself
+            // interfere with the crash propagation below.
+            try {
+                val ep = EntryPointAccessors.fromApplication(applicationContext, AppEntryPoint::class.java)
+                ep.crashLogStore().logSync(thread.name, "${e.javaClass.simpleName}: ${e.message}")
+            } catch (_: Throwable) { /* ignore */ }
             previous?.uncaughtException(thread, e)
         }
 
@@ -51,5 +80,20 @@ class EmuHelperApplication : Application() {
                 Log.w("EmuHelper", "Stale .part cleanup failed", e)
             }
         }.apply { isDaemon = true; start() }
+
+        // Fire-and-forget: load remote catalog overlay on app start.
+        // DORMANT by default (placeholder URL) — becomes active once the operator
+        // sets a real REMOTE_CATALOG_URL in CatalogRepository. Any failure leaves
+        // the baked-in catalog fully intact.
+        appScope.launch {
+            try {
+                val entryPoint = EntryPointAccessors.fromApplication(
+                    applicationContext, AppEntryPoint::class.java
+                )
+                entryPoint.catalogRepository().loadOnStart()
+            } catch (e: Exception) {
+                Log.w("EmuHelper", "Remote catalog loadOnStart failed (baked-in catalog active)", e)
+            }
+        }
     }
 }
