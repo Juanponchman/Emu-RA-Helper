@@ -4,6 +4,14 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.3.1] — 2026-06-11
+
+### Added
+- A guided "create an account" path for new users: a link on the sign-in
+  screen leads to a short explainer and an in-app signup page (with an
+  "open in browser" fallback), so people without an account can make one
+  without getting stuck at the login wall.
+
 ## [0.3.0] — 2026-06-11
 
 ### Added
