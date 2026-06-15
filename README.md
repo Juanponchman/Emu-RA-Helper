@@ -2,10 +2,11 @@
 
 <h1 align="center">EmuHelper</h1>
 
-<p align="center"><strong>A configurable Android client for browsing and retrieving files from user-supplied web archive endpoints.</strong></p>
+<p align="center"><strong>An Android download manager for the Internet Archive — browse large collections, build lists, and pull files fast over multiple connections.</strong></p>
 
 <p align="center">
   <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Release" src="https://img.shields.io/github/v/release/mayusi/EmuHelper?include_prereleases&sort=semver&label=release"></a>
+  <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/mayusi/EmuHelper/total?label=downloads&color=brightgreen"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="Min Android 10 (API 29)" src="https://img.shields.io/badge/Android-10%2B%20(API%2029)-3DDC84?logo=android&logoColor=white">
   <img alt="Built with Kotlin" src="https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white">
@@ -13,9 +14,9 @@
 
 ---
 
-EmuHelper is a generic, **source-agnostic** download and transfer manager for Android. You point it at HTTP archive endpoints you configure, it reads their directory/metadata listings, lets you assemble and save selections, and fetches them with a fast multi-connection transfer engine — saving everything neatly into per-category folders on your device.
+EmuHelper is an Android download manager built for the [Internet Archive](https://archive.org). You browse the collections you've configured, assemble and save selections, and fetch them with a fast multi-connection transfer engine that saves everything neatly into per-category folders on your device. It signs in with your own free Internet Archive account and downloads on your behalf.
 
-It ships with **no endpoints and no content**. The "bring-your-own-endpoints" model is the whole idea: EmuHelper is the machinery for browsing and retrieving large files; *what* you point it at is entirely up to you and supplied at build time.
+The app is **configurable and ships with no collections of its own** — you set up which Internet Archive collections it reads from. That keeps the project itself just the machinery: the browsing, list-building, and fast-transfer engine. *What* you point it at is up to you.
 
 > **Status: Early / Alpha — v0.3.2.** Still new and actively being built. Expect rough edges, and please file issues.
 
@@ -23,19 +24,20 @@ It ships with **no endpoints and no content**. The "bring-your-own-endpoints" mo
 
 ## Why use it
 
-If you regularly pull large files down to a phone or tablet from archives you control, a browser download or a generic file manager quickly gets clumsy. EmuHelper is built for that specific job:
+Pulling large files from the Internet Archive down to a phone, tablet, or handheld through a browser is slow and clumsy — single-connection downloads, no way to queue a batch, and files scattered everywhere. EmuHelper is built for exactly that job:
 
-- **Maintain offline backups** of large files from archives and endpoints you control, without babysitting a browser.
-- **Manage a personal library** of big downloads — build a list once, then fetch the whole batch on demand.
-- **Pull big files fast** over your own connection using multiple parallel connections per file, with a safe cap so the device stays cool and responsive.
+- **Pull big files fast** — each download uses multiple parallel connections with automatic mirror fail-over, with a safe cap so the device stays cool and responsive.
+- **Build a library, fetch on demand** — assemble a list once, then download the whole batch when you're ready.
 - **Stay organized automatically** — downloads land in tidy, per-category folders instead of one giant unsorted pile.
-- **Reuse your selections** — save curated lists to portable files so you can re-fetch them later or move them between installs.
+- **Pick up where you left off** — resume interrupted batches, re-download from history, and skip files you already have.
+- **Reuse and share selections** — save lists to portable files (or import one from a URL) to re-fetch later or move between installs.
 
 ---
 
 ## ✨ Features
 
-- **Configurable endpoints** — operate on your own catalog of HTTP archive endpoints; nothing is bundled.
+- **Configurable collections** — you set up which Internet Archive collections it reads from; none are bundled with the project.
+- **Sign in with your own account** — uses your free Internet Archive login. New here? The app has a built-in, guided "create an account" flow.
 - **Two ways to fetch** — build and save a selection set to retrieve later, or run an instant ad-hoc session and download right now.
 - **Fast multi-connection transfers** — each file is pulled with range-segmented (parallel) connections, with mirror/host fail-over where available.
 - **Safe connection cap** — a hard ceiling on total simultaneous connections keeps the device from overheating or thrashing, no matter how aggressive your settings.
@@ -45,9 +47,11 @@ If you regularly pull large files down to a phone or tablet from archives you co
 - **Background-friendly** — transfers continue via a foreground service while the app is backgrounded; pause, resume, retry, and cancel are all supported.
 - **Transfer tuning** — sliders for connections-per-file and files-at-once, plus a one-tap **Max throughput** preset for fast Wi-Fi.
 - **Built-in network speed test** — measure your real throughput (Mbit/s, MB/s, and an estimated minutes-per-GB) so you can tell whether slow downloads are your link or the source.
-- **Device readout** — model, free/total RAM, CPU cores, and app version at a glance.
-- **Guided file-staging helper** — a step-by-step assistant for moving files **you select from your own device storage** into another app's import folder, with on-screen import instructions. It only copies files you explicitly pick; it never reaches out anywhere on its own.
-- **Modern UI** — Jetpack Compose, Material 3, light/dark theming, and animated navigation.
+- **Download history & re-download** — see what you've fetched, re-download an item, or copy a filename; orphaned partial files are cleaned up automatically.
+- **Source health check** — ping your configured collections to see at a glance which are reachable.
+- **Device readout & local error log** — model, free/total RAM, CPU cores, app version, and an on-device (never-uploaded) error log you can view or share for troubleshooting.
+- **Guided file-staging helper** — a step-by-step assistant for moving files **you select from your own device storage** into another app's import folder, with on-screen instructions. It only copies files you explicitly pick; it never reaches out anywhere on its own.
+- **Modern UI** — Jetpack Compose, Material 3, light/dark theming, animated navigation, and a layout that works on handhelds in landscape.
 
 ---
 
@@ -106,17 +110,23 @@ Output APK: `app/build/outputs/apk/debug/app-debug.apk`. Or just open the projec
 
 ## ❓ FAQ
 
-**Does it come with any download sources?**
-No. EmuHelper ships with **no endpoints and no content**. You supply your own endpoints at build time.
+**What is this, plainly?**
+A fast, organized download manager for the [Internet Archive](https://archive.org). It signs in with your free Internet Archive account, lets you browse and queue large files from the collections you've set up, and downloads them with multiple connections into tidy folders.
 
-**Why isn't `Catalog.kt` in the repository?**
-Endpoints are operator-supplied. Keeping them out of version control is deliberate, so every clone starts from an empty, buildable project. You generate `Catalog.kt` from the committed template.
+**Do I need an account?**
+Yes — a free Internet Archive account, which the app can guide you through creating. It downloads using your own login; the project doesn't include or share any account.
 
-**Can I build it without setting up any endpoints?**
-Yes. Clone, copy the template to `Catalog.kt`, and run `./gradlew :app:assembleDebug`. The app runs fine with empty lists — entries only appear once you add your own endpoints.
+**Does it come with collections built in?**
+No. EmuHelper ships with **no collections of its own** — you configure which Internet Archive collections it reads from. The config file (`Catalog.kt`) is generated from a committed template and kept out of version control, so the repository itself stays content-free and every clone starts from an empty, buildable project.
+
+**Can I build it without setting anything up?**
+Yes. Clone, copy the template to `Catalog.kt`, and run `./gradlew :app:assembleDebug`. The app compiles and runs with empty lists — collections appear once you add them.
 
 **What permissions does it need?**
-Internet access, notification permission (Android 13+), and Storage Access Framework (SAF) access to a folder you pick. Nothing more.
+Internet access, notification permission (Android 13+), Storage Access Framework (SAF) access to a folder you pick, and install-packages permission for the optional in-app updater. Nothing more.
+
+**Is it affiliated with the Internet Archive?**
+No. EmuHelper is an independent, unofficial client. The Internet Archive is a nonprofit digital library; please consider [donating](https://archive.org/donate) to support it.
 
 ---
 
