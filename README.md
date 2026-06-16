@@ -14,11 +14,15 @@
 
 ---
 
-EmuHelper is an Android download manager built for the [Internet Archive](https://archive.org). You browse the collections you've configured, assemble and save selections, and fetch them with a fast multi-connection transfer engine that saves everything neatly into per-category folders on your device. It signs in with your own free Internet Archive account and downloads on your behalf.
+<p align="center"><strong>✅ Ready to go — just install, sign in, and download. No setup required.</strong></p>
 
-The app is **configurable and ships with no collections of its own** — you set up which Internet Archive collections it reads from. That keeps the project itself just the machinery: the browsing, list-building, and fast-transfer engine. *What* you point it at is up to you.
+---
+
+EmuHelper is an Android download manager built for the [Internet Archive](https://archive.org). **Grab the APK, sign in with your free Internet Archive account, and you're downloading in under a minute** — the collections are already wired up, so there's nothing to configure. It browses those collections, lets you assemble and save selections, and fetches them with a fast multi-connection transfer engine that drops everything into tidy per-category folders.
 
 > **Status: Early / Alpha — v0.4.0.** Still new and actively being built. Expect rough edges, and please file issues.
+
+> *Builders:* the source repository itself is content-free by design — it ships with no collections, generated from an empty template. The prebuilt release is the ready-to-use one; if you build from source you supply your own. See [Build from source](#-build-from-source).
 
 ---
 
