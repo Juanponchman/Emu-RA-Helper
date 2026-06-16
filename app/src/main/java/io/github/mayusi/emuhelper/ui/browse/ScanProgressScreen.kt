@@ -93,21 +93,32 @@ class BrowseViewModel @Inject constructor(
 
     fun queueDownloads(games: List<io.github.mayusi.emuhelper.data.model.CuratedGame>) {
         stateHolder.downloadQueue.value = games
-        // Free the large scannedFiles map now that the selection has been committed to
-        // downloadQueue. The download flow only needs downloadQueue from here on.
-        stateHolder.clearScan()
+        // NOTE: clearScan() is intentionally NOT called here. Freeing scannedFiles while
+        // GamePickerScreen is still composed (mid-transition) causes a flash of the
+        // "No files found" empty state. Instead, GamePickerScreen calls clearScan() from
+        // its DisposableEffect.onDispose so memory is freed only after the screen leaves
+        // composition — after the nav animation is fully done.
     }
 
     fun clearQueue() {
         stateHolder.downloadQueue.value = emptyList()
     }
 
+    /**
+     * Release the large scannedFiles map. Called from GamePickerScreen's
+     * DisposableEffect.onDispose so memory is freed only after the picker fully
+     * leaves composition (post-nav-animation), not mid-transition.
+     */
+    fun clearScan() {
+        stateHolder.clearScan()
+    }
+
     /** Hand the picker's current selection to the Save-list screen (BUILD mode). */
     fun stageForSaving(games: List<io.github.mayusi.emuhelper.data.model.CuratedGame>) {
         stateHolder.pendingListGames.value = games
-        // Free the large scannedFiles map now that the selection has been committed to
-        // pendingListGames. The save-list flow only needs pendingListGames from here on.
-        stateHolder.clearScan()
+        // NOTE: clearScan() is intentionally NOT called here — same reasoning as
+        // queueDownloads(). GamePickerScreen's DisposableEffect.onDispose calls it
+        // after the screen fully leaves composition.
     }
 
     /** Tracks the running scan so a new scan can cancel a stale one (prevents the

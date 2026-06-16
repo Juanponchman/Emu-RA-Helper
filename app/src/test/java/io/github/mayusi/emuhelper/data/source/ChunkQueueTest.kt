@@ -355,4 +355,132 @@ class ChunkQueueTest {
         assertTrue(q.isFailed(f.index))
         assertFalse(q.forceRequeue(f), "must not resurrect a failed chunk")
     }
+
+    // ---- v2 TAIL-CHUNK RACING -----------------------------------------------
+
+    /** A ChunkQueue with an injectable clock so tail-race timing is deterministic. */
+    private fun racingQueueFor(size: Long, chunkSize: Long, now: () -> Long): ChunkQueue =
+        ChunkQueue(partitionChunks(size, chunkSize), nowProvider = now)
+
+    @Test
+    fun `isInTail is false until the queue is drained and only a few chunks remain in flight`() {
+        var clock = 0L
+        val q = racingQueueFor(60L, 10L) { clock } // 6 chunks
+        // Plenty of fresh work queued -> NOT in the tail (an idle worker should claim, not race).
+        assertFalse(q.isInTail(), "fresh queued work must disable racing")
+        // Claim every chunk so the queue is drained but many are in flight (> threshold of 3).
+        val claimed = ArrayList<Chunk>()
+        var c = q.poll(); while (c != null) { claimed.add(c); c = q.poll() }
+        assertEquals(6, claimed.size)
+        assertFalse(q.isInTail(), "queue drained but inFlight (6) > RACE_TAIL_THRESHOLD (3)")
+        // Finish chunks until only 3 remain in flight -> NOW we're in the tail.
+        q.markDone(claimed[0]); q.markDone(claimed[1]); q.markDone(claimed[2])
+        assertEquals(3, q.inFlightCount())
+        assertTrue(q.isInTail(), "drained + inFlight==RACE_TAIL_THRESHOLD must be the tail")
+        // Finish all -> no longer in tail (nothing to race, all done).
+        q.markDone(claimed[3]); q.markDone(claimed[4]); q.markDone(claimed[5])
+        assertFalse(q.isInTail(), "fully done is not a tail")
+        assertTrue(q.allDone())
+    }
+
+    @Test
+    fun `pickRaceTarget only returns a chunk in the tail, past min in-flight age, never the freshest`() {
+        var clock = 1_000_000L
+        val q = racingQueueFor(30L, 10L) { clock } // 3 chunks
+        // Not in tail yet: claim one, two still queued.
+        val a = q.poll()!!
+        assertNull(q.pickRaceTarget(), "fresh queued work -> no race target")
+        // Claim the rest so the queue is drained (3 in flight == threshold).
+        val b = q.poll()!!
+        val c = q.poll()!!
+        assertEquals(0, q.unclaimed())
+        assertEquals(3, q.inFlightCount())
+        // All were just claimed (age 0) -> none is past RACE_MIN_INFLIGHT_MS -> no target yet.
+        assertNull(q.pickRaceTarget(), "no in-flight chunk is old enough to race")
+        // Age past the min-in-flight window -> the LONGEST-running (a, claimed first) is chosen.
+        clock += AdaptiveEngine.RACE_MIN_INFLIGHT_MS
+        val target = q.pickRaceTarget()
+        assertNotNull(target)
+        assertEquals(a.index, target!!.index, "the oldest in-flight chunk must be raced first")
+        assertEquals(1, q.racersOf(a.index), "pickRaceTarget reserves a racer slot")
+        // Per-chunk racer cap (MAX_RACERS_PER_CHUNK == 1): no second racer on the SAME chunk while
+        // the first holds the slot; the next-oldest (b) is offered instead.
+        val target2 = q.pickRaceTarget()
+        assertNotNull(target2)
+        assertEquals(b.index, target2!!.index, "racer cap diverts to the next-oldest tail chunk")
+        // Cleanup references so the compiler doesn't warn about unused locals.
+        assertEquals(3, q.inFlightCount())
+        assertTrue(b.index != c.index)
+    }
+
+    @Test
+    fun `a raced chunk completing via the racer marks done and the loser is an idempotent no-op`() {
+        var clock = 1_000_000L
+        val q = racingQueueFor(20L, 10L) { clock } // 2 chunks
+        val primary = q.poll()!!
+        q.poll()!! // drain the queue (2 in flight)
+        clock += AdaptiveEngine.RACE_MIN_INFLIGHT_MS
+        // A racer picks the primary's chunk.
+        val raced = q.pickRaceTarget()!!
+        assertEquals(primary.index, raced.index)
+        assertEquals(1, q.racersOf(primary.index))
+        // The RACER finishes first: its markDone wins (true). inFlight drops by exactly 1.
+        val before = q.inFlightCount()
+        assertTrue(q.markDone(raced), "racer's markDone must win")
+        assertEquals(before - 1, q.inFlightCount(), "winning markDone decrements inFlight once")
+        // The PRIMARY (loser) finishing late is a no-op: false, no double-decrement, no double-count.
+        assertFalse(q.markDone(primary), "loser's late markDone must be a no-op")
+        assertEquals(before - 1, q.inFlightCount(), "loser must NOT decrement inFlight again")
+        // The racer slot was cleared by the winning markDone (in-flight entry removed).
+        assertEquals(0, q.racersOf(primary.index))
+        // endRace after the chunk is gone is a harmless no-op (racer accounting can't leak).
+        q.endRace(raced)
+        assertEquals(0, q.racersOf(primary.index))
+    }
+
+    @Test
+    fun `endRace releases a racer slot and never drives inFlight negative or leaks`() {
+        var clock = 1_000_000L
+        val q = racingQueueFor(20L, 10L) { clock } // 2 chunks
+        val primary = q.poll()!!
+        q.poll()!!
+        clock += AdaptiveEngine.RACE_MIN_INFLIGHT_MS
+        val raced = q.pickRaceTarget()!!
+        assertEquals(1, q.racersOf(primary.index))
+        val inFlightBefore = q.inFlightCount()
+        // Racer LOSES / abandons: endRace clears its slot WITHOUT touching the primary's inFlight.
+        q.endRace(raced)
+        assertEquals(0, q.racersOf(primary.index), "endRace clears the racer slot")
+        assertEquals(inFlightBefore, q.inFlightCount(), "endRace must NOT change inFlight")
+        // Double endRace is a no-op (never negative).
+        q.endRace(raced)
+        assertEquals(0, q.racersOf(primary.index))
+        // The primary still owns the chunk and can complete it normally.
+        assertTrue(q.markDone(primary))
+        assertEquals(inFlightBefore - 1, q.inFlightCount())
+    }
+
+    @Test
+    fun `racing preserves the accounting identity claims minus requeues minus dones equals inFlight`() {
+        // Racers must NOT perturb the core identity — they're tracked in a SEPARATE counter and
+        // never touch claims/requeues/dones/inFlight except via the single winning markDone.
+        var clock = 1_000_000L
+        val q = racingQueueFor(30L, 10L) { clock } // 3 chunks
+        fun checkIdentity() {
+            val expected = q.claimsCount() - q.requeuesCount() - q.donesCount()
+            assertEquals(expected, q.inFlightCount().toLong(), "identity must hold even with racers")
+        }
+        val a = q.poll()!!; val b = q.poll()!!; val c = q.poll()!!
+        checkIdentity()
+        clock += AdaptiveEngine.RACE_MIN_INFLIGHT_MS
+        // Start racers on two chunks — identity is unchanged (racers aren't claims).
+        val r1 = q.pickRaceTarget()!!; checkIdentity()
+        q.endRace(r1); checkIdentity()
+        // Winner completes a; loser endRace; identity holds throughout.
+        assertTrue(q.markDone(a)); checkIdentity()
+        q.markDone(b); checkIdentity()
+        q.markDone(c); checkIdentity()
+        assertTrue(q.allDone())
+        assertEquals(0, q.inFlightCount())
+    }
 }

@@ -88,6 +88,21 @@ fun GamePickerScreen(
         }
     }
 
+    // FIX C: track whether scannedFiles was ever non-empty in this session.
+    // This lets the empty-state branch distinguish a genuinely empty scan from
+    // the map being cleared by clearScan() after a successful selection.
+    var hadData by remember { mutableStateOf(false) }
+    LaunchedEffect(scannedFiles) {
+        if (scannedFiles.isNotEmpty()) hadData = true
+    }
+
+    // FIX A: free the large scannedFiles map AFTER this screen leaves composition
+    // (i.e. after the nav animation completes), not mid-transition inside
+    // queueDownloads/stageForSaving. This prevents the flash.
+    DisposableEffect(Unit) {
+        onDispose { viewModel.clearScan() }
+    }
+
     // In "All" mode flatten every console's list; otherwise scope to the selected console.
     val isAllMode = currentConsole == ALL_CONSOLES_KEY
     val files: List<GameFile> = if (isAllMode) {
@@ -124,6 +139,16 @@ fun GamePickerScreen(
     }
 
     if (scannedFiles.isEmpty()) {
+        // FIX C: if we HAD data and it just went empty, the map was cleared by
+        // clearScan() after the user pressed Download/Save — this screen is mid-
+        // transition off the stack. Render nothing; the DisposableEffect will fire
+        // onDispose momentarily and the nav animation will complete. Never show
+        // "No files found" for a consumed/cleared picker.
+        if (hadData) {
+            return
+        }
+        // Genuine empty-scan state: the scan ran to completion but found nothing
+        // (or is still in flight). Show a helpful message.
         // If a scan is still running (we got here via a stale-state race), show a
         // calm "still scanning" state instead of a scary "No files found" — and do
         // NOT offer a Go Back that strands the user on an in-progress scan.

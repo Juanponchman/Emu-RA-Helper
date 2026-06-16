@@ -321,9 +321,18 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
                         if (instant) {
                             // Instant install: straight to downloading (login checked there
                             // if needed).
-                            navController.navigate(Routes.DOWNLOAD_PREVIEW)
+                            // FIX B: pop PICK (and the whole console_select+scan chain) off
+                            // the back stack so Back from DOWNLOAD_PREVIEW/DOWNLOAD goes to
+                            // HOME, not a stale empty picker.
+                            navController.navigate(Routes.DOWNLOAD_PREVIEW) {
+                                popUpTo(Routes.HOME) { inclusive = false }
+                            }
                         } else {
-                            navController.navigate(Routes.SAVE_LIST)
+                            // Build/save path: pop PICK and scan/console chain back to HOME
+                            // so Back from SAVE_LIST returns to HOME, not a stale picker.
+                            navController.navigate(Routes.SAVE_LIST) {
+                                popUpTo(Routes.HOME) { inclusive = false }
+                            }
                         }
                     },
                     onBack = { navController.popBackStack() }

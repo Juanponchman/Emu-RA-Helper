@@ -4,6 +4,27 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.3] — 2026-06-16
+
+### Fixed
+- **Stay logged in.** After signing in once, the app now trusts your saved
+  session immediately on startup instead of racing a timer — so it no longer
+  needlessly re-logs-in (the "it takes a moment") or briefly shows a signed-out
+  state. If your session ever does expire, it re-authenticates silently in the
+  background; you should only ever see the login screen again if your saved
+  password stops working.
+- **No more "No files found" flash.** Starting a download no longer flashes the
+  empty "No files found" screen for a split second, and pressing Back after a
+  download no longer lands on a stale, empty picker — Back now returns home.
+
+### Changed
+- **Adaptive engine: faster mode (experimental).** The adaptive download engine
+  can now open more connections across more mirrors at once and "race" the last
+  few slow chunks at the end of a file, to cut the long tail. Still off by
+  default (Settings → Experimental). Honest note: gains depend on your
+  connection and how many fast mirrors a file has — if you're already maxing
+  your own bandwidth, more connections won't beat that ceiling.
+
 ## [0.5.2] — 2026-06-16
 
 ### Fixed

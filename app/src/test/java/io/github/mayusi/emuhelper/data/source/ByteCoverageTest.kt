@@ -2,6 +2,7 @@ package io.github.mayusi.emuhelper.data.source
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
 import kotlin.test.Test
@@ -219,6 +220,170 @@ class ByteCoverageTest {
             failureRate = 0.0, seed = 100,
             maxErrorAttempts = 5, stallRate = 0.90
         )
+    }
+
+    // ---- v2 TAIL-CHUNK RACING: byte coverage under duplicate concurrent writes ----------
+
+    /**
+     * Models the v2 tail-racing behaviour and proves it can't corrupt bytes. Workers drain a
+     * shared queue; when there's no fresh chunk to claim AND the download is in its tail, an idle
+     * worker RACES an in-flight chunk: it dials a SECOND "connection" for the SAME absolute range
+     * and copies the same source bytes to the same output offsets. Both the primary and the racer
+     * write IDENTICAL bytes (last-write-wins is byte-safe), each checks `done` before every burst
+     * and bails the instant the chunk is finished, and whoever's [ChunkQueue.markDone] returns true
+     * is the sole winner. The reconstructed output must equal the source at EVERY offset despite
+     * the deliberate duplicate concurrent writes.
+     *
+     * To FORCE real racing (not just exercise the path), the PRIMARY on each chunk is made
+     * artificially slow (tiny bursts + a injected micro-pause) so a racer reliably catches up.
+     */
+    private fun simulateWithRacing(
+        size: Int,
+        chunkSize: Long,
+        workerCount: Int,
+        seed: Long
+    ): Triple<ByteArray, Int, Int> { // (output, racesStarted, racesWon)
+        val source = ByteArray(size) { i -> ((i * 31 + 7) and 0xFF).toByte() }
+        val output = ByteArray(size) { 0 }
+
+        // A shared monotonic clock the queue reads for tail-race age gating. Advancing it well past
+        // RACE_MIN_INFLIGHT_MS makes every drained-tail chunk immediately race-eligible.
+        val clock = AtomicLong(1_000_000L)
+        val queue = ChunkQueue(partitionChunks(size.toLong(), chunkSize), nowProvider = { clock.get() })
+        val failure = AtomicReference<Throwable?>(null)
+        val racesStarted = AtomicInteger(0)
+        val racesWon = AtomicInteger(0)
+        val ready = CountDownLatch(workerCount)
+        val go = CountDownLatch(1)
+        val workerSeed = AtomicInteger(0)
+
+        // Copy a chunk's range in small bursts, checking `done` before each burst. Returns true iff
+        // it wrote the FULL range (eligible to markDone). `slow` injects extra delay/finer bursts on
+        // the primary so a racer can overtake it. A racer bails early when the chunk goes done.
+        fun copyRange(chunk: Chunk, rnd: Random, slow: Boolean, isRace: Boolean): Boolean {
+            val start = chunk.start.toInt()
+            val len = chunk.length.toInt()
+            var i = 0
+            while (i < len) {
+                // done-check BEFORE writing: the loser bails the moment the winner finishes.
+                if (isRace && queue.isDone(chunk.index)) return false
+                val maxBurst = if (slow) 8 else 64
+                val burst = minOf(1 + rnd.nextInt(maxBurst), len - i)
+                System.arraycopy(source, start + i, output, start + i, burst)
+                i += burst
+                // Advance the clock a touch each burst so tail-age gating stays satisfied; the slow
+                // primary advances it more (simulating a slow node), giving racers room to win.
+                clock.addAndGet(if (slow) 50L else 1L)
+                if (slow) Thread.yield()
+            }
+            return true
+        }
+
+        val threads = (0 until workerCount).map {
+            Thread {
+                val rnd = Random(seed + workerSeed.getAndIncrement() * 1009L)
+                ready.countDown(); go.await()
+                try {
+                    while (queue.shouldKeepWorking()) {
+                        val chunk = queue.poll()
+                        if (chunk == null) {
+                            // No fresh work: try to RACE a tail chunk (the v2 idle-worker path).
+                            val raceChunk = queue.pickRaceTarget()
+                            if (raceChunk != null) {
+                                racesStarted.incrementAndGet()
+                                try {
+                                    val full = copyRange(raceChunk, rnd, slow = false, isRace = true)
+                                    if (full && queue.markDone(raceChunk)) racesWon.incrementAndGet()
+                                } finally {
+                                    queue.endRace(raceChunk) // release racer slot on every path
+                                }
+                            } else {
+                                Thread.yield()
+                            }
+                            continue
+                        }
+                        // PRIMARY owner: copy slowly so racers can overtake near the tail, then
+                        // markDone (a no-op if a racer already won — last-write-wins, idempotent).
+                        val full = copyRange(chunk, rnd, slow = true, isRace = false)
+                        if (full) queue.markDone(chunk)
+                    }
+                } catch (t: Throwable) {
+                    failure.compareAndSet(null, t)
+                }
+            }
+        }
+        threads.forEach { it.isDaemon = true; it.start() }
+        assertTrue(ready.await(10, java.util.concurrent.TimeUnit.SECONDS), "workers failed to start")
+        go.countDown()
+        threads.forEach { it.join(30_000) }
+
+        failure.get()?.let { throw AssertionError("worker threw", it) }
+        assertTrue(queue.allDone(), "queue did not fully complete under racing")
+        assertEquals(0, queue.inFlightCount(), "chunks left in flight after racing completion")
+        return Triple(output, racesStarted.get(), racesWon.get())
+    }
+
+    @Test
+    fun `reconstruction is byte-exact under tail-chunk racing with duplicate concurrent writes`() {
+        // Many workers, few-enough chunks that the queue drains while several are still in flight —
+        // the exact tail condition where racing fires. The duplicate concurrent writes (primary +
+        // racer on the same range) must NOT corrupt a single byte.
+        val expected = ByteArray(120_000) { i -> ((i * 31 + 7) and 0xFF).toByte() }
+        val (output, started, _) = simulateWithRacing(
+            size = 120_000, chunkSize = 4096, workerCount = 12, seed = 7
+        )
+        assertEquals(expected.size, output.size)
+        for (i in expected.indices) {
+            if (output[i] != expected[i]) {
+                throw AssertionError("byte mismatch at offset $i under racing: got ${output[i]} expected ${expected[i]}")
+            }
+        }
+        // Sanity: with 12 workers and a slow primary the tail must actually have raced at least once
+        // (otherwise the test wouldn't be exercising the duplicate-write path it claims to).
+        assertTrue(started > 0, "expected the tail to race at least once (started=$started)")
+    }
+
+    @Test
+    fun `racing reconstructs exactly across several size and worker combos`() {
+        val combos = listOf(
+            // size, chunkSize, workers
+            Triple(40_000, 2048L, 8),
+            Triple(80_000, 4096L, 16),
+            Triple(50_000, 1000L, 24)
+        )
+        var seed = 500L
+        for ((size, cs, workers) in combos) {
+            val expected = ByteArray(size) { i -> ((i * 31 + 7) and 0xFF).toByte() }
+            val (output, _, _) = simulateWithRacing(size, cs, workers, seed++)
+            assertEquals(size, output.size)
+            for (i in 0 until size) {
+                if (output[i] != expected[i]) {
+                    throw AssertionError(
+                        "byte mismatch at offset $i (size=$size cs=$cs workers=$workers): " +
+                            "got ${output[i]} expected ${expected[i]}"
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `a raced chunk is counted exactly once - confirmed bytes never double-count`() {
+        // Drive the winner/loser markDone race directly and assert the byte count is added EXACTLY
+        // once: markDone returns true for exactly one caller, so a "count on true" rule can never
+        // double-count a raced chunk's bytes.
+        val clock = AtomicLong(1_000_000L)
+        val queue = ChunkQueue(partitionChunks(20L, 10L), nowProvider = { clock.get() }) // 2 chunks
+        val confirmed = AtomicLong(0)
+        val primary = queue.poll()!!
+        queue.poll()!! // drain
+        clock.addAndGet(AdaptiveEngine.RACE_MIN_INFLIGHT_MS)
+        val racer = queue.pickRaceTarget()!!
+        // Both "finish" and try to count bytes; only the winner's markDone returns true.
+        if (queue.markDone(racer)) confirmed.addAndGet(racer.length)   // winner
+        if (queue.markDone(primary)) confirmed.addAndGet(primary.length) // loser -> no-op
+        queue.endRace(racer)
+        assertEquals(primary.length, confirmed.get(), "raced chunk bytes counted exactly once")
     }
 
     @Test

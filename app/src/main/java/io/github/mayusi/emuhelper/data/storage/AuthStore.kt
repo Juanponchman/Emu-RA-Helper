@@ -38,23 +38,37 @@ class AuthStore @Inject constructor(@ApplicationContext private val context: Con
      * Null when secure storage is unavailable (EncryptedSharedPreferences init failed).
      * In that state all reads return empty/defaults and all writes are NO-OPS — credentials
      * are never written to plaintext storage. The user will simply log in fresh each session.
+     *
+     * FIX 5: we deliberately do NOT memoize a FAILED open via `by lazy`. A transient KeyStore
+     * error right after boot can make create() throw once; caching that null would permanently
+     * lose the saved credentials for the whole process (so auto-login could never run, forcing
+     * a fresh sign-in). Instead we cache only a SUCCESSFUL handle and retry create() on the next
+     * access. No-plaintext-fallback policy is unchanged.
      */
-    private val prefs: SharedPreferences? by lazy {
-        try {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context,
-                ENCRYPTED_PREFS_FILE,
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (e: Exception) {
-            Log.w("EmuHelper", "Secure storage unavailable; credentials will not be persisted this session", e)
-            null // No plaintext fallback — credentials simply won't persist.
+    @Volatile private var cachedPrefs: SharedPreferences? = null
+    private val prefsLock = Any()
+    private val prefs: SharedPreferences?
+        get() {
+            cachedPrefs?.let { return it }
+            return synchronized(prefsLock) {
+                cachedPrefs ?: openPrefs().also { if (it != null) cachedPrefs = it }
+            }
         }
+
+    private fun openPrefs(): SharedPreferences? = try {
+        val masterKey = MasterKey.Builder(context)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .build()
+        EncryptedSharedPreferences.create(
+            context,
+            ENCRYPTED_PREFS_FILE,
+            masterKey,
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+    } catch (e: Exception) {
+        Log.w("EmuHelper", "Secure storage unavailable; credentials will not be persisted this session", e)
+        null // No plaintext fallback — credentials simply won't persist.
     }
 
     // Reactive flows so the UI updates when credentials change. Seeded from disk on first read.

@@ -23,9 +23,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import io.github.mayusi.emuhelper.data.model.CuratedGame
+import io.github.mayusi.emuhelper.data.source.LoginResult
 import io.github.mayusi.emuhelper.data.source.RemoteSource
+import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.data.storage.SettingsStore
+import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.cleanGameName
@@ -33,6 +38,7 @@ import io.github.mayusi.emuhelper.ui.common.formatSize
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import javax.inject.Inject
@@ -42,6 +48,8 @@ class DownloadPreviewViewModel @Inject constructor(
     private val scanState: ScanStateHolder,
     private val source: RemoteSource,
     private val settings: SettingsStore,
+    private val authStore: AuthStore,
+    private val cookieJar: PersistentCookieJar,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
 
@@ -74,6 +82,60 @@ class DownloadPreviewViewModel @Inject constructor(
     }
 
     fun isLoggedIn(): Boolean = source.isLoggedIn()
+
+    /**
+     * FIX 3 + FIX 4: the download gate's reliable "am I logged in?" path.
+     *
+     * Returns true if the user is (or can be silently made) logged in, false ONLY when the
+     * login screen is genuinely required. Steps:
+     *   (a) awaitRestored() so a cold-start disk restore can't be lost to a race, then re-check
+     *       the real persisted session;
+     *   (b) if still logged out but rememberMe + saved creds exist, attempt a SILENT
+     *       source.login() (no full login screen — the caller shows a small inline spinner);
+     *   (c) return false (→ login screen needed) only if there are no saved creds OR the silent
+     *       login DEFINITIVELY fails (bad creds). A network failure also returns false, but the
+     *       saved creds remain so the NEXT tap retries (one in-flight attempt at a time below).
+     *
+     * This is the on-demand path: even if the startup auto-relogin failed (e.g. no network at
+     * boot), tapping Download here silently re-auths.
+     */
+    suspend fun ensureLoggedIn(): Boolean {
+        // (a) Don't trust a synchronous isLoggedIn() on a cold start — wait for the restore.
+        cookieJar.awaitRestored()
+        if (source.isLoggedIn()) return true
+
+        // (b) Try a silent re-login from saved credentials.
+        val remember = authStore.rememberMe.first()
+        val email = authStore.savedEmail.first()
+        if (!remember || email.isBlank()) return false // no saved creds → login screen needed
+        val pwd = authStore.getSavedPassword()
+        if (pwd.isBlank()) return false
+
+        return when (source.login(email, pwd)) {
+            is LoginResult.Success -> true
+            is LoginResult.Failed -> source.isLoggedIn() // tolerate a benign race; else login needed
+        }
+    }
+
+    // FIX 4: guard against spamming the network with concurrent silent-login attempts — only one
+    // ensureLoggedIn() runs at a time. A second tap while one is in flight just awaits its result.
+    private val _signingIn = MutableStateFlow(false)
+    val signingIn: StateFlow<Boolean> = _signingIn
+    private var inFlight: kotlinx.coroutines.Deferred<Boolean>? = null
+
+    /** Single-flight wrapper around [ensureLoggedIn] used by the screen's Download tap. */
+    suspend fun ensureLoggedInOnce(): Boolean {
+        inFlight?.let { return it.await() }
+        _signingIn.value = true
+        val job = viewModelScope.async { ensureLoggedIn() }
+        inFlight = job
+        return try {
+            job.await()
+        } finally {
+            inFlight = null
+            _signingIn.value = false
+        }
+    }
 
     /** Narrow the download queue to only the checked games. Returns how many remain. */
     fun confirmSelection(): Int {
@@ -116,6 +178,10 @@ fun DownloadPreviewScreen(
     val games by viewModel.games.collectAsState()
     val checked by viewModel.checked.collectAsState()
     val freeBytes by viewModel.freeBytes.collectAsState()
+    // FIX 3: inline "Signing in…" state for the silent relogin attempt — shown on the Download
+    // button instead of bouncing the user to the full login screen.
+    val signingIn by viewModel.signingIn.collectAsState()
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(games) {
         if (games.isEmpty()) onBack() else viewModel.seedIfNeeded(games)
@@ -208,9 +274,23 @@ fun DownloadPreviewScreen(
                         }
                         Button(
                             onClick = {
+                                // FIX 3: silently re-login BEFORE ever signalling needsLogin. We
+                                // await the cookie restore + attempt a saved-credential login with
+                                // an inline spinner; only if that DEFINITIVELY fails do we tell the
+                                // nav lane (onConfirm(needsLogin = true)) to route to the login
+                                // screen. The actual navigate-to-login hop lives in EmuHelperApp
+                                // (nav lane, not this lane) — we only flip the boolean it consumes.
                                 val doConfirm = {
                                     val remaining = viewModel.confirmSelection()
-                                    if (remaining > 0) onConfirm(!viewModel.isLoggedIn())
+                                    if (remaining > 0) {
+                                        scope.launch {
+                                            // ensureLoggedInOnce() == true → already/now logged in,
+                                            // proceed with no login screen. false → genuinely needs
+                                            // the login screen (no creds, or bad creds).
+                                            val ok = viewModel.ensureLoggedInOnce()
+                                            onConfirm(!ok)
+                                        }
+                                    }
                                 }
                                 if (spaceWarning) {
                                     pendingConfirmAction = doConfirm
@@ -219,11 +299,24 @@ fun DownloadPreviewScreen(
                                     doConfirm()
                                 }
                             },
-                            enabled = selCount > 0,
+                            // Disable while a silent relogin is in flight so taps can't stack.
+                            enabled = selCount > 0 && !signingIn,
                             modifier = Modifier.height(Dimens.ButtonMinHeight),
                             shape = MaterialTheme.shapes.small,
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                        ) { Text("Download $selCount  ·  ${formatSize(selSize)}", style = MaterialTheme.typography.titleMedium) }
+                        ) {
+                            if (signingIn) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(20.dp),
+                                    strokeWidth = 2.dp,
+                                    color = MaterialTheme.colorScheme.onPrimary
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("Signing in…", style = MaterialTheme.typography.titleMedium)
+                            } else {
+                                Text("Download $selCount  ·  ${formatSize(selSize)}", style = MaterialTheme.typography.titleMedium)
+                            }
+                        }
                     }
                 }
             }

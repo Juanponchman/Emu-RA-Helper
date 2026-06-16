@@ -78,6 +78,53 @@ internal object AdaptiveEngine {
      * loop, not an error threshold.
      */
     const val MAX_STALL_REQUEUES: Int = 50
+
+    // ===================================================================================
+    // v2 SPEED LEVERS — OVER-PROVISIONING + TAIL-CHUNK RACING.
+    //
+    // v1 kept exactly `segments` workers busy and so never opened MORE connections than the
+    // nominal segment count, even when the global 24-connection budget was free. On the Internet
+    // Archive a single connection to one node is throttled, but pulling from MANY fast nodes at
+    // once is not — so the real speedup is to (1) open more connections from more nodes when the
+    // budget allows, and (2) kill the "waiting on 1-2 slow chunks at 99%" tail by racing the last
+    // few in-flight chunks on a second, different host. BOTH stay strictly under the global
+    // connectionBudget Semaphore (the #1 safety invariant: total acquired permits <= 24 always).
+    // ===================================================================================
+
+    /**
+     * OVER-PROVISION cap (v2). The adaptive worker pool may spin up to this many workers for a
+     * single file, regardless of the nominal `segments` hint — bounded additionally by the chunk
+     * count (no point exceeding chunks) and, at runtime, by the shared connectionBudget Semaphore
+     * (every worker acquire()s a permit, so the GLOBAL 24-cap is never exceeded no matter how many
+     * workers exist). This lets ONE big file pull from more nodes in parallel when the budget is
+     * free, while still yielding permits to other concurrent files via the same Semaphore. Set to
+     * the global connection ceiling so a single file can, when alone, use the whole budget.
+     */
+    const val MAX_ADAPTIVE_WORKERS: Int = 24
+
+    /**
+     * TAIL-RACING gate (v2): racing only kicks in for the long TAIL of a file — when there is
+     * NOTHING left to start fresh (queue.unclaimed() == 0) AND only this few chunks are still
+     * in-flight. Early in a download there's plenty of fresh work, so an idle worker should claim
+     * a new chunk, never race. Small so we don't waste a connection racing when real work remains.
+     */
+    const val RACE_TAIL_THRESHOLD: Int = 3
+
+    /**
+     * Minimum wall-clock a tail chunk must have been in-flight before it is eligible to be RACED
+     * (v2). A chunk that just started is not the "slow tail" — give it a beat to make progress on
+     * its own before a second worker dials a duplicate. Keeps racing targeted at genuinely-slow
+     * tail chunks, not freshly-claimed ones.
+     */
+    const val RACE_MIN_INFLIGHT_MS: Long = 1500L
+
+    /**
+     * Max simultaneous EXTRA racers per in-flight tail chunk (v2). 1 means a raced chunk runs on at
+     * most TWO connections total (the original worker + one racer) — enough to dodge a single slow
+     * node without multiplying connection pressure. The global Semaphore caps the absolute total
+     * regardless; this just bounds per-chunk duplication.
+     */
+    const val MAX_RACERS_PER_CHUNK: Int = 1
 }
 
 /**
@@ -130,7 +177,11 @@ internal fun partitionChunks(size: Long, chunkSize: Long = AdaptiveEngine.CHUNK_
  * All state is guarded by an intrinsic lock — operations are O(1)/O(count) over a tiny set, so
  * contention is negligible even with 24 workers. No coroutines: pure, synchronous, testable.
  */
-internal class ChunkQueue(chunks: List<Chunk>) {
+internal class ChunkQueue(
+    chunks: List<Chunk>,
+    /** Injected clock so tail-race timing is deterministic in tests. */
+    private val nowProvider: () -> Long = { System.currentTimeMillis() }
+) {
     private val lock = Any()
 
     /** Immutable partition, indexed by chunk.index for O(1) lookups. */
@@ -141,6 +192,20 @@ internal class ChunkQueue(chunks: List<Chunk>) {
 
     /** Indices fully written and confirmed. */
     private val done = HashSet<Int>()
+
+    /**
+     * v2 TAIL-RACING bookkeeping. For each chunk index that has a PRIMARY worker in flight, when
+     * it was claimed (millis) and how many EXTRA racers are currently dialled on it. Used by
+     * [pickRaceTarget] to choose the longest-running tail chunk on a DIFFERENT host and to cap the
+     * per-chunk racer count. A racer does NOT create an entry here — only the primary [poll] does;
+     * racers bump [racers] on the existing entry. The entry is cleared on done/requeue/fail/heal.
+     *
+     * This is pure bookkeeping layered on top of the existing inFlight counter: [inFlight] still
+     * counts PRIMARY claims only (so the accounting identity claims-requeues-dones == inFlight is
+     * preserved — racers are tracked separately and never touch that identity).
+     */
+    private class InFlightInfo(val claimedAtMs: Long, var racers: Int)
+    private val inFlightInfo = HashMap<Int, InFlightInfo>()
 
     /**
      * Terminal FAILED state (Fix D): indices that exhausted [AdaptiveEngine.MAX_ERROR_ATTEMPTS]
@@ -189,6 +254,9 @@ internal class ChunkQueue(chunks: List<Chunk>) {
         val idx = queued.removeFirstOrNull() ?: return null
         inFlight++
         claims++
+        // v2: record when this PRIMARY claim went in-flight so [pickRaceTarget] can find the
+        // longest-running tail chunk. A requeued chunk re-polled later gets a fresh timestamp.
+        inFlightInfo[idx] = InFlightInfo(claimedAtMs = nowProvider(), racers = 0)
         all[idx]
     }
 
@@ -201,6 +269,7 @@ internal class ChunkQueue(chunks: List<Chunk>) {
         if (chunk.index in done) return  // never resurrect a completed chunk
         // Only a chunk that was in flight can be requeued; guard the counter.
         if (inFlight > 0) inFlight--
+        inFlightInfo.remove(chunk.index)  // v2: clear tail-race tracking for this primary
         requeues++
         // Re-add to the tail so other workers can steal it (work-stealing fairness).
         if (chunk.index !in queued) queued.add(chunk.index)
@@ -224,11 +293,13 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     ): Boolean = synchronized(lock) {
         if (chunk.index in done) {
             if (inFlight > 0) inFlight--
+            inFlightInfo.remove(chunk.index)
             return false
         }
         val tries = (errorAttempts[chunk.index] ?: 0) + 1
         errorAttempts[chunk.index] = tries
         if (inFlight > 0) inFlight--
+        inFlightInfo.remove(chunk.index)  // v2: clear tail-race tracking for this primary
         if (tries >= maxAttempts) {
             // Exhausted real-error budget: mark terminal FAILED and leave it OUT of the queue.
             // shouldKeepWorking()/allFailed() now report a definite condition; the caller throws.
@@ -259,10 +330,12 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     ): Boolean = synchronized(lock) {
         if (chunk.index in done) {
             if (inFlight > 0) inFlight--
+            inFlightInfo.remove(chunk.index)
             return false
         }
         stallRequeues[chunk.index] = (stallRequeues[chunk.index] ?: 0) + 1
         if (inFlight > 0) inFlight--
+        inFlightInfo.remove(chunk.index)  // v2: clear tail-race tracking for this primary
         requeues++
         // A stalled chunk ALWAYS goes back to the queue so a different worker/host can complete it.
         if (chunk.index !in queued) queued.add(chunk.index)
@@ -291,10 +364,87 @@ internal class ChunkQueue(chunks: List<Chunk>) {
         if (chunk.index in failed) return false
         if (chunk.index in queued) return false
         if (inFlight > 0) inFlight--
+        inFlightInfo.remove(chunk.index)  // v2: clear tail-race tracking for this primary
         requeues++
         queued.add(chunk.index)
         return true
     }
+
+    // ---- v2 TAIL-CHUNK RACING ------------------------------------------------
+
+    /**
+     * Is the download in its TAIL right now (v2 tail-gating predicate)? True iff there is NOTHING
+     * left to start fresh (no queued chunks) AND a small number of chunks are still in-flight
+     * (<= [RACE_TAIL_THRESHOLD]) and not yet all done. This is the ONLY window in which racing is
+     * allowed: early on there's fresh work to claim, so an idle worker should never race. Pulled
+     * out as a pure predicate so it's directly unit-testable.
+     */
+    fun isInTail(
+        raceTailThreshold: Int = AdaptiveEngine.RACE_TAIL_THRESHOLD
+    ): Boolean = synchronized(lock) {
+        if (done.size == all.size) return false      // already complete — nothing to race
+        if (queued.isNotEmpty()) return false        // fresh work exists — claim it, don't race
+        if (inFlight <= 0) return false              // nothing in flight to race
+        inFlight <= raceTailThreshold
+    }
+
+    /**
+     * Pick an in-flight TAIL chunk for an idle worker to RACE on a second connection, or null if
+     * none is eligible right now. A chunk is eligible iff ALL hold (v2):
+     *   - we are in the TAIL ([isInTail]) — no fresh work remains and only a few chunks are left,
+     *   - it has been in-flight at least [RACE_MIN_INFLIGHT_MS] (it's a genuinely-slow tail chunk,
+     *     not one that was just claimed),
+     *   - it has fewer than [maxRacersPerChunk] extra racers already (cap per-chunk duplication),
+     *   - it is not done.
+     * Among eligible chunks the LONGEST-running (oldest claim) is chosen — the most likely to be
+     * the slow tail straggler. On success the chunk's racer count is incremented and the caller
+     * MUST pair it with [endRace] in a finally. Returns null (no race) if nothing qualifies, in
+     * which case the caller does NOT acquire a connection.
+     *
+     * Pure bookkeeping: this never touches the inFlight counter, the queue, or any budget — it
+     * only bumps a per-chunk racer count. Racing changes nothing about correctness: both the
+     * primary and the racer write the SAME absolute range with IDENTICAL server bytes, so
+     * last-write-wins is byte-safe and whichever finishes first calls [markDone] (the other's
+     * late markDone is a no-op).
+     */
+    fun pickRaceTarget(
+        now: Long = nowProvider(),
+        raceTailThreshold: Int = AdaptiveEngine.RACE_TAIL_THRESHOLD,
+        minInFlightMs: Long = AdaptiveEngine.RACE_MIN_INFLIGHT_MS,
+        maxRacersPerChunk: Int = AdaptiveEngine.MAX_RACERS_PER_CHUNK
+    ): Chunk? = synchronized(lock) {
+        // Tail gate, inlined (we already hold the lock).
+        if (done.size == all.size) return null
+        if (queued.isNotEmpty()) return null
+        if (inFlight <= 0 || inFlight > raceTailThreshold) return null
+        var bestIdx = -1
+        var bestClaimedAt = Long.MAX_VALUE
+        for ((idx, info) in inFlightInfo) {
+            if (idx in done) continue
+            if (info.racers >= maxRacersPerChunk) continue
+            if (now - info.claimedAtMs < minInFlightMs) continue
+            if (info.claimedAtMs < bestClaimedAt) {
+                bestClaimedAt = info.claimedAtMs
+                bestIdx = idx
+            }
+        }
+        if (bestIdx < 0) return null
+        inFlightInfo[bestIdx]!!.racers++   // reserve a racer slot; caller pairs with endRace
+        all[bestIdx]
+    }
+
+    /**
+     * Release a racer slot reserved by [pickRaceTarget] (v2). Called in the racer's finally on
+     * EVERY exit path (won, lost, cancelled, errored). A no-op if the primary already cleared the
+     * in-flight entry (chunk completed/requeued) — racer accounting can never leak. Never touches
+     * the inFlight counter or any budget.
+     */
+    fun endRace(chunk: Chunk): Unit = synchronized(lock) {
+        inFlightInfo[chunk.index]?.let { if (it.racers > 0) it.racers-- }
+    }
+
+    /** Active extra-racer count on [index] (test/diagnostic). */
+    fun racersOf(index: Int): Int = synchronized(lock) { inFlightInfo[index]?.racers ?: 0 }
 
     /**
      * Mark a chunk DONE after its FULL range was written and verified. Returns true if this
@@ -308,6 +458,7 @@ internal class ChunkQueue(chunks: List<Chunk>) {
         queued.remove(chunk.index)
         done.add(chunk.index)
         if (inFlight > 0) inFlight--
+        inFlightInfo.remove(chunk.index)  // v2: clear tail-race tracking for this primary
         dones++
         true
     }

@@ -10,8 +10,13 @@ import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -54,11 +59,27 @@ class PersistentCookieJar(context: Context) : CookieJar {
     val loggedIn: StateFlow<Boolean> = _loggedIn
     private fun refreshLoggedIn() { _loggedIn.value = computeHasCookies() }
 
-    // Lazily created — touching EncryptedSharedPreferences does disk I/O and a
-    // KeyStore op, so we never want it on the main thread. Both the initial load
-    // and every persist run on a background thread.
+    // Touching EncryptedSharedPreferences does disk I/O and a KeyStore op, so we never
+    // want it on the main thread. Both the initial load and every persist run on a
+    // background thread / coroutine.
     private val appContext = context.applicationContext
-    private val prefs: SharedPreferences? by lazy { openPrefs(appContext) }
+
+    // FIX 5: do NOT memoize a FAILED open. A transient KeyStore hiccup right after boot
+    // can make EncryptedSharedPreferences.create() throw once; if we cached that null via
+    // `by lazy`, the user would be permanently logged out for the whole process lifetime.
+    // Instead we cache only a SUCCESSFUL handle and retry create() on the next access.
+    @Volatile private var cachedPrefs: SharedPreferences? = null
+    private val prefsLock = Any()
+    private val prefs: SharedPreferences?
+        get() {
+            cachedPrefs?.let { return it }
+            synchronized(prefsLock) {
+                cachedPrefs?.let { return it }
+                val opened = openPrefs(appContext) // may return null on a transient failure
+                if (opened != null) cachedPrefs = opened // cache success only; retry next time on null
+                return opened
+            }
+        }
 
     /**
      * Returns an EncryptedSharedPreferences for cookie persistence, or null if secure
@@ -81,14 +102,38 @@ class PersistentCookieJar(context: Context) : CookieJar {
         null // No plaintext fallback — cookies stay in-memory only.
     }
 
+    // FIX 1: an awaitable signal that the disk restore has finished. Callers that need to
+    // know the persisted-session state (HomeViewModel.init, the download gate) can suspend
+    // on awaitRestored() instead of racing a blind timer. Completes exactly once, at the END
+    // of the initial loadFromDisk()+refreshLoggedIn(); awaiting after completion returns
+    // immediately. Safe to await from many places concurrently.
+    private val restored = CompletableDeferred<Unit>()
+    private val restoreScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     init {
         // Restore the saved session off the main thread; the in-memory `store`
         // (a ConcurrentHashMap) fills in shortly after construction, and we then
-        // publish the restored login state so the UI can react.
-        Thread {
-            loadFromDisk()
-            refreshLoggedIn()
-        }.apply { isDaemon = true; start() }
+        // publish the restored login state so the UI can react. We complete `restored`
+        // at the very END so anyone awaiting it sees a fully-restored, correct loggedIn
+        // value (no delay(400) race / no logged-out flash).
+        restoreScope.launch {
+            try {
+                loadFromDisk()
+                refreshLoggedIn()
+            } finally {
+                // complete() returns false if already completed — harmless; keeps this idempotent.
+                restored.complete(Unit)
+            }
+        }
+    }
+
+    /**
+     * Suspends until the initial on-disk cookie restore has completed (then [loggedIn] /
+     * [hasCookies] reflect the persisted session). Returns immediately if the restore is
+     * already done. Safe to call any number of times from any coroutine.
+     */
+    suspend fun awaitRestored() {
+        restored.await()
     }
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {

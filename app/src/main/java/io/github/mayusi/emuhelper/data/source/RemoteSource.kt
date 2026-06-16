@@ -622,9 +622,50 @@ class RemoteSource @Inject constructor(
         var lastReport = startTime
         val reportLock = Any()
 
-        // The number of worker connections for this file. Bounded by the worker hint and the
-        // number of chunks (no point spinning up more workers than chunks).
-        val workerCount = workerHint.coerceIn(1, chunks.size)
+        // v2 OVER-PROVISION the worker pool. v1 capped workers at `segments` (workerHint), so a
+        // single big file never opened more than `segments` connections even when the global
+        // 24-permit connectionBudget was free — leaving IA's other fast nodes idle. Now we scale
+        // UP toward [AdaptiveEngine.MAX_ADAPTIVE_WORKERS] (the global ceiling), still bounded by
+        // the chunk count (no point exceeding chunks). The SAFETY INVARIANT is unchanged and
+        // enforced at runtime, NOT here: every worker (and every racer) acquire()s a permit from
+        // the shared connectionBudget before opening a socket and releases it in a finally, so the
+        // total concurrent permits across ALL files+workers+racers is <= the Semaphore's capacity
+        // (24) no matter how many workers are spawned. Spawning more workers than free permits is
+        // safe: the extras simply block on acquire() until a permit frees, and yield to other
+        // concurrent files that share the same Semaphore. workerHint stays the FLOOR.
+        val workerCount = workerHint
+            .coerceAtLeast(1)
+            .coerceAtLeast(minOf(chunks.size, AdaptiveEngine.MAX_ADAPTIVE_WORKERS))
+            .coerceIn(1, chunks.size)
+
+        // v2 BENCH stats (cheap, aggregated at completion — no per-chunk spam). Concurrent permit
+        // tracking lets us log the PEAK simultaneous connections actually used; race counters let
+        // the maintainer see whether tail-racing fired and won on a real IA download.
+        val liveConns = java.util.concurrent.atomic.AtomicInteger(0)
+        val peakConns = java.util.concurrent.atomic.AtomicInteger(0)
+        val racesStarted = java.util.concurrent.atomic.AtomicInteger(0)
+        val racesWon = java.util.concurrent.atomic.AtomicInteger(0)
+        val onConnAcquired: () -> Unit = {
+            val n = liveConns.incrementAndGet()
+            // Lock-free monotonic max.
+            var peak = peakConns.get()
+            while (n > peak && !peakConns.compareAndSet(peak, n)) peak = peakConns.get()
+        }
+        val onConnReleased: () -> Unit = { liveConns.decrementAndGet() }
+
+        val onReport: suspend () -> Unit = {
+            // ~3x/sec aggregate report, identical shape & cadence to the static path.
+            val now = System.currentTimeMillis()
+            var doReport = false
+            synchronized(reportLock) {
+                if (now - lastReport >= 350) { lastReport = now; doReport = true }
+            }
+            if (doReport) {
+                val secs = (now - startTime).coerceAtLeast(1) / 1000.0
+                // Report the MONOTONIC confirmedBytes total; speed from live bytes.
+                onProgress(confirmedBytes.get(), liveBytes.get() / secs)
+            }
+        }
 
         coroutineScope {
             (0 until workerCount).map {
@@ -636,9 +677,39 @@ class RemoteSource @Inject constructor(
                         if (isCancelled()) throw CancellationException()
                         val chunk = queue.poll()
                         if (chunk == null) {
-                            // Nothing to claim right now but peers hold in-flight chunks that may
-                            // be requeued; yield briefly and re-check rather than busy-spinning.
-                            kotlinx.coroutines.delay(25)
+                            // No fresh chunk to start. v2: in the TAIL (queue drained, only a few
+                            // chunks still in-flight) an idle worker RACES a slow in-flight chunk on
+                            // a SECOND, different host instead of busy-waiting — first to finish the
+                            // range wins, the loser bails (see downloadChunkAttempt's done-check).
+                            // pickRaceTarget returns null unless the strict tail-gate holds, so this
+                            // never fires early or on small files.
+                            val raceChunk = queue.pickRaceTarget()
+                            if (raceChunk != null) {
+                                racesStarted.incrementAndGet()
+                                downloadChunkAttempt(
+                                    chunk = raceChunk,
+                                    queue = queue,
+                                    scoreboard = scoreboard,
+                                    recentRates = recentRates,
+                                    distinctHosts = distinctHosts,
+                                    destFile = destFile,
+                                    expectedSize = expectedSize,
+                                    buf = buf,
+                                    connectionBudget = connectionBudget,
+                                    confirmedBytes = confirmedBytes,
+                                    liveBytes = liveBytes,
+                                    isCancelled = isCancelled,
+                                    onReport = onReport,
+                                    isRace = true,
+                                    onConnAcquired = onConnAcquired,
+                                    onConnReleased = onConnReleased,
+                                    onRaceWon = { racesWon.incrementAndGet() }
+                                )
+                            } else {
+                                // Nothing to claim right now but peers hold in-flight chunks that
+                                // may be requeued; yield briefly rather than busy-spinning.
+                                kotlinx.coroutines.delay(25)
+                            }
                             continue
                         }
                         downloadChunkAttempt(
@@ -654,19 +725,11 @@ class RemoteSource @Inject constructor(
                             confirmedBytes = confirmedBytes,
                             liveBytes = liveBytes,
                             isCancelled = isCancelled,
-                            onReport = {
-                                // ~3x/sec aggregate report, identical shape & cadence to the static path.
-                                val now = System.currentTimeMillis()
-                                var doReport = false
-                                synchronized(reportLock) {
-                                    if (now - lastReport >= 350) { lastReport = now; doReport = true }
-                                }
-                                if (doReport) {
-                                    val secs = (now - startTime).coerceAtLeast(1) / 1000.0
-                                    // Report the MONOTONIC confirmedBytes total; speed from live bytes.
-                                    onProgress(confirmedBytes.get(), liveBytes.get() / secs)
-                                }
-                            }
+                            onReport = onReport,
+                            isRace = false,
+                            onConnAcquired = onConnAcquired,
+                            onConnReleased = onConnReleased,
+                            onRaceWon = { /* primary path is never a race win */ }
                         )
                     }
                 }
@@ -694,6 +757,19 @@ class RemoteSource @Inject constructor(
         if (total != expectedSize) {
             throw IOException("Adaptive download size mismatch: confirmed $total != expected $expectedSize")
         }
+        // v2 HONEST BENCH LOG (aggregate, once at completion — cheap, no per-chunk spam). Lets the
+        // maintainer compare adaptive-on vs adaptive-off MB/s on a real device from logcat, and see
+        // whether over-provisioning actually opened more connections and whether tail-racing fired
+        // and won. Tag is grep-friendly. wall-clock includes warm-up so it's the user-visible time.
+        val wallMs = (System.currentTimeMillis() - startTime).coerceAtLeast(1)
+        val mb = total.toDouble() / (1024.0 * 1024.0)
+        val mbps = mb / (wallMs / 1000.0)
+        Log.i(
+            "EmuHelper-ADAPTIVE-BENCH",
+            "adaptive: ${"%.1f".format(mb)}MB in ${"%.1f".format(wallMs / 1000.0)}s = " +
+                "${"%.2f".format(mbps)}MB/s, workers=$workerCount peakConns=${peakConns.get()} " +
+                "races=${racesStarted.get()}/${racesWon.get()} (started/won)"
+        )
         onProgress(total, 0.0)
         return total
     }
@@ -734,9 +810,31 @@ class RemoteSource @Inject constructor(
         confirmedBytes: java.util.concurrent.atomic.AtomicLong,
         liveBytes: java.util.concurrent.atomic.AtomicLong,
         isCancelled: () -> Boolean,
-        onReport: suspend () -> Unit
+        onReport: suspend () -> Unit,
+        // v2 TAIL-RACING: when true this is a RACER on an already-in-flight tail chunk, not the
+        // primary owner. A racer (a) acquires the global permit non-blockingly (tryAcquire — never
+        // block a permit a fresh chunk could use; bails if none free), (b) checks queue.isDone
+        // before every write and bails the instant the primary (or another racer) finishes the
+        // range, (c) NEVER touches the error/stall budgets or requeues/force-requeues the chunk —
+        // it is purely additive, so a racer failure can never fail the download (the primary still
+        // owns the chunk), and (d) pairs pickRaceTarget with endRace in finally. Race correctness:
+        // both the primary and the racer write the SAME absolute [start,end] range with IDENTICAL
+        // server bytes, so last-write-wins is byte-safe and whoever markDone()s first wins.
+        isRace: Boolean = false,
+        // v2 bench hooks: count a connection permit while held (for peak-connections), fired only
+        // once the permit is actually acquired and once on release.
+        onConnAcquired: () -> Unit = {},
+        onConnReleased: () -> Unit = {},
+        // v2: invoked iff THIS attempt was a race that WON (its markDone transitioned the chunk).
+        onRaceWon: () -> Unit = {}
     ) {
         if (isCancelled()) throw CancellationException()
+        // v2 racer: if the chunk already finished between pickRaceTarget and here, there's nothing
+        // to race — release the racer slot and bail (no permit acquired, no budget touched).
+        if (isRace && queue.isDone(chunk.index)) {
+            queue.endRace(chunk)
+            return
+        }
         // How many real errors this chunk has already taken — used to prefer a DIFFERENT host on
         // retries (fastest-first failover), matching the static path's per-attempt host rotation.
         val priorTries = queue.errorAttemptsOf(chunk.index)
@@ -744,9 +842,12 @@ class RemoteSource @Inject constructor(
             ?: distinctHosts[priorTries % distinctHosts.size]
         var hostReleased = false
         // Fix D: set true once the chunk is reconciled (markDone OR requeued/failed). If still
-        // false in the finally, the chunk leaked in-flight and is force-requeued.
-        var reconciled = false
+        // false in the finally, the chunk leaked in-flight and is force-requeued. A RACER never
+        // owns reconciliation (the primary does), so it starts and stays "reconciled" — its finally
+        // must never force-requeue a chunk the primary still owns.
+        var reconciled = isRace
         var call: okhttp3.Call? = null
+        var connAcquired = false
         var bytesThisChunk = 0L
         val chunkStart = System.currentTimeMillis()
         var lastReadAt = chunkStart
@@ -755,8 +856,22 @@ class RemoteSource @Inject constructor(
         var consecutiveSlowWindows = 0
         var lastSoftCheck = chunkStart
         // Acquire a GLOBAL connection slot BEFORE opening the socket; release in finally. This is
-        // what makes the 24-connection thermal cap robust to any (variable) worker count.
-        connectionBudget.acquire()
+        // what makes the 24-connection thermal cap robust to any (variable) worker count. A RACER
+        // uses tryAcquire so it never blocks a permit a fresh chunk could use and never pushes the
+        // total over the cap; if no permit is free it abandons the race immediately.
+        if (isRace) {
+            if (!connectionBudget.tryAcquire()) {
+                // No free permit — don't block. The primary still owns the chunk; just give up the
+                // race. (host was picked but never used; release its scoreboard load slot.)
+                scoreboard.releaseHost(host)
+                queue.endRace(chunk)
+                return
+            }
+        } else {
+            connectionBudget.acquire()
+        }
+        connAcquired = true
+        onConnAcquired()
         try {
             val req = Request.Builder().url(host)
                 .header("User-Agent", USER_AGENT)
@@ -787,6 +902,18 @@ class RemoteSource @Inject constructor(
                         var read: Int
                         while (input.read(buf).also { read = it } != -1) {
                             if (isCancelled()) throw CancellationException()
+                            // v2 RACE done-check: if the chunk has already been completed (by the
+                            // primary, or by another racer) bail BEFORE writing — avoid wasted
+                            // writes and let the loser stop promptly. Both attempts write identical
+                            // bytes to the same offset, so a stray late write would be harmless
+                            // (last-write-wins), but checking `done` first avoids the work entirely.
+                            // Only racers check this: the primary owns the chunk and must run to its
+                            // own markDone (its own markDone is the no-op if a racer beat it).
+                            if (isRace && queue.isDone(chunk.index)) {
+                                hostReleased = true
+                                scoreboard.releaseHost(host)
+                                return  // finally cancels the Call, releases permit + race slot
+                            }
                             if (read > 0) {
                                 raf.write(buf, 0, read)
                                 bytesThisChunk += read
@@ -834,7 +961,16 @@ class RemoteSource @Inject constructor(
             }
             // FULL-RANGE VERIFICATION: only mark done when the received byte count matches the
             // chunk length EXACTLY. A short read requeues the WHOLE chunk (no partial done).
+            // (A racer that read its full range but lost the race to the primary still lands here
+            // and its markDone is simply a no-op — last-write-wins, idempotent.)
             if (bytesThisChunk != chunk.length) {
+                if (isRace) {
+                    // A short-read RACER never errors/requeues the chunk (the primary owns it). Just
+                    // give up the race; the primary (or another racer) will complete the range.
+                    scoreboard.releaseHost(host)
+                    hostReleased = true
+                    return
+                }
                 throw IOException("Short chunk ${chunk.index}: got $bytesThisChunk of ${chunk.length}")
             }
             // Success: record the observed rate (releases the host slot), mark done, count bytes.
@@ -844,8 +980,13 @@ class RemoteSource @Inject constructor(
             hostReleased = true
             // Fix B: feed the CURRENT recent-rate baseline with this real completed-chunk rate.
             recentRates.record(observedRate)
+            // markDone is the single atomic winner-decider under the chunk's lock: it returns true
+            // for EXACTLY ONE caller (the first to finish the range — primary or racer), false for
+            // the loser. Only the winner counts the bytes, so confirmedBytes can never double-count
+            // a raced chunk.
             if (queue.markDone(chunk)) {
                 confirmedBytes.addAndGet(chunk.length)
+                if (isRace) onRaceWon()   // v2: this racer beat the primary — count the win.
             }
             reconciled = true  // Fix D: chunk reached a terminal-done state on this path.
             onReport()
@@ -869,8 +1010,12 @@ class RemoteSource @Inject constructor(
                 scoreboard.recordStall(host)
             }
             hostReleased = true
-            queue.requeueStall(chunk)            // own large budget; cannot fail the download
-            reconciled = true                    // Fix D: chunk reconciled (requeued).
+            // v2: a RACER never requeues — the primary owns the chunk and is still running. A racer
+            // stalling on its second host just abandons the race (the primary completes the chunk).
+            if (!isRace) {
+                queue.requeueStall(chunk)        // own large budget; cannot fail the download
+                reconciled = true                // Fix D: chunk reconciled (requeued).
+            }
             // No exponential backoff for a stall — the point is to migrate PROMPTLY to a peer/host.
         } catch (e: Exception) {
             // REAL transport error (non-206, short read, IOException, timeout): cool the host
@@ -879,6 +1024,13 @@ class RemoteSource @Inject constructor(
             // terminal semantics as the static per-segment loop, but ONLY for genuine errors.
             scoreboard.recordStall(host)
             hostReleased = true
+            // v2: a RACER never consumes the error budget and never fails the download — it is
+            // purely additive. On any racer error we just abandon the race; the primary still owns
+            // the chunk and its own error budget governs whether the download ultimately fails.
+            if (isRace) {
+                // reconciled stays true (a racer never owns reconciliation) — nothing to requeue.
+                return
+            }
             val exhausted = queue.recordErrorOrFail(chunk, AdaptiveEngine.MAX_ERROR_ATTEMPTS)
             reconciled = true                    // Fix D: chunk reconciled (requeued or failed).
             if (exhausted) throw e
@@ -886,16 +1038,29 @@ class RemoteSource @Inject constructor(
             val nextTry = queue.errorAttemptsOf(chunk.index)
             kotlinx.coroutines.delay(min(1000L * (1L shl ((nextTry - 1).coerceAtLeast(0))), 8000L))
         } finally {
-            // Cancel the in-flight Call so a stalled socket is torn down promptly.
+            // Cancel the in-flight Call so a stalled socket is torn down promptly. For a losing
+            // racer this tears down the duplicate connection so it stops pulling bytes immediately.
             runCatching { call?.cancel() }
-            // Always release the global connection slot.
-            connectionBudget.release()
+            // Always release the global connection slot we actually acquired (a racer that failed
+            // tryAcquire returned before this point and never reaches here). Pairing acquire with
+            // release in finally is THE invariant that keeps total permits <= the cap (24) across
+            // all workers AND racers.
+            if (connAcquired) {
+                connectionBudget.release()
+                onConnReleased()
+            }
             // Defensive: if neither success nor failure released the host (shouldn't happen),
             // release it so the scoreboard's load count stays accurate.
             if (!hostReleased) scoreboard.releaseHost(host)
+            // v2: release the racer slot on EVERY racer exit path (won, lost, errored, cancelled).
+            // A no-op for the primary. Pairs with pickRaceTarget's racer-count increment so racer
+            // accounting can never leak.
+            if (isRace) queue.endRace(chunk)
             // Fix D — SELF-HEALING completion gate: if the chunk was neither marked done nor
             // requeued/failed on ANY exit path (e.g. an unexpected throw before reconciliation),
             // force it back onto the queue so it can never be orphaned and leak an in-flight slot.
+            // A racer never owns reconciliation (reconciled starts true for racers), so this never
+            // force-requeues a chunk the primary still owns.
             if (!reconciled) queue.forceRequeue(chunk)
         }
     }

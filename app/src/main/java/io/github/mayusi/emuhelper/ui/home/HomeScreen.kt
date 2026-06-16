@@ -107,11 +107,24 @@ class HomeViewModel @Inject constructor(
         HomeUi(listCount = lists.size, loggedIn = loggedIn, email = email)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUi())
 
+    // FIX 2: tri-state auth gate. `false` until the cookie jar's disk restore has completed,
+    // so the UI knows whether `ui.loggedIn` is the REAL persisted state or just the cold-start
+    // default. While false, the screen must NOT render the logged-out "Sign in" prompt — that
+    // prevents the red sign-in card from flashing on a cold start before the session restores.
+    private val _authReady = MutableStateFlow(false)
+    val authReady: StateFlow<Boolean> = _authReady.asStateFlow()
+
     init {
-        // Silent auto-relogin.
+        // Silent auto-relogin — now gated on the cookie restore instead of a blind timer.
         viewModelScope.launch {
-            kotlinx.coroutines.delay(400)
+            // FIX 1: AWAIT the disk restore instead of racing delay(400). When this returns,
+            // cookieJar.loggedIn reflects the persisted session (no lost race on a cold KeyStore
+            // / loaded device), so we never fire a needless network re-login.
+            cookieJar.awaitRestored()
+            _authReady.value = true // FIX 2: auth state is now known — UI can show the real card.
+            // Trust the persisted session: if we restored a valid login, do NO network at all.
             if (cookieJar.loggedIn.value) return@launch
+            // Only when genuinely logged-out do we attempt a silent re-login from saved creds.
             val remember = authStore.rememberMe.first()
             val email = authStore.savedEmail.first()
             if (!remember || email.isBlank()) return@launch
@@ -239,6 +252,9 @@ fun HomeScreen(
     viewModel: HomeViewModel = hiltViewModel()
 ) {
     val ui by viewModel.ui.collectAsState()
+    // FIX 2: tri-state auth — false until the cookie restore completes. Used to avoid flashing
+    // the logged-out "Sign in" prompt before the persisted session is known on a cold start.
+    val authReady by viewModel.authReady.collectAsState()
     val updateInfo by viewModel.updateInfo.collectAsState()
     val updateFlow by viewModel.updateFlow.collectAsState()
     val dismissedTag by viewModel.dismissedUpdateTag.collectAsState()
@@ -555,7 +571,15 @@ fun HomeScreen(
             Spacer(Modifier.height(4.dp))
 
             // U3: Show a more prominent sign-in prompt when not logged in.
-            if (!ui.loggedIn) {
+            // FIX 2: gate on authReady. Until the cookie restore completes we DON'T know if the
+            // user is really logged out, so render neither the red "Sign in" prompt nor the
+            // signed-in chip — that avoids the logged-out flash on a cold start. Once authReady
+            // is true, ui.loggedIn is the real persisted state and we show the correct card.
+            if (!authReady) {
+                // Auth state still unknown — keep a tiny neutral placeholder so the layout
+                // doesn't jump when the real card appears a moment later.
+                Spacer(Modifier.height(Dimens.IconSmall))
+            } else if (!ui.loggedIn) {
                 OutlinedCard(
                     onClick = onSignIn,
                     modifier = Modifier.fillMaxWidth().widthIn(max = 600.dp),
