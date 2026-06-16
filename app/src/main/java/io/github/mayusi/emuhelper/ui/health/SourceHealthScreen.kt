@@ -212,9 +212,13 @@ private fun RunningContent(done: Int, total: Int, onCancel: () -> Unit) {
 @Composable
 private fun DoneContent(results: List<SourceHealth>, onRecheck: () -> Unit) {
     // Group by console; within each group show alive first then dead.
-    val grouped: Map<String, List<SourceHealth>> = results
-        .sortedWith(compareBy({ it.console }, { !it.alive }))
-        .groupBy { it.console }
+    // Wrapped in remember(results) so the sort+groupBy only re-runs when results change,
+    // not on every recomposition.
+    val grouped: Map<String, List<SourceHealth>> = remember(results) {
+        results
+            .sortedWith(compareBy({ it.console }, { !it.alive }))
+            .groupBy { it.console }
+    }
 
     val aliveTotal = results.count { it.alive }
     val deadTotal = results.count { !it.alive }

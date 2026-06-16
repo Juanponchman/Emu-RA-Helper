@@ -288,7 +288,7 @@ class CatalogRepository @Inject constructor(
                 key = k,
                 display = rc.display.ifBlank { existing?.display ?: k },
                 folder = rc.folder.ifBlank { existing?.folder ?: k },
-                emulator = rc.emulator
+                emulator = rc.emulator.ifBlank { existing?.emulator ?: "" }
             )
         }
 

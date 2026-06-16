@@ -31,6 +31,10 @@ class ConsoleSelectViewModel @Inject constructor(
 
     // ---- Remote catalog refresh ------------------------------------------
 
+    /** True while a refresh network call is in progress. */
+    private val _isRefreshing = MutableStateFlow(false)
+    val isRefreshing: StateFlow<Boolean> = _isRefreshing.asStateFlow()
+
     /** One-shot event emitted after a manual refresh; null when idle. */
     private val _refreshResult = MutableStateFlow<RefreshResult?>(null)
     val refreshResult: StateFlow<RefreshResult?> = _refreshResult.asStateFlow()
@@ -38,8 +42,13 @@ class ConsoleSelectViewModel @Inject constructor(
     fun refreshCatalog() {
         viewModelScope.launch {
             _refreshResult.value = null
-            val result = catalogRepository.refresh()
-            _refreshResult.value = result
+            _isRefreshing.value = true
+            try {
+                val result = catalogRepository.refresh()
+                _refreshResult.value = result
+            } finally {
+                _isRefreshing.value = false
+            }
         }
     }
 

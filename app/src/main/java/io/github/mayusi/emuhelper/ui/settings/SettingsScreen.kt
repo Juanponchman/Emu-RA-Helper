@@ -56,6 +56,7 @@ class SettingsViewModel @Inject constructor(
     val segments: StateFlow<Int> = settings.segments.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_SEGMENTS)
     val concurrency: StateFlow<Int> = settings.concurrency.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_CONCURRENCY)
     val extractArchives: StateFlow<Boolean> = settings.extractArchives.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val wifiOnly: StateFlow<Boolean> = settings.wifiOnly.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val themeMode: StateFlow<ThemeMode> = settings.themeMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.SYSTEM)
     val downloadFolder: StateFlow<Uri?> = settings.downloadFolder.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
@@ -71,6 +72,7 @@ class SettingsViewModel @Inject constructor(
     fun setSegments(v: Int) { viewModelScope.launch { settings.setSegments(v) } }
     fun setConcurrency(v: Int) { viewModelScope.launch { settings.setConcurrency(v) } }
     fun setExtract(v: Boolean) { viewModelScope.launch { settings.setExtractArchives(v) } }
+    fun setWifiOnly(v: Boolean) { viewModelScope.launch { settings.setWifiOnly(v) } }
     fun setThemeMode(mode: ThemeMode) { viewModelScope.launch { settings.setThemeMode(mode) } }
     fun setFolder(uri: Uri?) { viewModelScope.launch { settings.setDownloadFolder(uri) } }
 
@@ -116,6 +118,7 @@ fun SettingsScreen(
     val segments by viewModel.segments.collectAsState()
     val concurrency by viewModel.concurrency.collectAsState()
     val extractArchives by viewModel.extractArchives.collectAsState()
+    val wifiOnly by viewModel.wifiOnly.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
     val testing by viewModel.testing.collectAsState()
     val result by viewModel.result.collectAsState()
@@ -204,6 +207,24 @@ fun SettingsScreen(
                     "Pushes your connection hard. Helps on fast wifi; won't exceed your link's ceiling.",
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text("Wi-Fi only", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+                        Text(
+                            "Only download on Wi-Fi; blocks on mobile data",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = wifiOnly,
+                        onCheckedChange = { viewModel.setWifiOnly(it) }
+                    )
+                }
             }
 
             // ---- After download ----

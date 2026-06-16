@@ -40,16 +40,9 @@ data class LogEntry(
  * Fire-and-forget: [log] never throws on the caller.
  *
  * ── Uncaught-exception hook ──────────────────────────────────────────────────
- * The Application class is owned by a parallel agent, so the hook cannot be added
- * here. To wire it, add the following ONE LINE inside EmuHelperApplication.onCreate()
- * immediately before `previous?.uncaughtException(thread, e)`:
- *
- *   // TODO(CrashLogStore): inject CrashLogStore via Hilt field injection and call:
- *   crashLogStore.logSync(thread.name, "${e.javaClass.simpleName}: ${e.message}")
- *
+ * The global uncaught-exception handler is wired in EmuHelperApplication.onCreate():
+ * it calls [logSync] synchronously before delegating to the previous handler.
  * [logSync] is intentionally blocking — it must complete before the process dies.
- * To inject: add `@Inject lateinit var crashLogStore: CrashLogStore` to the
- * Application class (Hilt's @HiltAndroidApp already enables member injection there).
  */
 @OptIn(DelicateCoroutinesApi::class)
 @Singleton
@@ -100,8 +93,6 @@ class CrashLogStore @Inject constructor(
     /**
      * Blocking (synchronous) write intended for the global uncaught-exception handler,
      * where launching a coroutine is unsafe because the process may be dying.
-     *
-     * See the class-level KDoc for the exact TODO + one-line code to add in Application.
      */
     fun logSync(tag: String, message: String) {
         try {

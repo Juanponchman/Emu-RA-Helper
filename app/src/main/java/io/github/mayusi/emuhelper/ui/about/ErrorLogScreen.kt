@@ -7,6 +7,7 @@ import android.content.Intent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentCopy
@@ -185,7 +186,7 @@ fun ErrorLogScreen(
                             modifier = Modifier.padding(bottom = 4.dp)
                         )
                     }
-                    items(entries, key = { "${it.timestampMillis}_${it.tag}" }) { entry ->
+                    itemsIndexed(entries, key = { index, it -> "${index}_${it.timestampMillis}_${it.tag}" }) { _, entry ->
                         LogEntryCard(entry)
                     }
                     item { Spacer(Modifier.height(16.dp)) }

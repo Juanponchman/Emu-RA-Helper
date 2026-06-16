@@ -30,6 +30,7 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         private val KEY_CONCURRENCY = intPreferencesKey("download_concurrency")
         private val KEY_SEGMENTS = intPreferencesKey("download_segments")
         private val KEY_EXTRACT = booleanPreferencesKey("extract_archives")
+        private val KEY_WIFI_ONLY = booleanPreferencesKey("wifi_only_downloads")
         private val KEY_SEEN_SETUP_DISCLAIMER = booleanPreferencesKey("seen_setup_disclaimer")
         private val KEY_SETUP_STAGING_FOLDER = stringPreferencesKey("setup_staging_folder_uri")
         val KEY_LAST_UPDATE_CHECK = longPreferencesKey("last_update_check_ts")
@@ -60,6 +61,9 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     val extractArchives: Flow<Boolean> = context.settingsStore.data.map { it[KEY_EXTRACT] ?: false }
 
+    /** When true, downloads are only allowed on an unmetered (Wi-Fi) network. Default off. */
+    val wifiOnly: Flow<Boolean> = context.settingsStore.data.map { it[KEY_WIFI_ONLY] ?: false }
+
     suspend fun setDownloadFolder(uri: Uri?) {
         context.settingsStore.edit {
             if (uri != null) it[KEY_DOWNLOAD_FOLDER] = uri.toString()
@@ -85,6 +89,10 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setExtractArchives(value: Boolean) {
         context.settingsStore.edit { it[KEY_EXTRACT] = value }
+    }
+
+    suspend fun setWifiOnly(value: Boolean) {
+        context.settingsStore.edit { it[KEY_WIFI_ONLY] = value }
     }
 
     val seenSetupDisclaimer: Flow<Boolean> = context.settingsStore.data.map { it[KEY_SEEN_SETUP_DISCLAIMER] ?: false }

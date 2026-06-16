@@ -55,6 +55,7 @@ fun ConsoleSelectScreen(
     // Snackbar host for refresh result messages.
     val snackbarHostState = remember { SnackbarHostState() }
     val refreshResult by viewModel.refreshResult.collectAsState()
+    val isRefreshing by viewModel.isRefreshing.collectAsState()
 
     LaunchedEffect(refreshResult) {
         val result = refreshResult ?: return@LaunchedEffect
@@ -62,11 +63,9 @@ fun ConsoleSelectScreen(
             is RefreshResult.Updated  -> "Sources updated"
             is RefreshResult.UpToDate -> "Already up to date"
             is RefreshResult.Failed   -> "Couldn't check for updates"
-            is RefreshResult.Disabled -> null // dormant — silent, no toast
+            is RefreshResult.Disabled -> "Sources are up to date"
         }
-        if (msg != null) {
-            snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Short)
-        }
+        snackbarHostState.showSnackbar(msg, duration = SnackbarDuration.Short)
         viewModel.clearRefreshResult()
     }
 
@@ -81,9 +80,19 @@ fun ConsoleSelectScreen(
                     }
                 },
                 actions = {
-                    // Refresh sources action — always shown; dormant mode yields a silent no-op.
-                    IconButton(onClick = { viewModel.refreshCatalog() }) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh sources")
+                    // Refresh sources action — always shown; disabled while a fetch is in progress.
+                    IconButton(
+                        onClick = { viewModel.refreshCatalog() },
+                        enabled = !isRefreshing
+                    ) {
+                        if (isRefreshing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh sources")
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)

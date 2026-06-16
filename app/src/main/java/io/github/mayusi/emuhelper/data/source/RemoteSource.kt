@@ -34,19 +34,60 @@ class RemoteSource @Inject constructor(
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
 
     /**
-     * Process-lifetime cache of parsed metadata JSON roots, keyed by identifier.
+     * Bounded cache of parsed metadata JSON roots, keyed by identifier.
      * Eliminates redundant network + parse work when mirrorUrls(), fetchFileList(), and
      * fetchFileSize() are called for the same identifier during a batch (e.g. mirrorUrls
      * is called once per file, so a 30-file batch would otherwise hit the endpoint 30×).
-     * ConcurrentHashMap gives thread-safe reads; the putIfAbsent pattern avoids a
-     * double-fetch race while never blocking a reader.
+     *
+     * FIX #12: this previously used a ConcurrentHashMap that grew unbounded for the whole
+     * process lifetime — every distinct item the user ever scanned kept its full metadata
+     * JSON (potentially MBs each) pinned in memory. Now it's an access-order LinkedHashMap
+     * capped at [METADATA_CACHE_MAX] entries with LRU eviction, wrapped in a tiny
+     * thread-safe accessor that preserves the get / putIfAbsent semantics callers rely on.
      */
-    private val metadataCache = java.util.concurrent.ConcurrentHashMap<String, kotlinx.serialization.json.JsonObject>()
+    private val metadataCache = BoundedMetadataCache(METADATA_CACHE_MAX)
+
+    /**
+     * Synchronized LRU cache. accessOrder=true means each get()/put() moves the entry to
+     * the most-recently-used end, so the eldest (least-recently-used) entry is evicted once
+     * size exceeds [maxEntries]. All access is synchronized on the instance — the maps are
+     * tiny (<=20 small references) and lookups are O(1), so contention is negligible.
+     */
+    private class BoundedMetadataCache(private val maxEntries: Int) {
+        private val map = object :
+            LinkedHashMap<String, kotlinx.serialization.json.JsonObject>(16, 0.75f, true) {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<String, kotlinx.serialization.json.JsonObject>?
+            ): Boolean = size > maxEntries
+        }
+
+        @Synchronized
+        operator fun get(key: String): kotlinx.serialization.json.JsonObject? = map[key]
+
+        /**
+         * Mirrors ConcurrentHashMap.putIfAbsent: stores [value] only if [key] is absent and
+         * returns the PREVIOUS value (non-null when another caller already cached one), or
+         * null if this call inserted. Callers use `putIfAbsent(k, v) ?: v` to always end up
+         * with the winning instance.
+         */
+        @Synchronized
+        fun putIfAbsent(
+            key: String,
+            value: kotlinx.serialization.json.JsonObject
+        ): kotlinx.serialization.json.JsonObject? {
+            val existing = map[key]
+            if (existing != null) return existing
+            map[key] = value
+            return null
+        }
+    }
 
     companion object {
         private val SKIP_EXTS = setOf(".xml", ".json", ".sqlite", ".txt", ".md", ".torrent", ".log", ".csv", ".pdf", ".jpg", ".png", ".gif", ".ico")
         private const val MIN_FILE_SIZE = 102400L
         private const val MAX_ATTEMPTS = 5
+        /** FIX #12: hard cap on cached metadata roots (LRU eviction beyond this). */
+        private const val METADATA_CACHE_MAX = 20
         // Browser-like UA. The configured source host occasionally serves different
         // content to non-browser UAs; this pattern maximises compatibility.
         private const val USER_AGENT =
@@ -272,12 +313,17 @@ class RemoteSource @Inject constructor(
             if (".$ext" in SKIP_EXTS) return@mapNotNull null
             val size = obj["size"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L
             if (size < MIN_FILE_SIZE) return@mapNotNull null
+            // Source metadata exposes a per-file md5 hex string; carry it through so the
+            // download engine can verify integrity after a multi-segment download. Absent
+            // or blank means "unverified" downstream (back-compat, no behaviour change).
+            val md5 = obj["md5"]?.jsonPrimitive?.contentOrNull?.trim()?.lowercase() ?: ""
             GameFile(
                 name = name,
                 filename = File(name).name,
                 size = size,
                 identifier = identifier,
-                sourceUrl = iaUrl
+                sourceUrl = iaUrl,
+                md5 = md5
             )
         }
         Log.i("EmuHelper", "scan/$identifier  rawFiles=${files.size} kept=${kept.size}")

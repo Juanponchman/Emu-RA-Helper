@@ -1,8 +1,11 @@
 package io.github.mayusi.emuhelper.ui.download
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
@@ -32,6 +35,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emuhelper.data.model.CuratedGame
 import io.github.mayusi.emuhelper.data.model.DownloadStatus
 import io.github.mayusi.emuhelper.data.source.DownloadManager
@@ -57,7 +61,8 @@ import javax.inject.Inject
 class DownloadViewModel @Inject constructor(
     private val manager: DownloadManager,
     private val scanState: ScanStateHolder,
-    private val settings: SettingsStore
+    private val settings: SettingsStore,
+    @ApplicationContext private val appContext: Context
 ) : ViewModel() {
 
     val queuedGames: StateFlow<List<CuratedGame>> = scanState.downloadQueue
@@ -73,6 +78,34 @@ class DownloadViewModel @Inject constructor(
     // frame — no async-init race that briefly shows null while the launch{} completes.
     val customFolder: StateFlow<Uri?> = settings.downloadFolder
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /** Wi-Fi-only download preference; gated at the call site before starting downloads. */
+    val wifiOnly: StateFlow<Boolean> = settings.wifiOnly
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
+     * True when the Wi-Fi-only preference is on AND the active network is metered
+     * (e.g. mobile data). Used to gate downloads before they start. Fails open
+     * (returns false) if network state can't be read, so we never block spuriously.
+     */
+    fun isBlockedByWifiOnly(): Boolean {
+        if (!wifiOnly.value) return false
+        return isActiveNetworkMetered()
+    }
+
+    private fun isActiveNetworkMetered(): Boolean {
+        return try {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+            val network = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(network) ?: return false
+            // NOT_METERED present => unmetered (Wi-Fi). Absent => metered (mobile data).
+            !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "metered-network check failed; allowing download", e)
+            false
+        }
+    }
 
     fun start(games: List<CuratedGame>) = manager.start(games)
     fun cancelAll() = manager.cancelAll()
@@ -114,6 +147,20 @@ fun DownloadScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
 
+    // Wi-Fi-only gate: when a download is blocked because the user is on mobile data,
+    // hold the action to run if they choose "Download anyway".
+    var pendingWifiAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val showWifiBlock = pendingWifiAction != null
+
+    // Run [action] only if Wi-Fi-only doesn't block it; otherwise stash it and prompt.
+    val gateWifiOnly: (() -> Unit) -> Unit = { action ->
+        if (viewModel.isBlockedByWifiOnly()) {
+            pendingWifiAction = action
+        } else {
+            action()
+        }
+    }
+
     val folderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri ->
@@ -145,7 +192,34 @@ fun DownloadScreen(
     }
 
     // Start only if the manager isn't already working on this batch.
-    LaunchedEffect(games) { if (tasks.isEmpty() && games.isNotEmpty()) viewModel.start(games) }
+    // Gate on Wi-Fi-only: if the user is on metered data with the toggle on, we don't
+    // silently no-op — we surface a dialog (below) offering Wi-Fi or "Download anyway".
+    LaunchedEffect(games) {
+        if (tasks.isEmpty() && games.isNotEmpty()) gateWifiOnly { viewModel.start(games) }
+    }
+
+    // Wi-Fi-only block dialog: shown when the user tried to download on mobile data.
+    // We never silently no-op — the user can connect to Wi-Fi, open Settings via the
+    // explainer, or explicitly proceed with "Download anyway".
+    if (showWifiBlock) {
+        AlertDialog(
+            onDismissRequest = { pendingWifiAction = null },
+            title = { Text("On mobile data") },
+            text = {
+                Text("On mobile data — Wi-Fi-only is on. Connect to Wi-Fi or turn it off in Settings.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val action = pendingWifiAction
+                    pendingWifiAction = null
+                    action?.invoke()
+                }) { Text("Download anyway") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingWifiAction = null }) { Text("Cancel") }
+            }
+        )
+    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -250,8 +324,11 @@ fun DownloadScreen(
                                 // resolved per-console subfolder — is reused instead of
                                 // reconstructing a CuratedGame (which would drop `console`
                                 // and re-derive the subfolder, risking the wrong location).
-                                tasks.filter { it.status == DownloadStatus.FAILED }
-                                    .forEach { viewModel.retryTask(it) }
+                                // Gate on Wi-Fi-only just like the initial start.
+                                gateWifiOnly {
+                                    tasks.filter { it.status == DownloadStatus.FAILED }
+                                        .forEach { viewModel.retryTask(it) }
+                                }
                             },
                             modifier = Modifier.weight(1f)
                         ) { Text("Retry failed") }
@@ -398,7 +475,7 @@ fun DownloadScreen(
                                     visible = task.status == DownloadStatus.FAILED || task.status == DownloadStatus.CANCELLED,
                                     enter = fadeIn() + expandVertically()
                                 ) {
-                                    TextButton(onClick = { viewModel.retryTask(task) }) {
+                                    TextButton(onClick = { gateWifiOnly { viewModel.retryTask(task) } }) {
                                         Text("Retry", style = MaterialTheme.typography.labelSmall)
                                     }
                                 }

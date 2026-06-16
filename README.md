@@ -74,6 +74,8 @@ Pulling large files from the Internet Archive down to a phone, tablet, or handhe
 2. On your device, allow installs from unknown sources for your browser/file manager when prompted.
 3. Open the APK to install. Requires **Android 10 (API 29)** or newer.
 
+> **The prebuilt APK comes ready to use.** Sign in with your Internet Archive account and start downloading right away — the collections are already set up for you, so there's nothing to configure. *(The source repository itself stays content-free by design; if you build from source, you supply your own collections — see below.)*
+
 > The alpha builds install as a separate `.debug` package, so they won't collide with any future release build.
 
 ---

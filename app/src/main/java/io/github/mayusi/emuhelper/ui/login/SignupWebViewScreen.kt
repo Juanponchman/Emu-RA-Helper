@@ -87,7 +87,7 @@ fun SignupWebViewScreen(
                         false
                     } else {
                         // Open external links in the system browser; block them in-app.
-                        context.openUrl(request.url.toString())
+                        context.openUrl(request.url?.toString() ?: return true)
                         true
                     }
                 }

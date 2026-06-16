@@ -199,7 +199,7 @@ fun GamePickerScreen(
                             for ((c, fl) in scannedFiles) {
                                 val sel = selectedGames[c] ?: continue
                                 fl.filter { it.filename in sel }.forEach { f ->
-                                    games.add(CuratedGame(name = cleanGameName(f.filename), filename = f.name, size = f.size, identifier = f.identifier, source = "scanned", console = c))
+                                    games.add(CuratedGame(name = cleanGameName(f.filename), filename = f.name, size = f.size, identifier = f.identifier, source = "scanned", console = c, md5 = f.md5))
                                 }
                             }
                             if (games.isNotEmpty()) {
@@ -223,6 +223,11 @@ fun GamePickerScreen(
             val consoleKeys = remember(scannedFiles.keys) {
                 listOf(ALL_CONSOLES_KEY) + scannedFiles.keys.sorted()
             }
+            // Hoist the "All" totals so they recompute only when the backing maps change,
+            // not on every checkbox toggle or recomposition inside the LazyColumn body.
+            val allFileCount by remember(scannedFiles) { derivedStateOf { scannedFiles.values.sumOf { it.size } } }
+            val allSelCount by remember(selectedGames) { derivedStateOf { selectedGames.values.sumOf { it.size } } }
+
             LazyColumn(
                 modifier = Modifier.width(Dimens.SidebarWidth).fillMaxHeight().background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)),
                 contentPadding = PaddingValues(6.dp),
@@ -230,9 +235,9 @@ fun GamePickerScreen(
             ) {
                 items(consoleKeys, key = { it }) { console ->
                     val isAll = console == ALL_CONSOLES_KEY
-                    val count = if (isAll) scannedFiles.values.sumOf { it.size }
+                    val count = if (isAll) allFileCount
                                else scannedFiles[console]?.size ?: 0
-                    val sel = if (isAll) selectedGames.values.sumOf { it.size }
+                    val sel = if (isAll) allSelCount
                               else selectedGames[console]?.size ?: 0
                     val active = console == currentConsole
                     val backgroundColor by animateColorAsState(

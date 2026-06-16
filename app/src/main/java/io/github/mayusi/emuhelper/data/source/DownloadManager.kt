@@ -20,12 +20,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -57,6 +59,22 @@ class DownloadManager @Inject constructor(
 
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks
+
+    /**
+     * FIX #1: the ALWAYS-CURRENT source of truth for the task list.
+     *
+     * [updateTask] is called ~69×/sec across up to 24 segment callbacks. Previously every
+     * call assigned `_tasks.value`, which made the StateFlow emit at that full rate and
+     * forced Compose to re-diff the whole LazyColumn each time -> jank on low-RAM handhelds.
+     *
+     * We now decouple "source of truth" from "UI emission": this field is updated on EVERY
+     * call (so internal readers and the next updateTask always see the latest state), while
+     * `_tasks.value` (the StateFlow the UI collects) is only re-assigned on terminal status,
+     * task add/remove, or once the throttle window elapses. All access is under updateTask's
+     * @Synchronized lock (or the other writers below, which also keep this field in lockstep
+     * with `_tasks.value`). @Volatile guards the few non-locked reads on other coroutines.
+     */
+    @Volatile private var latestTasks: List<DownloadTask> = emptyList()
     private val _totalProgress = MutableStateFlow(0f)
     val totalProgress: StateFlow<Float> = _totalProgress
     private val _totalSpeed = MutableStateFlow(0.0)
@@ -153,15 +171,19 @@ class DownloadManager @Inject constructor(
                     id = "${g.identifier}/${g.filename}",
                     url = url, displayPath = displayPath, filename = safeName,
                     size = g.size, identifier = g.identifier, relativeName = g.filename,
-                    subfolder = subfolder, console = consoleKey, name = g.name
+                    subfolder = subfolder, console = consoleKey, name = g.name,
+                    // Carry the source checksum so the completion path can verify integrity.
+                    md5 = g.md5
                 )
             }
-            _tasks.value = taskList.sortedBy { it.filename }
+            val sorted = taskList.sortedBy { it.filename }
+            latestTasks = sorted          // keep source of truth in lockstep with the StateFlow
+            _tasks.value = sorted
             _statusText.value = "Downloading ${taskList.size} files..."
-            recomputeAggregates()
+            recomputeAggregates(sorted)
 
             val sem = Semaphore(concurrentFiles)
-            _tasks.value.map { it.id }.map { id ->
+            sorted.map { it.id }.map { id ->
                 launch {
                     sem.withPermit {
                         if (!cancelRequested) downloadOne(id, customRoot, defaultRoot)
@@ -169,14 +191,17 @@ class DownloadManager @Inject constructor(
                 }
             }.forEach { it.join() }
 
-            val done = _tasks.value.count { it.status == DownloadStatus.DONE }
-            val failed = _tasks.value.count { it.status == DownloadStatus.FAILED }
+            // Read the source of truth (all tasks are terminal here, so it already equals
+            // the last emitted _tasks.value — but latestTasks is the canonical snapshot).
+            val finalTasks = latestTasks
+            val done = finalTasks.count { it.status == DownloadStatus.DONE }
+            val failed = finalTasks.count { it.status == DownloadStatus.FAILED }
             _statusText.value = when {
                 failed == 0 -> "Complete: $done done"
                 done == 0 -> "All $failed downloads failed"
                 else -> "Done: $done · Failed: $failed"
             }
-            recordBatchHistory(_tasks.value)
+            recordBatchHistory(finalTasks)
             // Clear the persisted queue — batch reached its terminal state successfully,
             // so there is nothing to resume. An interrupted batch (app killed mid-batch)
             // leaves the queue set because this line is never reached.
@@ -192,7 +217,7 @@ class DownloadManager @Inject constructor(
         // can't both pass the guard and spawn duplicate coroutines.
         val shouldLaunch: Boolean
         synchronized(this) {
-            val originalStatus = _tasks.value.firstOrNull { it.id == taskId }?.status ?: return
+            val originalStatus = latestTasks.firstOrNull { it.id == taskId }?.status ?: return
             // Only retry tasks that were genuinely terminal.
             if (originalStatus != DownloadStatus.FAILED && originalStatus != DownloadStatus.CANCELLED) return
             // Mark as queued now, while holding the lock.
@@ -213,7 +238,7 @@ class DownloadManager @Inject constructor(
             if (permError != null) {
                 updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, error = permError) }
                 synchronized(this@DownloadManager) {
-                    if (_tasks.value.none {
+                    if (latestTasks.none {
                             it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED
                         }
                     ) {
@@ -229,7 +254,7 @@ class DownloadManager @Inject constructor(
                 downloadOne(taskId, customRoot, defaultRoot)
             } finally {
                 synchronized(this@DownloadManager) {
-                    if (_tasks.value.none {
+                    if (latestTasks.none {
                             it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.QUEUED
                         }
                     ) {
@@ -291,7 +316,7 @@ class DownloadManager @Inject constructor(
         // If batch-end already recorded, the CAS in recordBatchHistory returns early (no-op).
         // Reset the AtomicBoolean BEFORE launching so the next batch starts clean,
         // but only after the snapshot is captured.
-        val snapshot = _tasks.value
+        val snapshot = latestTasks
         if (snapshot.isNotEmpty()) {
             scope.launch {
                 recordBatchHistory(snapshot)
@@ -305,6 +330,7 @@ class DownloadManager @Inject constructor(
         // a belt-and-suspenders safety net for the edge case where the app never calls
         // start() again before another clear().
         batchHistoryRecorded.set(false)
+        latestTasks = emptyList()     // reset source of truth alongside the StateFlow
         _tasks.value = emptyList()
         _statusText.value = "Preparing..."
         _totalProgress.value = 0f
@@ -316,11 +342,12 @@ class DownloadManager @Inject constructor(
     // ---- one file ---------------------------------------------------------
 
     private suspend fun downloadOne(taskId: String, customRootBase: DocumentFile?, defaultRootBase: File) {
-        val base = _tasks.value.firstOrNull { it.id == taskId } ?: return
+        val base = latestTasks.firstOrNull { it.id == taskId } ?: return
         val filename = base.filename
         val expected = base.size
         val url = base.url
         val subfolder = base.subfolder
+        val expectedMd5 = base.md5  // empty => no checksum known => verification skipped
 
         updateTask(taskId) { it.copy(status = DownloadStatus.DOWNLOADING, error = "", speed = 0.0) }
 
@@ -367,6 +394,22 @@ class DownloadManager @Inject constructor(
             val ok = if (expected > 0) total >= expected * 99 / 100 else total > 0
             if (!ok) throw java.io.IOException("Incomplete: $total / $expected")
 
+            // Integrity check: a multi-GB, multi-segment download can silently corrupt
+            // (a stale byte range, a flaky node) yet still pass the 1%-tolerance size check.
+            // When the source published an md5 for this file, hash the freshly downloaded
+            // bytes (the cache .part, which is exactly what the server served — verbatim for
+            // copies, and the .zip itself when extraction is enabled) and compare. On a clear
+            // mismatch we FAIL the task and do NOT publish the corrupt file. If the md5 is
+            // unknown or hashing itself errors, we proceed exactly as before (unverified).
+            if (expectedMd5.isNotBlank()) {
+                val actualMd5 = computeMd5OrNull(cacheFile)  // off-main, cancellation-safe
+                if (actualMd5 != null && !actualMd5.equals(expectedMd5, ignoreCase = true)) {
+                    // Don't rename/copy: throwing here lands in the catch below, which deletes
+                    // the cache file and marks the task FAILED with this message.
+                    throw java.io.IOException("File corrupt - retry")
+                }
+            }
+
             _statusText.value = "Saving $filename…"
             if (extractArchives && filename.lowercase().endsWith(".zip")) {
                 extractZipToDestination(cacheFile, customRootBase, defaultRootBase, subfolder)
@@ -389,6 +432,45 @@ class DownloadManager @Inject constructor(
                 else msg.ifBlank { e.javaClass.simpleName }
             } else e.message ?: e.javaClass.simpleName
             updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, speed = 0.0, error = errorMessage) }
+        }
+    }
+
+    /**
+     * Stream the file through MD5 and return the lowercase hex digest, or null if hashing
+     * could not complete (I/O error, MessageDigest unavailable, etc.) — callers treat null
+     * as "unverified, proceed" rather than a failure.
+     *
+     * Runs on [Dispatchers.IO] so it never touches the main thread, reads in 1 MB chunks so a
+     * multi-GB file streams with a bounded buffer (no slowdown worth noticing on small files),
+     * and checks for cancellation each chunk. A genuine coroutine cancellation is re-thrown so
+     * a cancelled download is recorded as CANCELLED rather than silently "proceeding".
+     */
+    private suspend fun computeMd5OrNull(file: File): String? = withContext(Dispatchers.IO) {
+        try {
+            val digest = java.security.MessageDigest.getInstance("MD5")
+            file.inputStream().buffered().use { input ->
+                val buf = ByteArray(1 shl 20) // 1 MB
+                var read: Int
+                while (input.read(buf).also { read = it } != -1) {
+                    // Cooperative cancellation: bail promptly if the batch was cancelled or the
+                    // coroutine itself is cancelled, so we don't keep hashing a dead download.
+                    if (cancelRequested) throw CancellationException()
+                    ensureActive()
+                    digest.update(buf, 0, read)
+                }
+            }
+            val sb = StringBuilder(32)
+            for (b in digest.digest()) {
+                val v = b.toInt() and 0xFF
+                sb.append("0123456789abcdef"[v shr 4]).append("0123456789abcdef"[v and 0x0F])
+            }
+            sb.toString()
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: Exception) {
+            // Never crash the download over a hashing failure — log and let the caller proceed.
+            Log.w("EmuHelper", "MD5 verify failed for ${file.name}; proceeding unverified", e)
+            null
         }
     }
 
@@ -544,22 +626,49 @@ class DownloadManager @Inject constructor(
 
     @Synchronized
     private fun updateTask(id: String, transform: (DownloadTask) -> DownloadTask) {
-        val all = _tasks.value
+        // Read from the always-current source of truth (not _tasks.value, which may now
+        // lag the UI by one throttled progress update — see FIX #1 below).
+        val all = latestTasks
         val idx = all.indexOfFirst { it.id == id }
         if (idx < 0) return
+        val oldStatus = all[idx].status
         val updated = all.toMutableList().apply { this[idx] = transform(this[idx]) }
-        _tasks.value = updated
-        // Always recompute immediately on terminal status so totals are accurate at completion.
-        // During active progress, throttle to at most ~3×/sec to avoid pegging the CPU
-        // across up to 24 concurrent segment coroutines each reporting every ~256 KB.
         val newStatus = updated[idx].status
+        // Always advance the source of truth so the NEXT updateTask (and any internal
+        // reader) sees this mutation even if we don't emit to the UI this time.
+        latestTasks = updated
+
+        // FIX #1: decouple emission from the segment-callback rate.
+        // updateTask fires ~69×/sec across up to 24 segments; assigning _tasks.value on
+        // every call made the StateFlow emit at that rate and forced Compose to re-diff the
+        // whole LazyColumn each time -> jank on 2-3GB handhelds. Gate the EMISSION behind the
+        // same throttle that already guarded recomputeAggregates, with two correctness
+        // carve-outs that must ALWAYS emit so the UI never shows a wrong final/paused state:
+        //   - terminal status (DONE/FAILED/CANCELLED): the last word on a task.
+        //   - any status TRANSITION (e.g. -> DOWNLOADING/PAUSED): once paused, progress
+        //     callbacks stop, so a throttled-away PAUSED would otherwise never reach the UI.
+        // Pure progress ticks within the throttle window are coalesced (still recorded in
+        // latestTasks; the next emission carries the freshest bytes/speed).
         val isTerminal = newStatus == DownloadStatus.DONE ||
                          newStatus == DownloadStatus.FAILED ||
                          newStatus == DownloadStatus.CANCELLED
+        val statusChanged = newStatus != oldStatus
         val now = System.currentTimeMillis()
-        if (isTerminal || now - lastAggregateMs >= AGGREGATE_INTERVAL_MS) {
+        val throttleElapsed = now - lastAggregateMs >= AGGREGATE_INTERVAL_MS
+
+        // Aggregate recompute keeps its ORIGINAL gate (terminal || throttle window) so
+        // totals/ETA/notification timing is byte-for-byte unchanged from before FIX #1.
+        if (isTerminal || throttleElapsed) {
             lastAggregateMs = now
             recomputeAggregates(updated)
+        }
+        // Emit to the UI on the same window, PLUS on any status transition. The transition
+        // carve-out is essential: when a task flips to PAUSED its progress callbacks stop,
+        // so a throttled-away PAUSED would never reach the UI; likewise terminal states are
+        // status changes and so always emit. Pure progress ticks inside the window are
+        // coalesced — latestTasks already holds them and the next emission carries them.
+        if (isTerminal || statusChanged || throttleElapsed) {
+            _tasks.value = updated
         }
     }
 

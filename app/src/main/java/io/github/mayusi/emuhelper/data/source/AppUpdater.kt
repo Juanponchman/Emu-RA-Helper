@@ -95,8 +95,6 @@ class AppUpdater @Inject constructor(
      *                       Pass null to skip verification (host allowlist + HTTPS still apply).
      * @param onProgress     Callback with fractional progress 0f..1f (trailing-lambda friendly).
      * @return The written [File] on success, or null on any error (including failed verification).
-     *
-     * TODO (ViewModels): pass UpdateInfo.apkSha256 as expectedSha256 when calling this function.
      */
     suspend fun downloadApk(
         apkUrl: String,

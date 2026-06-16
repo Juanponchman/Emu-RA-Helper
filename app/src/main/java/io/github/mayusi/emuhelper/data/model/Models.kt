@@ -8,7 +8,11 @@ data class GameFile(
     val filename: String,
     val size: Long,
     val identifier: String,
-    val sourceUrl: String = ""
+    val sourceUrl: String = "",
+    /** Lowercase MD5 hex from the source item's metadata, used to verify a finished
+     *  download. Defaulted to empty for back-compat and for files whose metadata
+     *  omits a checksum (verification is skipped when blank). */
+    val md5: String = ""
 ) : Serializable
 
 @KSerializable
@@ -20,7 +24,11 @@ data class CuratedGame(
     val source: String = "built_in",
     /** Platform key (e.g. "snes", "gcn") so downloads can be filed into a per-platform
      *  subfolder. Defaulted for backward-compat with lists exported before this field. */
-    val console: String = ""
+    val console: String = "",
+    /** Lowercase MD5 hex carried from [GameFile.md5] so the download task can verify the
+     *  finished file's integrity. Defaulted to empty for back-compat with lists exported
+     *  before this field (and for sources that don't publish a checksum). */
+    val md5: String = ""
 ) : Serializable {
     /**
      * Stable composite key distinguishing games across consoles.
@@ -73,6 +81,9 @@ data class DownloadTask(
     val console: String = "",
     /** Human-readable game name — carried from [CuratedGame.name] for display in history. */
     val name: String = "",
+    /** Lowercase MD5 hex carried from [CuratedGame.md5] so the completion path can verify
+     *  the finished file. Blank means "no checksum known" — verification is skipped. */
+    val md5: String = "",
     val downloaded: Long = 0,
     val speed: Double = 0.0,
     val status: DownloadStatus = DownloadStatus.QUEUED,
