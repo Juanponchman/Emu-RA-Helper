@@ -55,8 +55,19 @@ class PersistentCookieJar(context: Context) : CookieJar {
     // disk restore finishes — otherwise an early synchronous isLoggedIn() reads the
     // still-empty store on cold start and the user looks signed-out until a manual
     // re-check. Starts false; flipped after loadFromDisk() and on every mutation.
+    //
+    // v0.5.4: refreshLoggedIn() is called on EVERY path that can change login status —
+    // loadFromDisk (startup), saveFromResponse (a successful login stores the auth
+    // cookie), loadForRequest (expired-cookie sweep) and clear(). Assigning to a
+    // StateFlow.value is cheap and conflated: it only re-emits to collectors when the
+    // boolean actually flips, so calling it redundantly is idempotent and safe. The key
+    // guarantee is that a successful silent re-login (which goes through saveFromResponse)
+    // immediately publishes loggedIn=true, so any live collector — e.g. the home screen's
+    // combine — reacts the instant the session is restored, with no manual re-check.
     private val _loggedIn = MutableStateFlow(false)
     val loggedIn: StateFlow<Boolean> = _loggedIn
+    // Recompute from the live store and publish. Idempotent + cheap: StateFlow conflates,
+    // so this only emits when the computed value differs from the current one.
     private fun refreshLoggedIn() { _loggedIn.value = computeHasCookies() }
 
     // Touching EncryptedSharedPreferences does disk I/O and a KeyStore op, so we never
@@ -135,6 +146,16 @@ class PersistentCookieJar(context: Context) : CookieJar {
     suspend fun awaitRestored() {
         restored.await()
     }
+
+    /**
+     * Force a re-evaluation of the login state from the live cookie store and re-publish it
+     * to [loggedIn]. Normally unnecessary — every mutation path already calls the private
+     * refreshLoggedIn() — but it gives callers (e.g. HomeViewModel after awaitRestored(), or a
+     * user-initiated "refresh") a cheap, idempotent way to guarantee [loggedIn] reflects the
+     * current store. Conflated: emits only if the value actually changed, so calling it when
+     * already correct is a no-op for collectors.
+     */
+    fun publishLoginState() = refreshLoggedIn()
 
     override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
         val now = System.currentTimeMillis()

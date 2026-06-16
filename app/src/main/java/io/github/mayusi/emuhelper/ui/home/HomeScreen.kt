@@ -99,13 +99,28 @@ class HomeViewModel @Inject constructor(
     // B3: Keep a reference to the in-flight download job so cancelDownload() can cancel it.
     private var downloadJob: Job? = null
 
+    // FIX (v0.5.4): SharingStarted.Eagerly — NOT WhileSubscribed.
+    // The bug: the home screen showed "not logged in" after a cold start even though the
+    // session HAD restored; navigating to About and back made it correct. Root cause was
+    // the WhileSubscribed(5000) sharing strategy. The cookie jar restores the session on a
+    // background thread AFTER this flow is created, then flips cookieJar.loggedIn=false→true.
+    // With WhileSubscribed, the combine's upstream subscription to cookieJar.loggedIn is
+    // started lazily and torn down 5s after the last collector detaches; the late flip to
+    // true could land in the gap (or be conflated against the lazy startup), so ui.value
+    // stayed HomeUi(loggedIn=false). Only the nav round-trip — which tears down HomeScreen
+    // and re-subscribes ui, causing stateIn to re-read the now-true cookieJar.loggedIn.value
+    // fresh — surfaced the correct state. Eagerly subscribes to cookieJar.loggedIn the
+    // instant the ViewModel is created and KEEPS the combine alive for the VM's whole
+    // lifetime, so every loggedIn flip — the disk restore completing AND a successful silent
+    // relogin (saveFromResponse → refreshLoggedIn) — propagates into ui.value LIVE, with no
+    // nav round-trip and no timer race.
     val ui: StateFlow<HomeUi> = combine(
         listStore.lists,
         authStore.savedEmail,
         cookieJar.loggedIn
     ) { lists, email, loggedIn ->
         HomeUi(listCount = lists.size, loggedIn = loggedIn, email = email)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeUi())
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, HomeUi())
 
     // FIX 2: tri-state auth gate. `false` until the cookie jar's disk restore has completed,
     // so the UI knows whether `ui.loggedIn` is the REAL persisted state or just the cold-start
@@ -121,6 +136,12 @@ class HomeViewModel @Inject constructor(
             // cookieJar.loggedIn reflects the persisted session (no lost race on a cold KeyStore
             // / loaded device), so we never fire a needless network re-login.
             cookieJar.awaitRestored()
+            // Belt-and-suspenders: re-publish the restored login state before the gate flips.
+            // The restore already called refreshLoggedIn(), and the combine above (Eagerly)
+            // observes every flip — this is a cheap, conflated no-op when already correct, but
+            // it guarantees ui.loggedIn reflects the freshly-restored session by the time the
+            // screen is told the auth state is known.
+            cookieJar.publishLoginState()
             _authReady.value = true // FIX 2: auth state is now known — UI can show the real card.
             // Trust the persisted session: if we restored a valid login, do NO network at all.
             if (cookieJar.loggedIn.value) return@launch
@@ -131,7 +152,14 @@ class HomeViewModel @Inject constructor(
             val pwd = authStore.getSavedPassword()
             if (pwd.isBlank()) return@launch
             when (source.login(email, pwd)) {
-                is LoginResult.Success -> Log.i("EmuHelper", "silent auto-relogin OK")
+                is LoginResult.Success -> {
+                    // A successful login goes through OkHttp → cookieJar.saveFromResponse →
+                    // refreshLoggedIn(), so cookieJar.loggedIn has ALREADY flipped true and the
+                    // Eagerly combine has already pushed it into ui.value live. Re-publish anyway
+                    // as a cheap idempotent guarantee so the home screen never lags the session.
+                    cookieJar.publishLoginState()
+                    Log.i("EmuHelper", "silent auto-relogin OK")
+                }
                 is LoginResult.Failed -> Log.w("EmuHelper", "silent auto-relogin failed")
             }
         }
@@ -159,6 +187,16 @@ class HomeViewModel @Inject constructor(
             authStore.clearCredentials()
             cookieJar.clear()
         }
+    }
+
+    /**
+     * Lightweight manual re-check of the login state. The reactive combine above already
+     * keeps the home screen in sync live (this is NOT the primary fix), but exposing a cheap
+     * idempotent refresh lets the UI nudge the published state if a user ever wants to. It
+     * only re-publishes from the cookie store — no network — so it's safe to call freely.
+     */
+    fun refreshAuth() {
+        cookieJar.publishLoginState()
     }
 
     fun setFolder(uri: Uri?) {

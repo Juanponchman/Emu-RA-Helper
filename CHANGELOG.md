@@ -4,6 +4,16 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.4] — 2026-06-16
+
+### Fixed
+- **Login status now updates live on the home screen.** After v0.5.3 you could
+  still briefly see "not signed in" on the home screen even though you were
+  logged in (it corrected itself if you visited another screen and came back).
+  The home screen now reflects your real login state immediately and updates
+  the instant a background sign-in completes — no need to navigate away and
+  back.
+
 ## [0.5.3] — 2026-06-16
 
 ### Fixed
