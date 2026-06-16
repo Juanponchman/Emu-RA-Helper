@@ -18,7 +18,7 @@ EmuHelper is an Android download manager built for the [Internet Archive](https:
 
 The app is **configurable and ships with no collections of its own** — you set up which Internet Archive collections it reads from. That keeps the project itself just the machinery: the browsing, list-building, and fast-transfer engine. *What* you point it at is up to you.
 
-> **Status: Early / Alpha — v0.3.2.** Still new and actively being built. Expect rough edges, and please file issues.
+> **Status: Early / Alpha — v0.4.0.** Still new and actively being built. Expect rough edges, and please file issues.
 
 ---
 

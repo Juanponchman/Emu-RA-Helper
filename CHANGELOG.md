@@ -4,6 +4,27 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.4.0] — 2026-06-16
+
+### Added
+- **Download integrity check** — each downloaded file is now verified against
+  the Internet Archive's published MD5. A corrupt download is caught and marked
+  "File corrupt — retry" instead of silently leaving a broken file.
+- **Wi-Fi-only mode** (Settings) — block downloads on mobile data, with a clear
+  prompt and a "download anyway" option, so a big batch can't burn a data cap.
+
+### Changed
+- Big jank reduction during downloads on low-RAM handhelds (the download list no
+  longer churns the UI on every progress tick), plus a bounded metadata cache and
+  lighter game-picker/source-health screens.
+- Clearer README (it's an Internet Archive download manager; the prebuilt APK is
+  ready to use) with a live downloads badge.
+
+### Fixed
+- Save-list screen scrolls/pads for the keyboard so the Save button isn't clipped.
+- Refresh-sources button shows progress; signup web view and error-log list are
+  hardened against crashes; a catalog-merge fallback no longer blanks a hint.
+
 ## [0.3.2] — 2026-06-11
 
 ### Fixed
