@@ -5,8 +5,8 @@
 <p align="center"><strong>An Android download manager for the Internet Archive — browse large collections, build lists, and pull files fast over multiple connections.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Release" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/mayusi/EmuHelper/badges/release.json"></a>
-  <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/mayusi/EmuHelper/badges/downloads.json"></a>
+  <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Release" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmayusi%2FEmuHelper%2Fbadges%2Frelease.json&cacheSeconds=3600"></a>
+  <a href="https://github.com/mayusi/EmuHelper/releases"><img alt="Downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmayusi%2FEmuHelper%2Fbadges%2Fdownloads.json&cacheSeconds=3600"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
   <img alt="Min Android 10 (API 29)" src="https://img.shields.io/badge/Android-10%2B%20(API%2029)-3DDC84?logo=android&logoColor=white">
   <img alt="Built with Kotlin" src="https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white">
