@@ -4,6 +4,22 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.0] — 2026-06-16
+
+### Added
+- **Experimental adaptive download engine** (Settings, off by default). On the
+  Internet Archive, individual mirrors throttle hard and inconsistently — this
+  engine splits each file into many small chunks pulled from a shared queue by a
+  pool of connections, so fast mirrors do more work and a slow one only holds up
+  one small chunk (requeued elsewhere) instead of bottlenecking the whole file.
+  Can meaningfully speed up large downloads. Turn it on in Settings to try it.
+
+### Notes
+- The engine is fully opt-in; with it off, downloads behave exactly as before.
+  The 24-connection safety cap, resume, and MD5 verification all still apply.
+  Backed by new unit tests proving the chunked transfer reconstructs files
+  exactly even under connection failures.
+
 ## [0.4.0] — 2026-06-16
 
 ### Added
