@@ -30,14 +30,54 @@ internal object AdaptiveEngine {
     /** A chunk must run at least this long before soft-stall logic applies (past TCP ramp-up). */
     const val MIN_SAMPLE_MS: Long = 2000L
 
-    /** Soft stall: chunk throughput below this fraction of the best-live EWMA is "slow". */
-    const val SOFT_STALL_FRACTION: Double = 0.25
+    /**
+     * Soft stall (Fix B): a chunk reading below this fraction of the CURRENT baseline is "slow".
+     * Deliberately conservative — on a shared pipe most chunks legitimately run at 40-70% of the
+     * baseline, so the fraction is well below that band. Only a genuinely dead/throttled chunk
+     * (sustained, see [SOFT_STALL_WINDOWS]) trips it.
+     */
+    const val SOFT_STALL_FRACTION: Double = 0.15
 
-    /** A host that stalls/errors is on cooldown (skipped during selection) for this long. */
+    /**
+     * Soft stall must be SUSTAINED (Fix B): a chunk must read below the threshold for this many
+     * CONSECUTIVE measurement windows before it migrates. A single slow instantaneous sample
+     * (normal contention jitter) is ignored.
+     */
+    const val SOFT_STALL_WINDOWS: Int = 3
+
+    /**
+     * Soft-stall guardrail (Fix B): the recent-rate baseline is only trustworthy once at least
+     * this many completed-chunk samples exist. Below this, soft-stall is DISABLED (hard-stall
+     * only) — the dangerous heuristic stays inert until it has real data.
+     */
+    const val SOFT_STALL_MIN_SAMPLES: Int = 4
+
+    /** Ring-buffer capacity for the recent completed-chunk throughput baseline (Fix B). */
+    const val RECENT_RATE_WINDOW: Int = 16
+
+    /** A host that HARD-stalls/errors is on cooldown (skipped during selection) for this long. */
     const val HOST_COOLDOWN_MS: Long = 15_000L
+
+    /**
+     * Soft-stall host demotion (Fix C): a soft stall does NOT cool the host. Instead its EWMA is
+     * scaled by this factor so it is mildly de-preferred without the all-cooled funnel a 15s
+     * cooldown would cause. > 0 and < 1.
+     */
+    const val SOFT_DEMOTE_FACTOR: Double = 0.85
 
     /** EWMA smoothing: new = old*EWMA_KEEP + observed*(1-EWMA_KEEP). */
     const val EWMA_KEEP: Double = 0.7
+
+    /** Real transport-error budget per chunk (Fix A): non-206, short read, IOException, timeout. */
+    const val MAX_ERROR_ATTEMPTS: Int = 5
+
+    /**
+     * Stall-requeue budget per chunk (Fix A): soft/hard stall migrations. Much larger than the
+     * error budget — a stall never fails the download by itself, it just re-queues the chunk for
+     * another worker/host. The cap is a sanity bound against a pathological infinite-migration
+     * loop, not an error threshold.
+     */
+    const val MAX_STALL_REQUEUES: Int = 50
 }
 
 /**
@@ -102,16 +142,31 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     /** Indices fully written and confirmed. */
     private val done = HashSet<Int>()
 
+    /**
+     * Terminal FAILED state (Fix D): indices that exhausted [AdaptiveEngine.MAX_ERROR_ATTEMPTS]
+     * real transport errors. An explicit terminal condition so [allFailed]/[shouldKeepWorking]
+     * have a definite answer instead of relying on a thrown exception racing other workers. The
+     * download throws iff this set is non-empty; it completes iff [done] covers every index.
+     */
+    private val failed = HashSet<Int>()
+
     /** Count of chunks currently held by a worker (polled, not yet done/requeued). */
     private var inFlight = 0
 
     /**
-     * Per-chunk failed-attempt counter. Persists across requeues so a chunk that bounces
-     * between workers/hosts still fails the whole download once it exhausts MAX_ATTEMPTS — the
-     * same failure semantics as the static per-segment loop, just tracked on the queue so a
-     * requeued chunk carries its tally instead of resetting.
+     * Per-chunk REAL-error counter (Fix A). Only genuine transport failures (non-206, short read,
+     * IOException, timeout) increment this. Persists across requeues so a chunk that bounces
+     * between workers/hosts still fails once it exhausts [AdaptiveEngine.MAX_ERROR_ATTEMPTS] —
+     * the same terminal semantics as the static per-segment loop.
      */
-    private val attempts = HashMap<Int, Int>()
+    private val errorAttempts = HashMap<Int, Int>()
+
+    /**
+     * Per-chunk STALL-requeue counter (Fix A). Soft/hard stall migrations increment this, NOT
+     * [errorAttempts]. A stall never fails the whole download — it just re-queues the chunk for
+     * another worker/host. Capped only by [AdaptiveEngine.MAX_STALL_REQUEUES] as a sanity bound.
+     */
+    private val stallRequeues = HashMap<Int, Int>()
 
     // ---- diagnostic / test counters (monotonic) -----------------------------
     private var claims = 0L
@@ -152,21 +207,32 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     }
 
     /**
-     * Record one failed attempt on [chunk] and decide its fate. If the chunk has now exhausted
-     * [maxAttempts] it is NOT requeued and this returns true (the caller should fail the whole
-     * download). Otherwise the WHOLE chunk is requeued for any worker and this returns false.
+     * Record one REAL transport error on [chunk] and decide its fate (Fix A — error budget).
+     *
+     * Increments ONLY the [errorAttempts] counter. If the chunk has now exhausted [maxAttempts]
+     * (default [AdaptiveEngine.MAX_ERROR_ATTEMPTS]) it is moved to the terminal [failed] state,
+     * left OUT of the queue, and this returns true — the caller throws and the whole download
+     * fails. Otherwise the WHOLE chunk is requeued for any worker and this returns false.
      * Already-done chunks are never requeued and never report exhaustion.
+     *
+     * Stalls must NOT call this — they go through [requeueStall], which uses a separate, far
+     * larger budget and can never fail the download.
      */
-    fun requeueOrFail(chunk: Chunk, maxAttempts: Int): Boolean = synchronized(lock) {
+    fun recordErrorOrFail(
+        chunk: Chunk,
+        maxAttempts: Int = AdaptiveEngine.MAX_ERROR_ATTEMPTS
+    ): Boolean = synchronized(lock) {
         if (chunk.index in done) {
             if (inFlight > 0) inFlight--
             return false
         }
-        val tries = (attempts[chunk.index] ?: 0) + 1
-        attempts[chunk.index] = tries
+        val tries = (errorAttempts[chunk.index] ?: 0) + 1
+        errorAttempts[chunk.index] = tries
         if (inFlight > 0) inFlight--
         if (tries >= maxAttempts) {
-            // Exhausted: leave it OUT of the queue; the caller throws and the whole download fails.
+            // Exhausted real-error budget: mark terminal FAILED and leave it OUT of the queue.
+            // shouldKeepWorking()/allFailed() now report a definite condition; the caller throws.
+            failed.add(chunk.index)
             return true
         }
         requeues++
@@ -174,8 +240,61 @@ internal class ChunkQueue(chunks: List<Chunk>) {
         return false
     }
 
-    /** Failed attempts recorded for [index] so far (test/diagnostic). */
-    fun attemptsOf(index: Int): Int = synchronized(lock) { attempts[index] ?: 0 }
+    /**
+     * Requeue [chunk] after a SOFT or HARD stall (Fix A — stall budget). Increments only the
+     * [stallRequeues] counter, NEVER [errorAttempts], so a stall can NEVER exhaust the error
+     * budget and fail the download. The chunk is always re-queued for another worker/host (so it
+     * can eventually complete on a faster node), except:
+     *  - an already-done chunk is a harmless no-op, and
+     *  - if [stallRequeues] somehow exceeds [maxStallRequeues] (a pathological infinite-migration
+     *    loop) the chunk is still requeued — a stall must never fail the download — but the cap is
+     *    surfaced via [stallRequeuesOf] for diagnostics.
+     *
+     * Always returns false: a stall never signals download failure. (Boolean kept for symmetry /
+     * call-site readability.)
+     */
+    fun requeueStall(
+        chunk: Chunk,
+        @Suppress("UNUSED_PARAMETER") maxStallRequeues: Int = AdaptiveEngine.MAX_STALL_REQUEUES
+    ): Boolean = synchronized(lock) {
+        if (chunk.index in done) {
+            if (inFlight > 0) inFlight--
+            return false
+        }
+        stallRequeues[chunk.index] = (stallRequeues[chunk.index] ?: 0) + 1
+        if (inFlight > 0) inFlight--
+        requeues++
+        // A stalled chunk ALWAYS goes back to the queue so a different worker/host can complete it.
+        if (chunk.index !in queued) queued.add(chunk.index)
+        return false
+    }
+
+    /** Real transport-error attempts recorded for [index] so far (test/diagnostic). */
+    fun errorAttemptsOf(index: Int): Int = synchronized(lock) { errorAttempts[index] ?: 0 }
+
+    /** Stall requeues recorded for [index] so far (test/diagnostic). */
+    fun stallRequeuesOf(index: Int): Int = synchronized(lock) { stallRequeues[index] ?: 0 }
+
+    /** True iff [index] reached the terminal FAILED state (exhausted the real-error budget). */
+    fun isFailed(index: Int): Boolean = synchronized(lock) { index in failed }
+
+    /**
+     * Self-healing reconciliation (Fix D). If [chunk] is still IN-FLIGHT (not done, not failed,
+     * not queued) on some exit path that neither marked it done nor requeued it, force it back
+     * onto the queue so it can never be orphaned / leak an in-flight slot (which would wedge
+     * shouldKeepWorking() true forever and hang the download). A no-op if the chunk is already
+     * done, failed, or already queued. Touches NEITHER budget — pure bookkeeping. Returns true
+     * iff it actually reconciled a leaked in-flight chunk.
+     */
+    fun forceRequeue(chunk: Chunk): Boolean = synchronized(lock) {
+        if (chunk.index in done) return false
+        if (chunk.index in failed) return false
+        if (chunk.index in queued) return false
+        if (inFlight > 0) inFlight--
+        requeues++
+        queued.add(chunk.index)
+        return true
+    }
 
     /**
      * Mark a chunk DONE after its FULL range was written and verified. Returns true if this
@@ -205,12 +324,23 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     /** True iff EVERY chunk index 0..count-1 is done. The completion gate asserts this. */
     fun allDone(): Boolean = synchronized(lock) { done.size == all.size }
 
+    /** True iff at least one chunk reached the terminal FAILED state (Fix D). */
+    fun anyFailed(): Boolean = synchronized(lock) { failed.isNotEmpty() }
+
+    /** Indices in the terminal FAILED state (test/diagnostic). */
+    fun failedIndices(): Set<Int> = synchronized(lock) { failed.toSet() }
+
     /**
-     * True while a worker should keep looping: either work is queued, or other workers still
-     * hold in-flight chunks that might be requeued. Workers exit only when the queue is empty
-     * AND no chunks are in flight (and therefore everything is done, or has failed out).
+     * True while a worker should keep looping (Fix D — definite terminal conditions): either work
+     * is queued, or other workers still hold in-flight chunks that might be requeued. Workers exit
+     * only when the queue is empty AND no chunks are in flight — at which point every chunk is in
+     * a terminal state (done or failed). A short-circuit on [anyFailed] lets workers stop promptly
+     * once the download is doomed rather than draining the rest first.
      */
-    fun shouldKeepWorking(): Boolean = synchronized(lock) { queued.isNotEmpty() || inFlight > 0 }
+    fun shouldKeepWorking(): Boolean = synchronized(lock) {
+        if (failed.isNotEmpty()) return false
+        queued.isNotEmpty() || inFlight > 0
+    }
 
     /** True iff this exact index is done. */
     fun isDone(index: Int): Boolean = synchronized(lock) { index in done }
@@ -219,6 +349,100 @@ internal class ChunkQueue(chunks: List<Chunk>) {
     fun claimsCount(): Long = synchronized(lock) { claims }
     fun requeuesCount(): Long = synchronized(lock) { requeues }
     fun donesCount(): Long = synchronized(lock) { dones }
+}
+
+/**
+ * Thread-safe ring buffer of the most-recent completed-chunk throughputs (bytes/ms), and the
+ * soft-stall DECISION built on top of it (Fix B).
+ *
+ * The old soft-stall baseline was the PEAK EWMA of the single fastest host — a number that only
+ * ever climbs and never reflects that bandwidth is now shared across ~24 connections. Against a
+ * peak, most chunks look "slow" and trip a false-positive storm. This window instead holds the
+ * last [capacity] *actually-observed* completed-chunk rates across ALL hosts, so the baseline is
+ * a CURRENT, decaying snapshot of real conditions: as the pipe gets shared the recorded rates
+ * fall and the baseline falls with them.
+ *
+ * [baseline] is the MEDIAN of the buffered samples (robust to one fast/slow outlier). The
+ * soft-stall decision ([shouldSoftStall]) is deliberately conservative and only fires when ALL
+ * of these hold:
+ *   - enough samples exist ([AdaptiveEngine.SOFT_STALL_MIN_SAMPLES]) — otherwise the baseline is
+ *     untrustworthy and soft-stall is DISABLED (hard-stall only); this is the safety fallback,
+ *   - the chunk has run past warm-up ([AdaptiveEngine.MIN_SAMPLE_MS]),
+ *   - its rate is below [AdaptiveEngine.SOFT_STALL_FRACTION] × baseline,
+ *   - it has been below that bar for [AdaptiveEngine.SOFT_STALL_WINDOWS] CONSECUTIVE windows
+ *     (sustained, not a single jittery sample), and
+ *   - there is unclaimed work to migrate to (checked by the caller).
+ */
+internal class RecentRateWindow(
+    private val capacity: Int = AdaptiveEngine.RECENT_RATE_WINDOW
+) {
+    private val lock = Any()
+    private val buf = DoubleArray(capacity.coerceAtLeast(1))
+    private var size = 0
+    private var next = 0
+
+    /** Record one completed-chunk throughput in bytes/ms. Non-positive samples are ignored. */
+    fun record(bytesPerMs: Double): Unit = synchronized(lock) {
+        if (bytesPerMs <= 0.0) return
+        buf[next] = bytesPerMs
+        next = (next + 1) % buf.size
+        if (size < buf.size) size++
+    }
+
+    /** Number of samples currently buffered (caps at [capacity]). */
+    fun sampleCount(): Int = synchronized(lock) { size }
+
+    /**
+     * Median of the buffered completed-chunk rates (bytes/ms), or 0.0 when empty. Median (not
+     * mean) so one very fast or very slow chunk can't skew the baseline.
+     */
+    fun baseline(): Double = synchronized(lock) {
+        if (size == 0) return 0.0
+        val snap = DoubleArray(size) { buf[it] }
+        snap.sort()
+        return if (size % 2 == 1) snap[size / 2]
+        else (snap[size / 2 - 1] + snap[size / 2]) / 2.0
+    }
+
+    /**
+     * Pure soft-stall decision (Fix B), excluding the "unclaimed work waiting" precondition which
+     * the caller checks separately (it needs the live queue). Returns true iff a chunk reading
+     * [chunkRate] bytes/ms after [elapsedMs] should be treated as soft-stalled.
+     *
+     * Returns false (soft-stall DISABLED) whenever the baseline isn't yet trustworthy — fewer
+     * than [AdaptiveEngine.SOFT_STALL_MIN_SAMPLES] samples. This is the guardrail that makes the
+     * heuristic inert until it has real data; the conservative no-migration behaviour is the
+     * automatic fallback.
+     */
+    fun shouldSoftStall(
+        chunkRate: Double,
+        elapsedMs: Long,
+        consecutiveSlowWindows: Int
+    ): Boolean = synchronized(lock) {
+        if (size < AdaptiveEngine.SOFT_STALL_MIN_SAMPLES) return false      // baseline untrustworthy
+        if (elapsedMs < AdaptiveEngine.MIN_SAMPLE_MS) return false           // still warming up
+        if (consecutiveSlowWindows < AdaptiveEngine.SOFT_STALL_WINDOWS) return false  // not sustained
+        val base = baselineLocked()
+        if (base <= 0.0) return false
+        return chunkRate < AdaptiveEngine.SOFT_STALL_FRACTION * base
+    }
+
+    /** Is [chunkRate] below the soft-stall bar right now (for counting consecutive slow windows)? */
+    fun isBelowBar(chunkRate: Double): Boolean = synchronized(lock) {
+        if (size < AdaptiveEngine.SOFT_STALL_MIN_SAMPLES) return false
+        val base = baselineLocked()
+        if (base <= 0.0) return false
+        return chunkRate < AdaptiveEngine.SOFT_STALL_FRACTION * base
+    }
+
+    /** Caller already holds [lock]. */
+    private fun baselineLocked(): Double {
+        if (size == 0) return 0.0
+        val snap = DoubleArray(size) { buf[it] }
+        snap.sort()
+        return if (size % 2 == 1) snap[size / 2]
+        else (snap[size / 2 - 1] + snap[size / 2]) / 2.0
+    }
 }
 
 /**
@@ -333,10 +557,30 @@ internal class HostScoreboard(
         if (s.inFlight > 0) s.inFlight--
     }
 
-    /** Record a stall/error on [host]: start its cooldown and release its in-flight slot. */
+    /**
+     * Record a HARD stall or a real transport error on [host]: start its [HOST_COOLDOWN_MS]
+     * cooldown and release its in-flight slot. Only unambiguous events (zero bytes for the stall
+     * timeout, non-206, short read, IOException) call this — they're real signals that the host
+     * is unhealthy, so cooling it is correct.
+     */
     fun recordStall(host: String): Unit = synchronized(lock) {
         val s = states[host] ?: return
         s.lastStallMs = nowProvider()
+        if (s.inFlight > 0) s.inFlight--
+    }
+
+    /**
+     * Record a SOFT stall on [host] (Fix C): the host is merely slower than the current baseline,
+     * NOT broken. It must NOT go on cooldown — cooling every soft-stalled mirror funnels all 24
+     * workers onto the one least-recently-stalled host, which IA then throttles, producing more
+     * soft stalls (the positive-feedback loop). Instead we lightly DEMOTE its EWMA by
+     * [SOFT_DEMOTE_FACTOR] so it's mildly de-preferred by [pickHost] but stays fully eligible,
+     * and release its in-flight slot. No [lastStallMs] update -> never cooled.
+     */
+    fun recordSoftStall(host: String): Unit = synchronized(lock) {
+        val s = states[host] ?: return
+        s.ewmaBytesPerMs = (s.ewmaBytesPerMs * AdaptiveEngine.SOFT_DEMOTE_FACTOR)
+            .coerceAtLeast(MIN_WEIGHT)
         if (s.inFlight > 0) s.inFlight--
     }
 

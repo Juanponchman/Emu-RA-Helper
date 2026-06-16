@@ -354,7 +354,14 @@ class RemoteSource @Inject constructor(
      * CDN nodes are often rate-limited while datanodes are faster; naive even
      * splitting lets a slow node bottleneck the whole file, so we weight by speed.
      */
-    private suspend fun rankHosts(resolvedHosts: List<String>): List<String> = withContext(Dispatchers.IO) {
+    private suspend fun rankHosts(
+        resolvedHosts: List<String>,
+        // FIX B: optional sink for the REAL measured probe rate (bytes/ms) per host. The adaptive
+        // engine uses this to seed its EWMA scoreboard in CORRECT units (bytes/ms) instead of the
+        // old bogus "slot count × 100" seed. Default null -> the static path is unaffected and the
+        // ranking output is byte-for-byte identical to before.
+        probeRatesOut: MutableMap<String, Double>? = null
+    ): List<String> = withContext(Dispatchers.IO) {
         if (resolvedHosts.size <= 1) return@withContext resolvedHosts
         data class Probe(val url: String, val bytesPerMs: Double)
         val probes = coroutineScope {
@@ -380,6 +387,10 @@ class RemoteSource @Inject constructor(
                     }
                 }
             }.awaitAll()
+        }
+        // FIX B: surface the real measured rates (bytes/ms) for the adaptive seed, if requested.
+        if (probeRatesOut != null) {
+            for (p in probes) if (p.bytesPerMs > 0.0) probeRatesOut[p.url] = p.bytesPerMs
         }
         val good = probes.filter { it.bytesPerMs > 0.0 }.sortedByDescending { it.bytesPerMs }
         if (good.isEmpty()) return@withContext resolvedHosts
@@ -410,8 +421,11 @@ class RemoteSource @Inject constructor(
     ): Long = withContext(Dispatchers.IO) {
         // Resolve each candidate's redirect once to its real node, dedup.
         val resolvedHosts = candidateUrls.map { resolveFinalUrl(it) ?: it }.distinct()
+        // FIX B: when adaptive, capture the REAL probe rates (bytes/ms) to seed the EWMA in correct
+        // units. For the static path probeRates stays null and ranking is byte-for-byte unchanged.
+        val probeRates: MutableMap<String, Double>? = if (adaptive) HashMap() else null
         // Probe + rank: weighted pool favouring the fastest nodes, slow nodes dropped.
-        val hosts = rankHosts(resolvedHosts).ifEmpty { resolvedHosts }
+        val hosts = rankHosts(resolvedHosts, probeRates).ifEmpty { resolvedHosts }
         // SMALL-FILE FAST PATH (shared by both engines): no range support, single connection,
         // or <= 1 segment / <1 chunk -> stream straight through. Don't rank, don't chunk.
         val rangeOk = segments > 1 && expectedSize > 0 && hosts.isNotEmpty() && supportsRange(hosts.first())
@@ -438,6 +452,7 @@ class RemoteSource @Inject constructor(
                 destFile = destFile,
                 workerHint = segments,
                 connectionBudget = connectionBudget ?: Semaphore(segments.coerceAtLeast(1)),
+                probeRates = probeRates ?: emptyMap(),
                 onProgress = onProgress,
                 isCancelled = isCancelled
             )
@@ -554,8 +569,9 @@ class RemoteSource @Inject constructor(
      *    matches its length; a short read requeues the WHOLE chunk (idempotent overwrite).
      *  - Every worker acquires the shared [connectionBudget] before opening a socket and releases
      *    it in a finally, so the global 24-connection thermal cap holds for any worker count.
-     *  - On exit we assert every chunk is done; a chunk that exhausts MAX_ATTEMPTS on all hosts
-     *    throws, failing the whole download (same as today).
+     *  - On exit we assert every chunk is done; a chunk that exhausts its REAL-error budget
+     *    (MAX_ERROR_ATTEMPTS) enters the queue's terminal FAILED state and the download throws
+     *    (Fix D). Stalls (soft/hard) never fail the download — they only migrate the chunk.
      */
     private suspend fun downloadAdaptive(
         hosts: List<String>,
@@ -563,6 +579,11 @@ class RemoteSource @Inject constructor(
         destFile: File,
         workerHint: Int,
         connectionBudget: Semaphore,
+        // FIX B: real measured probe rates (bytes/ms) per host, used to seed the EWMA in correct
+        // units. May be empty (single host, probe failed, or unit test) -> falls back to the
+        // scoreboard's small default prior, which is safe because soft-stall is independently
+        // gated on the RecentRateWindow's min-sample guardrail, not on the seed.
+        probeRates: Map<String, Double>,
         onProgress: suspend (Long, Double) -> Unit,
         isCancelled: () -> Boolean
     ): Long {
@@ -574,12 +595,23 @@ class RemoteSource @Inject constructor(
         val chunks = partitionChunks(expectedSize)
         val queue = ChunkQueue(chunks)
 
-        // Seed EWMA from the one-time rankHosts() probe: a host's frequency in the weighted pool
-        // (1..4 slots) encodes its relative speed, so use that count as the seed. rankHosts stays
-        // unchanged; we only read its output here.
-        val seed: Map<String, Double> = hosts.groupingBy { it }.eachCount()
-            .mapValues { (_, slots) -> slots.toDouble() * 100.0 } // arbitrary positive scale; only ratios matter
+        // FIX B: seed EWMA in CORRECT units (bytes/ms) from the rankHosts() probe's actual measured
+        // rate per host. The OLD seed was "slot-count × 100" (range 100-400) which is NOT bytes/ms
+        // — recordSuccess feeds bytesThisChunk/ms (thousands), so the EWMA climbed into the
+        // thousands while the seed stayed tiny, making the old soft-stall baseline wrong-scaled.
+        // Unseeded hosts fall back to HostScoreboard's small default prior. The soft-stall baseline
+        // no longer depends on this seed at all (it uses the RecentRateWindow), so an absent seed
+        // is fully safe — it only biases initial host PREFERENCE, not the stall decision.
+        val seed: Map<String, Double> = distinctHosts.mapNotNull { h ->
+            probeRates[h]?.takeIf { it > 0.0 }?.let { h to it }
+        }.toMap()
         val scoreboard = HostScoreboard(distinctHosts, seedEwma = seed)
+
+        // FIX B: the CURRENT, decaying soft-stall baseline. A ring buffer of the last N
+        // completed-chunk throughputs across ALL hosts. The soft-stall decision compares a chunk's
+        // sustained rate against the MEDIAN of these real recent rates (not a never-decaying peak),
+        // and is DISABLED until enough samples exist (the min-sample guardrail).
+        val recentRates = RecentRateWindow()
 
         // Progress: confirmedBytes counts only fully-completed chunks (monotonic — a requeue can
         // never make it go backwards or over-count). It is what we REPORT, keeping the progress
@@ -613,6 +645,7 @@ class RemoteSource @Inject constructor(
                             chunk = chunk,
                             queue = queue,
                             scoreboard = scoreboard,
+                            recentRates = recentRates,
                             distinctHosts = distinctHosts,
                             destFile = destFile,
                             expectedSize = expectedSize,
@@ -640,11 +673,27 @@ class RemoteSource @Inject constructor(
             }.awaitAll()
         }
 
-        // COMPLETION GATE: every chunk index 0..count-1 must be done before we return.
+        // COMPLETION GATE (Fix D — self-healing, definite terminal conditions):
+        // Workers exit only when no chunk is queued and none is in flight, so by here every chunk
+        // is in a TERMINAL state: done or failed. The download fails iff any chunk hit the terminal
+        // FAILED state (exhausted its real-error budget) — a definite condition, not a race on a
+        // thrown exception. Otherwise every chunk is done and we confirm the byte total.
+        if (queue.anyFailed()) {
+            throw IOException(
+                "Adaptive download failed: ${queue.failedIndices().size} chunk(s) exhausted the " +
+                    "error budget (indices ${queue.failedIndices().sorted()})"
+            )
+        }
         if (!queue.allDone()) {
+            // Should be impossible given the worker exit condition, but keep the hard guard.
             throw IOException("Adaptive download incomplete: ${queue.remaining()} chunk(s) unfinished")
         }
         val total = confirmedBytes.get()
+        // Sanity: confirmedBytes must equal expectedSize on success (sum of all chunk lengths ==
+        // expectedSize), so the caller's `total >= expected*99/100` completion check passes.
+        if (total != expectedSize) {
+            throw IOException("Adaptive download size mismatch: confirmed $total != expected $expectedSize")
+        }
         onProgress(total, 0.0)
         return total
     }
@@ -653,10 +702,20 @@ class RemoteSource @Inject constructor(
      * Download ONE chunk attempt: pick a host, ranged GET, write at absolute offset, verify the
      * full byte count, and mark the chunk DONE. The work-stealing model is "requeue whole on
      * stall": a single failed attempt does NOT loop here — instead the WHOLE chunk is handed back
-     * to [ChunkQueue.requeueOrFail] (with backoff) so ANY worker can re-claim it, and this returns
-     * normally so the current worker immediately pulls its next chunk. A chunk only fails the
-     * whole download once it has exhausted [MAX_ATTEMPTS] across all hosts (tracked on the queue),
-     * at which point this throws.
+     * to the queue so ANY worker can re-claim it, and this returns normally so the current worker
+     * immediately pulls its next chunk.
+     *
+     * BUDGET SEPARATION (Fix A): a STALL (soft or hard) is NOT an error. Stalls go through
+     * [ChunkQueue.requeueStall] (own large budget) and can NEVER fail the download — they just
+     * migrate the chunk to a different worker/host. Only REAL transport errors (non-206, short
+     * read, IOException, timeout) go through [ChunkQueue.recordErrorOrFail], which consumes the
+     * per-chunk error budget ([AdaptiveEngine.MAX_ERROR_ATTEMPTS]) and, when exhausted, moves the
+     * chunk to the terminal FAILED state and rethrows so the whole download fails.
+     *
+     * SELF-HEALING (Fix D): a `reconciled` guard ensures the polled chunk is reconciled EXACTLY
+     * ONCE on every exit path. If we somehow leave without having marked it done or requeued it,
+     * the finally force-requeues it so it can never be orphaned (which would leak an in-flight slot
+     * and wedge the workers forever).
      *
      * Correctness: writes are idempotent absolute-offset overwrites, so a requeued chunk simply
      * overwrites the same range. The chunk is marked DONE only after the received byte count
@@ -666,6 +725,7 @@ class RemoteSource @Inject constructor(
         chunk: Chunk,
         queue: ChunkQueue,
         scoreboard: HostScoreboard,
+        recentRates: RecentRateWindow,
         distinctHosts: List<String>,
         destFile: File,
         expectedSize: Long,
@@ -677,16 +737,23 @@ class RemoteSource @Inject constructor(
         onReport: suspend () -> Unit
     ) {
         if (isCancelled()) throw CancellationException()
-        // How many times this chunk has already failed — used to prefer a DIFFERENT host on
+        // How many real errors this chunk has already taken — used to prefer a DIFFERENT host on
         // retries (fastest-first failover), matching the static path's per-attempt host rotation.
-        val priorTries = queue.attemptsOf(chunk.index)
+        val priorTries = queue.errorAttemptsOf(chunk.index)
         val host = scoreboard.pickHost()
             ?: distinctHosts[priorTries % distinctHosts.size]
         var hostReleased = false
+        // Fix D: set true once the chunk is reconciled (markDone OR requeued/failed). If still
+        // false in the finally, the chunk leaked in-flight and is force-requeued.
+        var reconciled = false
         var call: okhttp3.Call? = null
         var bytesThisChunk = 0L
         val chunkStart = System.currentTimeMillis()
         var lastReadAt = chunkStart
+        // Soft-stall sustain counter: how many consecutive measurement windows this chunk has read
+        // below the baseline bar. Resets to 0 whenever it reads at/above the bar (Fix B — sustained).
+        var consecutiveSlowWindows = 0
+        var lastSoftCheck = chunkStart
         // Acquire a GLOBAL connection slot BEFORE opening the socket; release in finally. This is
         // what makes the 24-connection thermal cap robust to any (variable) worker count.
         connectionBudget.acquire()
@@ -728,19 +795,37 @@ class RemoteSource @Inject constructor(
                             }
                             onReport()
 
-                            // HARD STALL: zero bytes for STALL_TIMEOUT_MS -> bail and requeue.
                             val now = System.currentTimeMillis()
+                            // HARD STALL (unchanged, unambiguous, safe): zero bytes for
+                            // STALL_TIMEOUT_MS -> bail and requeue AS A STALL (Fix A), not an error.
                             if (now - lastReadAt >= AdaptiveEngine.STALL_TIMEOUT_MS) {
-                                throw StallException("hard stall on ${host.hostLabel()}")
+                                throw StallException("hard stall on ${host.hostLabel()}", soft = false)
                             }
-                            // SOFT STALL: past TCP ramp-up, this chunk is far slower than the best
-                            // live host AND there is unclaimed work to redistribute to a peer.
+                            // SOFT STALL (Fix B — real, sustained, guarded). Evaluate at most once
+                            // per measurement window (~350ms) so "consecutive windows" is meaningful
+                            // and cheap. A chunk migrates only when ALL hold:
+                            //   - past TCP warm-up (MIN_SAMPLE_MS),
+                            //   - its rate is below SOFT_STALL_FRACTION × the CURRENT recent-rate
+                            //     baseline (median of recent completed chunks, not a stale peak),
+                            //   - it has stayed below that bar for SOFT_STALL_WINDOWS consecutive
+                            //     windows (not a single jittery sample),
+                            //   - the baseline is trustworthy (>= SOFT_STALL_MIN_SAMPLES; otherwise
+                            //     soft-stall is DISABLED and we never migrate — the safe fallback),
+                            //   - there is unclaimed work to migrate to (else migration is pointless).
                             val elapsed = now - chunkStart
-                            if (elapsed >= AdaptiveEngine.MIN_SAMPLE_MS && queue.unclaimed() > 0) {
+                            if (elapsed >= AdaptiveEngine.MIN_SAMPLE_MS &&
+                                now - lastSoftCheck >= 350L
+                            ) {
+                                lastSoftCheck = now
                                 val rate = bytesThisChunk.toDouble() / elapsed.coerceAtLeast(1)
-                                val best = scoreboard.bestLiveEwma()
-                                if (best > 0.0 && rate < AdaptiveEngine.SOFT_STALL_FRACTION * best) {
-                                    throw StallException("soft stall on ${host.hostLabel()}")
+                                // Count consecutive sub-bar windows (no-op when soft-stall disabled
+                                // by the min-sample guardrail — isBelowBar returns false then).
+                                consecutiveSlowWindows =
+                                    if (recentRates.isBelowBar(rate)) consecutiveSlowWindows + 1 else 0
+                                if (queue.unclaimed() > 0 &&
+                                    recentRates.shouldSoftStall(rate, elapsed, consecutiveSlowWindows)
+                                ) {
+                                    throw StallException("soft stall on ${host.hostLabel()}", soft = true)
                                 }
                             }
                         }
@@ -754,28 +839,51 @@ class RemoteSource @Inject constructor(
             }
             // Success: record the observed rate (releases the host slot), mark done, count bytes.
             val ms = (System.currentTimeMillis() - chunkStart).coerceAtLeast(1)
-            scoreboard.recordSuccess(host, bytesThisChunk.toDouble() / ms)
+            val observedRate = bytesThisChunk.toDouble() / ms
+            scoreboard.recordSuccess(host, observedRate)
             hostReleased = true
+            // Fix B: feed the CURRENT recent-rate baseline with this real completed-chunk rate.
+            recentRates.record(observedRate)
             if (queue.markDone(chunk)) {
                 confirmedBytes.addAndGet(chunk.length)
             }
+            reconciled = true  // Fix D: chunk reached a terminal-done state on this path.
             onReport()
         } catch (c: CancellationException) {
             // Structured cancellation: release the host slot and requeue is unnecessary (the whole
-            // scope is being torn down). Re-throw so the caller deletes the .part.
+            // scope is being torn down). Re-throw so the caller deletes the .part. The finally must
+            // NOT force-requeue here, so mark reconciled — the scope teardown is authoritative.
             scoreboard.releaseHost(host)
             hostReleased = true
+            reconciled = true
             throw c
+        } catch (s: StallException) {
+            // STALL (Fix A + C): NOT an error. It never consumes the error budget and never fails
+            // the download — the chunk is always requeued for another worker/host.
+            if (s.soft) {
+                // Soft stall (Fix C): the host is just slower than the current baseline, not broken.
+                // DEMOTE it (no cooldown) so we don't funnel all workers onto one host.
+                scoreboard.recordSoftStall(host)
+            } else {
+                // Hard stall: zero bytes for the timeout is an unambiguous bad-host signal -> cool it.
+                scoreboard.recordStall(host)
+            }
+            hostReleased = true
+            queue.requeueStall(chunk)            // own large budget; cannot fail the download
+            reconciled = true                    // Fix D: chunk reconciled (requeued).
+            // No exponential backoff for a stall — the point is to migrate PROMPTLY to a peer/host.
         } catch (e: Exception) {
-            // Stall or transport error: cool the host (releases its slot), record one attempt and
-            // requeue the WHOLE chunk — UNLESS it has now exhausted MAX_ATTEMPTS, in which case the
-            // whole download fails (same terminal semantics as the static per-segment loop).
+            // REAL transport error (non-206, short read, IOException, timeout): cool the host
+            // (releases its slot) and consume the per-chunk ERROR budget. When exhausted, the chunk
+            // enters the terminal FAILED state and we rethrow so the whole download fails — same
+            // terminal semantics as the static per-segment loop, but ONLY for genuine errors.
             scoreboard.recordStall(host)
             hostReleased = true
-            val exhausted = queue.requeueOrFail(chunk, MAX_ATTEMPTS)
+            val exhausted = queue.recordErrorOrFail(chunk, AdaptiveEngine.MAX_ERROR_ATTEMPTS)
+            reconciled = true                    // Fix D: chunk reconciled (requeued or failed).
             if (exhausted) throw e
             // Backoff before the chunk is retried by some worker (same constants as static path).
-            val nextTry = queue.attemptsOf(chunk.index)
+            val nextTry = queue.errorAttemptsOf(chunk.index)
             kotlinx.coroutines.delay(min(1000L * (1L shl ((nextTry - 1).coerceAtLeast(0))), 8000L))
         } finally {
             // Cancel the in-flight Call so a stalled socket is torn down promptly.
@@ -785,14 +893,23 @@ class RemoteSource @Inject constructor(
             // Defensive: if neither success nor failure released the host (shouldn't happen),
             // release it so the scoreboard's load count stays accurate.
             if (!hostReleased) scoreboard.releaseHost(host)
+            // Fix D — SELF-HEALING completion gate: if the chunk was neither marked done nor
+            // requeued/failed on ANY exit path (e.g. an unexpected throw before reconciliation),
+            // force it back onto the queue so it can never be orphaned and leak an in-flight slot.
+            if (!reconciled) queue.forceRequeue(chunk)
         }
     }
 
     /** Compact host label for logs (scheme/host only). */
     private fun String.hostLabel(): String = substringAfter("//").substringBefore('/')
 
-    /** Internal marker for a detected stall (vs. a transport error) — both are recoverable. */
-    private class StallException(message: String) : IOException(message)
+    /**
+     * Internal marker for a detected STALL (vs. a real transport error). A stall is always
+     * recoverable and NEVER consumes the per-chunk error budget (Fix A): it only migrates the
+     * chunk. [soft] distinguishes a soft stall (slower than the current baseline — host is merely
+     * de-preferred, NOT cooled; Fix C) from a hard stall (zero bytes for the timeout — host cooled).
+     */
+    private class StallException(message: String, val soft: Boolean) : IOException(message)
 
     /** Follow a redirect once and return the final CDN URL (or null on failure). */
     private fun resolveFinalUrl(url: String): String? = try {

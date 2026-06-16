@@ -226,37 +226,133 @@ class ChunkQueueTest {
         assertTrue(q.allDone())
     }
 
-    // ---- requeueOrFail: bounded retries -------------------------------------
+    // ---- recordErrorOrFail: bounded REAL-error retries ----------------------
 
     @Test
-    fun `requeueOrFail requeues until maxAttempts then signals failure`() {
+    fun `recordErrorOrFail requeues until maxAttempts then signals failure and goes terminal failed`() {
         val q = queueFor(10L, 10L) // 1 chunk
         val c = q.poll()!!
         // attempts 1..4 requeue (false); attempt 5 hits MAX and reports exhaustion (true).
-        assertFalse(q.requeueOrFail(c, maxAttempts = 5)) // try 1
-        assertEquals(1, q.attemptsOf(c.index))
-        val c2 = q.poll()!!                               // re-claimed after requeue
-        assertFalse(q.requeueOrFail(c2, 5))               // try 2
+        assertFalse(q.recordErrorOrFail(c, maxAttempts = 5)) // try 1
+        assertEquals(1, q.errorAttemptsOf(c.index))
+        val c2 = q.poll()!!                                  // re-claimed after requeue
+        assertFalse(q.recordErrorOrFail(c2, 5))              // try 2
         val c3 = q.poll()!!
-        assertFalse(q.requeueOrFail(c3, 5))               // try 3
+        assertFalse(q.recordErrorOrFail(c3, 5))              // try 3
         val c4 = q.poll()!!
-        assertFalse(q.requeueOrFail(c4, 5))               // try 4
+        assertFalse(q.recordErrorOrFail(c4, 5))              // try 4
         val c5 = q.poll()!!
-        assertTrue(q.requeueOrFail(c5, 5))                // try 5 -> exhausted
-        assertEquals(5, q.attemptsOf(c.index))
-        // The exhausted chunk is NOT requeued (caller fails the whole download).
+        assertTrue(q.recordErrorOrFail(c5, 5))               // try 5 -> exhausted
+        assertEquals(5, q.errorAttemptsOf(c.index))
+        // Fix D: the exhausted chunk is now in the explicit terminal FAILED state, NOT requeued.
+        assertTrue(q.isFailed(c.index))
+        assertTrue(q.anyFailed())
+        assertEquals(setOf(c.index), q.failedIndices())
         assertNull(q.poll())
         assertFalse(q.allDone())
+        // Fix D: with a chunk failed, workers must stop (definite terminal condition, no hang).
+        assertFalse(q.shouldKeepWorking())
     }
 
     @Test
-    fun `requeueOrFail on a done chunk is a harmless no-op`() {
+    fun `recordErrorOrFail on a done chunk is a harmless no-op`() {
         val q = queueFor(20L, 10L)
         val c = q.poll()!!
         q.markDone(c)
         // A late failure report for a chunk that already completed must not requeue or fail.
-        assertFalse(q.requeueOrFail(c, maxAttempts = 5))
-        assertEquals(0, q.attemptsOf(c.index))
+        assertFalse(q.recordErrorOrFail(c, maxAttempts = 5))
+        assertEquals(0, q.errorAttemptsOf(c.index))
         assertTrue(q.isDone(c.index))
+        assertFalse(q.isFailed(c.index))
+    }
+
+    // ---- FIX A: separated budgets (stalls vs real errors) -------------------
+
+    @Test
+    fun `stalls use a separate budget and NEVER fail the chunk or the download`() {
+        // THE test that would have caught the bug (ROOT CAUSE #1): a chunk that stalls many times
+        // (here 20x) must keep being re-queued and can still complete. Stalls must NOT touch the
+        // error budget, so even with the production error cap of 5 the chunk never fails.
+        val q = queueFor(10L, 10L) // 1 chunk
+        repeat(20) {
+            val c = q.poll()!!
+            // Each stall requeues via the STALL budget; returns false (never signals failure).
+            assertFalse(q.requeueStall(c, maxStallRequeues = AdaptiveEngine.MAX_STALL_REQUEUES))
+            // The ERROR budget is untouched the entire time.
+            assertEquals(0, q.errorAttemptsOf(c.index), "stalls must not consume the error budget")
+            assertFalse(q.isFailed(c.index), "a stalled chunk must never go terminal-failed")
+            assertFalse(q.anyFailed())
+        }
+        assertEquals(20, q.stallRequeuesOf(0))
+        // After all that stalling the chunk is still claimable and can finally complete.
+        val last = q.poll()!!
+        assertTrue(q.markDone(last))
+        assertTrue(q.allDone())
+        assertFalse(q.anyFailed())
+    }
+
+    @Test
+    fun `stall requeues and error attempts are independent counters`() {
+        // Interleave stalls and real errors on the same chunk; each counter advances on its own.
+        val q = queueFor(10L, 10L) // 1 chunk
+        var c = q.poll()!!
+        assertFalse(q.requeueStall(c))                     // stall 1
+        c = q.poll()!!
+        assertFalse(q.recordErrorOrFail(c, maxAttempts = 5)) // error 1
+        c = q.poll()!!
+        assertFalse(q.requeueStall(c))                     // stall 2
+        c = q.poll()!!
+        assertFalse(q.recordErrorOrFail(c, maxAttempts = 5)) // error 2
+        assertEquals(2, q.stallRequeuesOf(0))
+        assertEquals(2, q.errorAttemptsOf(0))
+        // 50 more stalls still don't move the error counter or fail the chunk.
+        repeat(50) {
+            val s = q.poll()!!
+            q.requeueStall(s)
+        }
+        assertEquals(2, q.errorAttemptsOf(0), "stalls must never bump the error budget")
+        assertFalse(q.isFailed(0))
+        // Three more real errors (total 5) finally exhaust the ERROR budget -> terminal failed.
+        repeat(2) {
+            val e = q.poll()!!
+            assertFalse(q.recordErrorOrFail(e, maxAttempts = 5))
+        }
+        val fifth = q.poll()!!
+        assertTrue(q.recordErrorOrFail(fifth, maxAttempts = 5)) // 5th error -> exhausted
+        assertTrue(q.isFailed(0))
+    }
+
+    // ---- FIX D: self-healing forceRequeue -----------------------------------
+
+    @Test
+    fun `forceRequeue reconciles a leaked in-flight chunk exactly once`() {
+        val q = queueFor(20L, 10L) // 2 chunks
+        val c = q.poll()!!
+        assertEquals(1, q.inFlightCount())
+        // Simulate an exit path that neither marked done nor requeued: force-requeue heals it.
+        assertTrue(q.forceRequeue(c), "should reconcile a leaked in-flight chunk")
+        assertEquals(0, q.inFlightCount())
+        assertEquals(2, q.unclaimed())
+        // Idempotent: a chunk already back on the queue is not re-added.
+        assertFalse(q.forceRequeue(c))
+        assertEquals(2, q.unclaimed())
+    }
+
+    @Test
+    fun `forceRequeue is a no-op for done or failed chunks`() {
+        val q = queueFor(20L, 10L)
+        val done = q.poll()!!
+        q.markDone(done)
+        assertFalse(q.forceRequeue(done), "must not resurrect a done chunk")
+        assertTrue(q.isDone(done.index))
+
+        // Drive the other chunk to terminal-failed, then assert forceRequeue won't resurrect it.
+        var f = q.poll()!!
+        while (!q.isFailed(f.index)) {
+            if (q.recordErrorOrFail(f, maxAttempts = 5)) break
+            f = q.poll()!!
+        }
+        assertTrue(q.isFailed(f.index))
+        assertFalse(q.forceRequeue(f), "must not resurrect a failed chunk")
     }
 }

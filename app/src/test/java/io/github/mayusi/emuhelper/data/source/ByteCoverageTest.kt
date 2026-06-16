@@ -39,7 +39,13 @@ class ByteCoverageTest {
         chunkSize: Long,
         workerCount: Int,
         failureRate: Double,
-        seed: Long
+        seed: Long,
+        // The REAL per-chunk error cap. 10_000 (the old default) HID the bug; the new variant runs
+        // with the production value (5) plus stall injection to prove it still completes.
+        maxErrorAttempts: Int = 10_000,
+        // Probability that an attempt SOFT/HARD-STALLS partway (requeueStall — own large budget,
+        // never counts against the error cap). A high stall rate must NOT fail the download.
+        stallRate: Double = 0.0
     ): ByteArray {
         // Deterministic "source" content: each byte is a function of its absolute offset, so a
         // misplaced byte (wrong offset) is detectable, not just a missing one.
@@ -69,15 +75,19 @@ class ByteCoverageTest {
                         val start = chunk.start.toInt()
                         val len = chunk.length.toInt()
 
-                        // Decide up front whether this attempt will fail partway through.
-                        val willFail = rnd.nextDouble() < failureRate
-                        // If failing, abort after copying a random prefix (0..len-1 bytes).
-                        val abortAfter = if (willFail) rnd.nextInt(len) else len
+                        // A STALL aborts the attempt and requeues via the STALL budget (never the
+                        // error budget). Decided before an error so stalls dominate the churn — this
+                        // is exactly the soft-stall storm that used to exhaust the shared budget.
+                        val willStall = rnd.nextDouble() < stallRate
+                        // Decide up front whether this attempt will (separately) FAIL partway through.
+                        val willFail = !willStall && rnd.nextDouble() < failureRate
+                        // If aborting (stall or fail), stop after copying a random prefix.
+                        val abortAfter = if (willStall || willFail) rnd.nextInt(len) else len
 
                         var written = 0
                         var i = 0
                         while (i < len) {
-                            if (willFail && written >= abortAfter) break
+                            if ((willStall || willFail) && written >= abortAfter) break
                             // Idempotent absolute-offset write: output[start + i] = source[start + i].
                             // Copy in small bursts to interleave with other threads.
                             val burst = minOf(1 + rnd.nextInt(64), len - i)
@@ -89,10 +99,13 @@ class ByteCoverageTest {
                         // DONE only if the FULL range was written; otherwise requeue the WHOLE chunk.
                         if (written == len) {
                             queue.markDone(chunk)
+                        } else if (willStall) {
+                            // Fix A: a stall requeues via the STALL budget — it must NEVER exhaust
+                            // the error cap and so can never fail the download, only migrate.
+                            queue.requeueStall(chunk)
                         } else {
-                            // requeueOrFail with a generous cap so the sim always converges; the
-                            // point is correctness under churn, not exercising the failure throw.
-                            val exhausted = queue.requeueOrFail(chunk, maxAttempts = 10_000)
+                            // A mid-chunk abort models a real transport short-read -> error budget.
+                            val exhausted = queue.recordErrorOrFail(chunk, maxAttempts = maxErrorAttempts)
                             if (exhausted) error("chunk ${chunk.index} unexpectedly exhausted")
                         }
                     }
@@ -116,9 +129,17 @@ class ByteCoverageTest {
     }
 
     /** Assert the reconstructed output equals the source at EVERY offset. */
-    private fun assertReconstructs(size: Int, chunkSize: Long, workers: Int, failureRate: Double, seed: Long) {
+    private fun assertReconstructs(
+        size: Int,
+        chunkSize: Long,
+        workers: Int,
+        failureRate: Double,
+        seed: Long,
+        maxErrorAttempts: Int = 10_000,
+        stallRate: Double = 0.0
+    ) {
         val expected = ByteArray(size) { i -> ((i * 31 + 7) and 0xFF).toByte() }
-        val output = simulate(size, chunkSize, workers, failureRate, seed)
+        val output = simulate(size, chunkSize, workers, failureRate, seed, maxErrorAttempts, stallRate)
         assertEquals(size, output.size)
         // Compare every byte; report the first mismatch precisely if any.
         for (i in 0 until size) {
@@ -166,6 +187,41 @@ class ByteCoverageTest {
     }
 
     @Test
+    fun `completes with REAL maxAttempts of 5 under a heavy stall storm`() {
+        // THE regression guard for ROOT CAUSE #1. The old test used maxAttempts=10_000, which HID
+        // the bug: soft-stall false positives shared the error budget, so on a real device they
+        // exhausted it mid-file and the download FAILED. Here we use the PRODUCTION error cap (5)
+        // AND inject a heavy 60% stall storm. Because stalls now use a SEPARATE budget
+        // (requeueStall, Fix A) they can never exhaust the error cap — so despite ~60% of every
+        // chunk's attempts stalling, the file must still reconstruct byte-for-byte, with NO chunk
+        // ever entering the terminal FAILED state. Genuine errors stay rare (10%) so no single
+        // chunk realistically piles up 5 REAL errors.
+        assertReconstructs(
+            size = 200_000, chunkSize = 777, workers = 16,
+            failureRate = 0.10, seed = 2024,
+            maxErrorAttempts = AdaptiveEngine.MAX_ERROR_ATTEMPTS, // == 5
+            stallRate = 0.60
+        )
+    }
+
+    @Test
+    fun `extreme stall rate with maxAttempts 5 still completes (stalls never fail the download)`() {
+        // Push stalls to 90%: a chunk may be stall-requeued dozens of times. With the OLD shared
+        // budget this would fail almost immediately. With separated budgets it just migrates and
+        // eventually completes. Small + single-and-multi worker to stress the convergence.
+        assertReconstructs(
+            size = 60_000, chunkSize = 512, workers = 8,
+            failureRate = 0.0, seed = 99,
+            maxErrorAttempts = 5, stallRate = 0.90
+        )
+        assertReconstructs(
+            size = 30_000, chunkSize = 500, workers = 1,
+            failureRate = 0.0, seed = 100,
+            maxErrorAttempts = 5, stallRate = 0.90
+        )
+    }
+
+    @Test
     fun `no chunk is left claimable or in-flight after completion`() {
         // A direct structural check independent of byte content: after a churny run the queue
         // must be fully drained — nothing pollable, nothing in flight, everything done.
@@ -176,8 +232,8 @@ class ByteCoverageTest {
         while (c != null && loops < 1_000_000) {
             loops++
             // Fail the first time we see each chunk, succeed thereafter.
-            if (queue.attemptsOf(c.index) == 0) {
-                queue.requeueOrFail(c, maxAttempts = 5)
+            if (queue.errorAttemptsOf(c.index) == 0) {
+                queue.recordErrorOrFail(c, maxAttempts = 5)
             } else {
                 queue.markDone(c)
             }

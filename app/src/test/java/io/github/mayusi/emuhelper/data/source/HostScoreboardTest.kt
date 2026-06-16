@@ -79,6 +79,55 @@ class HostScoreboardTest {
     }
 
     @Test
+    fun `a SOFT stall does NOT cool the host but a hard stall and an error do`() {
+        // FIX C: cooling a host on a SOFT stall is what funnels every worker onto one mirror and
+        // feeds the throttle loop. A soft stall must only DEMOTE the EWMA (no cooldown); only a
+        // HARD stall / real error cools.
+        val board = HostScoreboard(
+            hosts = listOf("h"),
+            seedEwma = mapOf("h" to 1000.0),
+            nowProvider = fakeNow
+        )
+        clock = 1_000_000L
+        board.pickHost()
+        val before = board.ewmaOf("h")
+        // Soft stall: NOT cooled, EWMA demoted by SOFT_DEMOTE_FACTOR.
+        board.recordSoftStall("h")
+        assertFalse(board.isCooledNow("h"), "a soft stall must NOT put the host on cooldown")
+        val afterSoft = board.ewmaOf("h")
+        assertTrue(afterSoft < before, "soft stall should demote the EWMA: $before -> $afterSoft")
+        assertEquals(before * AdaptiveEngine.SOFT_DEMOTE_FACTOR, afterSoft, 1e-6)
+        assertEquals(0, board.inFlightOf("h"), "soft stall still releases the in-flight slot")
+
+        // Hard stall: DOES cool.
+        board.pickHost()
+        board.recordStall("h")
+        assertTrue(board.isCooledNow("h"), "a hard stall must cool the host")
+    }
+
+    @Test
+    fun `repeated soft stalls keep the host live and pickable`() {
+        // FIX C: even after many soft stalls the host must stay eligible (never cooled), so workers
+        // can still use it instead of all funneling onto one mirror.
+        val board = HostScoreboard(
+            hosts = listOf("a", "b"),
+            seedEwma = mapOf("a" to 500.0, "b" to 500.0),
+            nowProvider = fakeNow
+        )
+        clock = 50_000L
+        repeat(10) {
+            board.pickHost()
+            board.recordSoftStall("a")
+            board.pickHost()
+            board.recordSoftStall("b")
+        }
+        assertFalse(board.isCooledNow("a"))
+        assertFalse(board.isCooledNow("b"))
+        // A pick must still return one of them (never wedges, never all-cooled).
+        assertNotNull(board.pickHost())
+    }
+
+    @Test
     fun `when all hosts are cooled it falls back to least-recently-stalled`() {
         val board = HostScoreboard(listOf("a", "b"), nowProvider = fakeNow)
         clock = 5_000L

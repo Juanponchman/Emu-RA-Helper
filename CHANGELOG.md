@@ -4,6 +4,22 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.2] — 2026-06-16
+
+### Fixed
+- **Adaptive download engine no longer fails partway through.** The previous
+  version's "this mirror is slow" detector was far too trigger-happy under
+  normal multi-connection load and counted those false alarms against the
+  same budget as real errors, so big downloads could fail around the halfway
+  mark. Now: slow-mirror migrations never count as failures (only genuine
+  network errors do), the "slow" decision uses a realistic, decaying baseline
+  and must be sustained before acting, and it stays off entirely until it has
+  enough real data. The engine also can't get stuck or orphan a piece of a
+  file anymore. Backed by new tests covering exactly these cases.
+
+> Still experimental and off by default — Settings → Experimental — but it
+> should now actually help instead of failing.
+
 ## [0.5.1] — 2026-06-16
 
 ### Added
