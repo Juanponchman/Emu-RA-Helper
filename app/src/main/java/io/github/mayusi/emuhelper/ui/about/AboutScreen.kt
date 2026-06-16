@@ -9,6 +9,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.NewReleases
@@ -252,6 +253,20 @@ fun AboutScreen(
                 label = "MIT License",
                 url = "https://github.com/mayusi/EmuHelper/blob/main/LICENSE",
                 context = context
+            )
+            AboutLinkRow(
+                icon = Icons.Default.Forum,
+                label = "Community & support — Join the Discord",
+                url = "https://discord.gg/jEnMYW5YfE",
+                context = context
+            )
+            Text(
+                "Maintainer: naxte on Discord",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 42.dp, bottom = 4.dp)
             )
 
             Spacer(Modifier.height(8.dp))

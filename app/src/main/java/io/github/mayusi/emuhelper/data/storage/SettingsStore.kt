@@ -42,6 +42,8 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         // ---- Remote catalog cache --------------------------------------------
         val KEY_LAST_CATALOG_FETCH = longPreferencesKey("last_catalog_fetch_ts")
         val KEY_CACHED_REMOTE_CATALOG = stringPreferencesKey("cached_remote_catalog_json")
+        // ---- Discord community prompt ----------------------------------------
+        private val KEY_SEEN_DISCORD_PROMPT = booleanPreferencesKey("seen_discord_prompt")
     }
 
     /** Persisted SAF URI for the user-chosen download folder, or null if using app-private dir. */
@@ -170,5 +172,13 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setCachedRemoteCatalog(json: String) {
         context.settingsStore.edit { it[KEY_CACHED_REMOTE_CATALOG] = json }
+    }
+
+    // ---- Discord community prompt ----------------------------------------
+
+    val seenDiscordPrompt: Flow<Boolean> = context.settingsStore.data.map { it[KEY_SEEN_DISCORD_PROMPT] ?: false }
+
+    suspend fun setSeenDiscordPrompt(value: Boolean) {
+        context.settingsStore.edit { it[KEY_SEEN_DISCORD_PROMPT] = value }
     }
 }

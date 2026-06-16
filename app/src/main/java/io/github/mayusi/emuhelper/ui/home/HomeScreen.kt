@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
@@ -48,6 +49,7 @@ import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.UpdateDialog
 import io.github.mayusi.emuhelper.ui.common.UpdateFlowState
+import io.github.mayusi.emuhelper.ui.common.openUrl
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -209,6 +211,15 @@ class HomeViewModel @Inject constructor(
     fun resetUpdateFlow() {
         _updateFlow.value = UpdateFlowState.Idle
     }
+
+    // ---- Discord community prompt ----------------------------------------
+
+    val seenDiscordPrompt: StateFlow<Boolean> = settings.seenDiscordPrompt
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true) // default true = don't show until loaded
+
+    fun markDiscordPromptSeen() {
+        viewModelScope.launch { settings.setSeenDiscordPrompt(true) }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -232,9 +243,12 @@ fun HomeScreen(
     val updateFlow by viewModel.updateFlow.collectAsState()
     val dismissedTag by viewModel.dismissedUpdateTag.collectAsState()
     val pendingQueue by viewModel.pendingQueue.collectAsState()
+    val seenDiscordPrompt by viewModel.seenDiscordPrompt.collectAsState()
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
+    // Track whether the Discord dialog has been actioned in this session (prevents re-trigger on recomposition).
+    var discordDialogHandled by remember { mutableStateOf(false) }
 
     // Compute whether the banner should be visible.
     val info = updateInfo
@@ -272,6 +286,51 @@ fun HomeScreen(
                 // B3: cancel any in-flight download when the dialog is dismissed.
                 viewModel.cancelDownload()
                 showUpdateDialog = false
+            }
+        )
+    }
+
+    // Discord community prompt — shown once on first launch after onboarding.
+    // seenDiscordPrompt starts as `true` until DataStore loads (Eagerly, default true),
+    // so it never flashes before the real value arrives. discordDialogHandled prevents
+    // re-triggering on recomposition after the user acts.
+    if (!seenDiscordPrompt && !discordDialogHandled) {
+        AlertDialog(
+            onDismissRequest = {
+                discordDialogHandled = true
+                viewModel.markDiscordPromptSeen()
+            },
+            icon = {
+                Icon(
+                    Icons.Default.Forum,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = { Text("Join the community!") },
+            text = {
+                Text(
+                    "Get help, follow development updates, and hang out with other users on the EmuHelper Discord.\n\n" +
+                    "You can always find the invite link later in About → Community & support.\n\n" +
+                    "Maintainer: naxte on Discord."
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    discordDialogHandled = true
+                    viewModel.markDiscordPromptSeen()
+                    context.openUrl("https://discord.gg/jEnMYW5YfE")
+                }) {
+                    Text("Join Discord")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    discordDialogHandled = true
+                    viewModel.markDiscordPromptSeen()
+                }) {
+                    Text("Maybe later")
+                }
             }
         )
     }

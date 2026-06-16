@@ -4,6 +4,13 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.1] — 2026-06-16
+
+### Added
+- **Community & support** — EmuHelper now has a Discord. A one-time welcome
+  prompt on first launch invites you to join, and the link is always available
+  in the About screen (and the README). Come say hi.
+
 ## [0.5.0] — 2026-06-16
 
 ### Added
