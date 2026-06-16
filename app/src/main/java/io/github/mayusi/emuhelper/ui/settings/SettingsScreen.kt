@@ -57,6 +57,7 @@ class SettingsViewModel @Inject constructor(
     val concurrency: StateFlow<Int> = settings.concurrency.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_CONCURRENCY)
     val extractArchives: StateFlow<Boolean> = settings.extractArchives.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val wifiOnly: StateFlow<Boolean> = settings.wifiOnly.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val adaptiveEngine: StateFlow<Boolean> = settings.adaptiveEngine.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val themeMode: StateFlow<ThemeMode> = settings.themeMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.SYSTEM)
     val downloadFolder: StateFlow<Uri?> = settings.downloadFolder.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
@@ -73,6 +74,7 @@ class SettingsViewModel @Inject constructor(
     fun setConcurrency(v: Int) { viewModelScope.launch { settings.setConcurrency(v) } }
     fun setExtract(v: Boolean) { viewModelScope.launch { settings.setExtractArchives(v) } }
     fun setWifiOnly(v: Boolean) { viewModelScope.launch { settings.setWifiOnly(v) } }
+    fun setAdaptiveEngine(v: Boolean) { viewModelScope.launch { settings.setAdaptiveEngine(v) } }
     fun setThemeMode(mode: ThemeMode) { viewModelScope.launch { settings.setThemeMode(mode) } }
     fun setFolder(uri: Uri?) { viewModelScope.launch { settings.setDownloadFolder(uri) } }
 
@@ -119,6 +121,7 @@ fun SettingsScreen(
     val concurrency by viewModel.concurrency.collectAsState()
     val extractArchives by viewModel.extractArchives.collectAsState()
     val wifiOnly by viewModel.wifiOnly.collectAsState()
+    val adaptiveEngine by viewModel.adaptiveEngine.collectAsState()
     val themeMode by viewModel.themeMode.collectAsState()
     val testing by viewModel.testing.collectAsState()
     val result by viewModel.result.collectAsState()
@@ -238,6 +241,32 @@ fun SettingsScreen(
                     Switch(
                         checked = extractArchives,
                         onCheckedChange = { viewModel.setExtract(it) }
+                    )
+                }
+            }
+
+            // ---- Experimental ----
+            SettingCard(title = "Experimental") {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                        Text(
+                            "Adaptive download engine",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            "Faster downloads by racing Internet Archive mirrors. Experimental — turn off if downloads misbehave.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = adaptiveEngine,
+                        onCheckedChange = { viewModel.setAdaptiveEngine(it) }
                     )
                 }
             }

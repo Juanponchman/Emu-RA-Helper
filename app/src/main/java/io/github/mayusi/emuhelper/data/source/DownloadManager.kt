@@ -98,6 +98,9 @@ class DownloadManager @Inject constructor(
     @Volatile private var segmentsPerFile = 4
     @Volatile private var concurrentFiles = 2
     @Volatile private var extractArchives = false
+    /** EXPERIMENTAL adaptive (chunk-queue work-stealing) engine. Default OFF; loaded from
+     *  settings on each start()/retry(). When false the proven static path runs unchanged. */
+    @Volatile private var adaptiveEngine = false
 
     // HARD SAFETY CEILING on simultaneous HTTP connections across ALL files+segments.
     // Without this, concurrentFiles(16) × segmentsPerFile(32) = 512 sockets + 128 MB of
@@ -146,6 +149,9 @@ class DownloadManager @Inject constructor(
                 segmentsPerFile = (MAX_TOTAL_CONNECTIONS / concurrentFiles).coerceAtLeast(1)
             }
             extractArchives = settings.extractArchives.first()
+            // EXPERIMENTAL adaptive engine (default OFF). When false, downloadOne() passes
+            // adaptive=false and the EXACT current static download path runs unchanged.
+            adaptiveEngine = settings.adaptiveEngine.first()
 
             val customRoot = chosenUri?.let { DocumentFile.fromTreeUri(appContext, it) }
             val defaultRoot = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "ROMs")
@@ -248,6 +254,8 @@ class DownloadManager @Inject constructor(
                 }
                 return@launch
             }
+            // Re-read the experimental flag so a retry honours the current setting (default OFF).
+            adaptiveEngine = settings.adaptiveEngine.first()
             val customRoot = chosenUri?.let { DocumentFile.fromTreeUri(appContext, it) }
             val defaultRoot = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "ROMs").apply { mkdirs() }
             try {
@@ -373,6 +381,11 @@ class DownloadManager @Inject constructor(
                 expectedSize = expected,
                 destFile = cacheFile,
                 segments = segmentsPerFile,
+                // EXPERIMENTAL: gate the adaptive chunk-queue path behind the default-OFF flag.
+                // When false, the static path runs UNCHANGED. The shared 24-connection budget is
+                // passed through so the thermal cap holds across files regardless of engine.
+                adaptive = adaptiveEngine,
+                connectionBudget = connectionBudget,
                 onProgress = { bytes, bps ->
                     // honour pause: suspend until unpaused instead of busy-polling every 200ms.
                     // _isPaused is a StateFlow; .first { !it } suspends cheaply with no polling

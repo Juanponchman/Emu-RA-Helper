@@ -31,6 +31,7 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         private val KEY_SEGMENTS = intPreferencesKey("download_segments")
         private val KEY_EXTRACT = booleanPreferencesKey("extract_archives")
         private val KEY_WIFI_ONLY = booleanPreferencesKey("wifi_only_downloads")
+        private val KEY_ADAPTIVE_ENGINE = booleanPreferencesKey("adaptive_download_engine")
         private val KEY_SEEN_SETUP_DISCLAIMER = booleanPreferencesKey("seen_setup_disclaimer")
         private val KEY_SETUP_STAGING_FOLDER = stringPreferencesKey("setup_staging_folder_uri")
         val KEY_LAST_UPDATE_CHECK = longPreferencesKey("last_update_check_ts")
@@ -64,6 +65,11 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
     /** When true, downloads are only allowed on an unmetered (Wi-Fi) network. Default off. */
     val wifiOnly: Flow<Boolean> = context.settingsStore.data.map { it[KEY_WIFI_ONLY] ?: false }
 
+    /** EXPERIMENTAL: when true, downloads use the adaptive chunk-queue engine that spreads
+     *  work across Internet Archive mirrors. Default FALSE — the proven static path runs
+     *  unless the user explicitly opts in. */
+    val adaptiveEngine: Flow<Boolean> = context.settingsStore.data.map { it[KEY_ADAPTIVE_ENGINE] ?: false }
+
     suspend fun setDownloadFolder(uri: Uri?) {
         context.settingsStore.edit {
             if (uri != null) it[KEY_DOWNLOAD_FOLDER] = uri.toString()
@@ -93,6 +99,10 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setWifiOnly(value: Boolean) {
         context.settingsStore.edit { it[KEY_WIFI_ONLY] = value }
+    }
+
+    suspend fun setAdaptiveEngine(value: Boolean) {
+        context.settingsStore.edit { it[KEY_ADAPTIVE_ENGINE] = value }
     }
 
     val seenSetupDisclaimer: Flow<Boolean> = context.settingsStore.data.map { it[KEY_SEEN_SETUP_DISCLAIMER] ?: false }
