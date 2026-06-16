@@ -1,0 +1,135 @@
+# badges.yml
+#
+# Auto-maintains the `badges` branch, which holds two shields.io endpoint JSON
+# files (badges/release.json and badges/downloads.json).
+#
+# WHY THIS EXISTS
+# ───────────────
+# The standard shields.io github/v/release and github/downloads badge types
+# query the GitHub API through shields.io's shared token pool.  Under load that
+# pool exhausts itself and badges render as "unable to select next github token
+# from pool".  The endpoint badge type is different: shields.io simply fetches a
+# static JSON file you control and renders whatever it says — it never touches
+# the GitHub API at all, so it can never produce the token-pool error.
+#
+# HOW IT WORKS
+# ────────────
+# 1. This workflow runs on every release, on a daily schedule (to keep the
+#    download count fresh), and on manual dispatch.
+# 2. It uses the repo's own built-in GITHUB_TOKEN (never the shields.io pool)
+#    to call the GitHub API via `gh`, computing the real values.
+# 3. It writes two JSON files and force-pushes them to the orphan `badges`
+#    branch.  The `badges` branch contains nothing else and is never merged
+#    into main — it is pure generated infra.
+#
+# BOOTSTRAP
+# ─────────
+# The `badges` branch is created automatically on the first workflow run.
+# Until that first run completes, the README badges show "inaccessible".
+# Trigger the first run with:
+#   gh workflow run badges.yml
+# …or via the Actions tab → "Update badge data" → "Run workflow".
+
+name: Update badge data
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 6 * * *"   # 06:00 UTC daily — keeps download count current
+  workflow_dispatch:       # manual trigger whenever needed
+
+permissions:
+  contents: write          # required to push to the badges branch
+
+jobs:
+  badges:
+    name: Compute and publish badge JSON
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main (for .git context)
+        uses: actions/checkout@v4
+
+      - name: Compute badge values
+        id: values
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # ── Total downloads across all releases ──────────────────────────
+          DOWNLOADS=$(gh api "repos/${{ github.repository }}/releases" \
+            --paginate \
+            --jq '[.[].assets[].download_count] | add // 0')
+
+          # ── Latest release tag ───────────────────────────────────────────
+          # Try the /releases/latest endpoint first; fall back to the list so
+          # we still get a tag even when no non-prerelease release exists yet.
+          TAG=$(gh api "repos/${{ github.repository }}/releases/latest" \
+            --jq '.tag_name' 2>/dev/null || true)
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG=$(gh api "repos/${{ github.repository }}/releases" \
+              --jq 'first | .tag_name // "unreleased"')
+          fi
+
+          echo "downloads=$DOWNLOADS" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"             >> "$GITHUB_OUTPUT"
+
+      - name: Write endpoint JSON files
+        run: |
+          mkdir -p badges
+
+          cat > badges/downloads.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "downloads",
+            "message": "${{ steps.values.outputs.downloads }}",
+            "color": "brightgreen"
+          }
+          EOF
+
+          cat > badges/release.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "release",
+            "message": "${{ steps.values.outputs.tag }}",
+            "color": "blue"
+          }
+          EOF
+
+      - name: Publish to badges branch
+        run: |
+          # Configure the bot identity for the badges-branch commit only.
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Switch to (or create) the badges orphan branch without disturbing
+          # the main checkout.  We use a worktree so git doesn't complain about
+          # switching branches with uncommitted changes.
+          if git ls-remote --exit-code origin badges > /dev/null 2>&1; then
+            # Branch already exists on remote — check it out.
+            git worktree add badges-wt badges 2>/dev/null || \
+              git worktree add badges-wt --track -B badges origin/badges
+          else
+            # First run — create a fresh orphan branch.
+            git worktree add --orphan -B badges badges-wt
+          fi
+
+          # Copy the freshly-written JSON into the worktree.
+          cp badges/downloads.json badges-wt/downloads.json
+          cp badges/release.json   badges-wt/release.json
+
+          cd badges-wt
+
+          git add downloads.json release.json
+
+          # Commit only if something actually changed; skip gracefully otherwise.
+          if git diff --cached --quiet; then
+            echo "No badge values changed — nothing to commit."
+          else
+            git commit -m "chore: update badge data [skip ci]"
+            git push origin badges
+          fi
+
+          cd ..
+          git worktree remove badges-wt
