@@ -18,15 +18,25 @@
 #    download count fresh), and on manual dispatch.
 # 2. It uses the repo's own built-in GITHUB_TOKEN (never the shields.io pool)
 #    to call the GitHub API via `gh`, computing the real values.
-# 3. It writes two JSON files and force-pushes them to the orphan `badges`
-#    branch.  The `badges` branch contains nothing else and is never merged
-#    into main — it is pure generated infra.
+# 3. It writes two JSON files and publishes them to the `badges` branch via the
+#    GitHub Contents API (not a local checkout/worktree of that branch). The
+#    `badges` branch contains nothing else and is never merged into main — it
+#    is pure generated infra.
+#
+# WHY THE CONTENTS API (and not git worktree)
+# ───────────────────────────────────────────
+# The earlier version checked out the badges branch into a git worktree. That
+# broke on EVERY run because actions/checkout only fetches `main`, so
+# `origin/badges` was never a local remote-tracking ref and the worktree command
+# failed with "fatal: invalid reference: origin/badges" (exit 128) — silently
+# freezing the badge for weeks. The Contents API needs no local ref at all: it
+# reads the current blob SHA over HTTPS and PUTs the new content, creating the
+# branch on first run. It cannot be tripped up by checkout depth or fetch config.
 #
 # BOOTSTRAP
 # ─────────
-# The `badges` branch is created automatically on the first workflow run.
-# Until that first run completes, the README badges show "inaccessible".
-# Trigger the first run with:
+# The `badges` branch is created automatically on the first workflow run (the
+# first PUT with no prior SHA creates the file and the branch). Trigger a run with:
 #   gh workflow run badges.yml
 # …or via the Actions tab → "Update badge data" → "Run workflow".
 
@@ -77,9 +87,9 @@ jobs:
 
       - name: Write endpoint JSON files
         run: |
-          mkdir -p badges
+          mkdir -p out
 
-          cat > badges/downloads.json <<EOF
+          cat > out/downloads.json <<EOF
           {
             "schemaVersion": 1,
             "label": "downloads",
@@ -88,7 +98,7 @@ jobs:
           }
           EOF
 
-          cat > badges/release.json <<EOF
+          cat > out/release.json <<EOF
           {
             "schemaVersion": 1,
             "label": "release",
@@ -97,39 +107,54 @@ jobs:
           }
           EOF
 
-      - name: Publish to badges branch
+      # Publish the two JSON files to the `badges` branch via the GitHub
+      # Contents API directly — no local checkout of that branch, no worktree,
+      # no remote-tracking ref required.  The previous git-worktree approach
+      # broke because actions/checkout only fetches `main`, so `origin/badges`
+      # was never a local ref and `git worktree add … origin/badges` died with
+      # "invalid reference: origin/badges" on every run.  Going through the API
+      # sidesteps all of that: it reads the current blob SHA (if any) and PUTs
+      # the new content, creating the branch on first run.  It is idempotent and
+      # cannot be tripped up by checkout depth or branch-fetch configuration.
+      - name: Publish to badges branch via Contents API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          # Configure the bot identity for the badges-branch commit only.
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          publish() {
+            local file="$1"          # path under the repo root on the badges branch
+            local local_path="$2"    # the freshly-written JSON on disk
+            local content
+            content=$(base64 -w0 "$local_path")
 
-          # Switch to (or create) the badges orphan branch without disturbing
-          # the main checkout.  We use a worktree so git doesn't complain about
-          # switching branches with uncommitted changes.
-          if git ls-remote --exit-code origin badges > /dev/null 2>&1; then
-            # Branch already exists on remote — check it out.
-            git worktree add badges-wt badges 2>/dev/null || \
-              git worktree add badges-wt --track -B badges origin/badges
-          else
-            # First run — create a fresh orphan branch.
-            git worktree add --orphan -B badges badges-wt
-          fi
+            # Look up the existing blob SHA on the badges branch (empty if the
+            # file — or the branch — does not exist yet; first run creates it).
+            local sha
+            sha=$(gh api "repos/$REPO/contents/$file?ref=badges" --jq '.sha' 2>/dev/null || true)
 
-          # Copy the freshly-written JSON into the worktree.
-          cp badges/downloads.json badges-wt/downloads.json
-          cp badges/release.json   badges-wt/release.json
+            # Skip the write when the content is byte-identical to avoid empty
+            # commits on the daily cron when nothing changed.
+            if [ -n "$sha" ]; then
+              local current
+              current=$(gh api "repos/$REPO/contents/$file?ref=badges" --jq '.content' 2>/dev/null | tr -d '\n' || true)
+              local want
+              want=$(base64 -w0 "$local_path")
+              # GitHub returns base64 with newlines; normalise both sides.
+              if [ "$(echo "$current" | base64 -d 2>/dev/null | base64 -w0)" = "$want" ]; then
+                echo "$file unchanged — skipping."
+                return 0
+              fi
+            fi
 
-          cd badges-wt
+            local args=(-X PUT "repos/$REPO/contents/$file"
+              -f "message=chore: update $file [skip ci]"
+              -f "content=$content"
+              -f "branch=badges")
+            [ -n "$sha" ] && args+=(-f "sha=$sha")
 
-          git add downloads.json release.json
+            gh api "${args[@]}" --jq '.commit.sha' \
+              | xargs -I{} echo "$file published in commit {}"
+          }
 
-          # Commit only if something actually changed; skip gracefully otherwise.
-          if git diff --cached --quiet; then
-            echo "No badge values changed — nothing to commit."
-          else
-            git commit -m "chore: update badge data [skip ci]"
-            git push origin badges
-          fi
-
-          cd ..
-          git worktree remove badges-wt
+          publish "downloads.json" "out/downloads.json"
+          publish "release.json"   "out/release.json"
