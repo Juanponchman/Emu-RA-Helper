@@ -308,12 +308,14 @@ fun ScanProgressScreen(
 
     // Guard against navigating twice (which could pop SCAN then land on a half-state).
     var navigated by remember(selectionKey) { mutableStateOf(false) }
-    LaunchedEffect(armed, state.scanComplete, state.isScanning, state.totalFiles) {
+    LaunchedEffect(armed, state.scanComplete, state.isScanning, state.totalFiles, state.failures) {
         // Auto-navigate to Pick ONLY once this session's scan is genuinely complete
-        // with some files. `armed` ensures we ignore a previous run's leftover
-        // scanComplete; `navigated` ensures we fire exactly once.
+        // with some files AND no failures. `armed` ensures we ignore a previous run's
+        // leftover scanComplete; `navigated` ensures we fire exactly once.
+        // When failures.isNotEmpty(), we hold on the scan screen so the user can see
+        // which sources failed and choose to continue or not (see "Continue" button below).
         if (armed && !navigated && state.scanComplete && !state.isScanning &&
-            state.error.isBlank() && state.totalFiles > 0
+            state.error.isBlank() && state.totalFiles > 0 && state.failures.isEmpty()
         ) {
             navigated = true
             onScanComplete()
@@ -411,8 +413,20 @@ fun ScanProgressScreen(
             }
             if (state.scanComplete && state.totalFiles > 0 && state.failures.isNotEmpty()) {
                 Spacer(Modifier.height(Dimens.SectionGap))
+                val unavailableCount = state.failures.size
+                val totalSourcesLabel = if (state.totalSources > 0) " of ${state.totalSources}" else ""
+                Text(
+                    "$unavailableCount$totalSourcesLabel sources unavailable — some files may be missing.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(Dimens.ItemGap))
                 Button(
-                    onClick = onScanComplete,
+                    onClick = {
+                        // Set navigated so the LaunchedEffect doesn't also fire.
+                        navigated = true
+                        onScanComplete()
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                 ) { Text("Continue with ${state.totalFiles} files") }
             }

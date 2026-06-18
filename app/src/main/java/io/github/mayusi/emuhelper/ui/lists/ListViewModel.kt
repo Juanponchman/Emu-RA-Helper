@@ -29,6 +29,10 @@ class ListViewModel @Inject constructor(
     val lists: StateFlow<List<GameList>> =
         store.lists.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /** True when the persisted game-list JSON was corrupt and could not be decoded. */
+    val decodeError: StateFlow<Boolean> =
+        store.decodeError.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
     /** Games staged by the picker (BUILD mode), shown on the Save-list screen. */
     val pendingGames: StateFlow<List<CuratedGame>> = scanState.pendingListGames
 

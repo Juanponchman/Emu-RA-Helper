@@ -301,6 +301,8 @@ fun HomeScreen(
     val context = LocalContext.current
     var menuOpen by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf(false) }
+    // FIX 1: Logout confirmation dialog state.
+    var showLogoutConfirm by remember { mutableStateOf(false) }
     // Track whether the Discord dialog has been actioned in this session (prevents re-trigger on recomposition).
     var discordDialogHandled by remember { mutableStateOf(false) }
 
@@ -323,6 +325,24 @@ fun HomeScreen(
                 Log.w("EmuHelper", "Persisting folder URI failed", e)
             }
         }
+    }
+
+    // FIX 1: Logout confirmation dialog.
+    if (showLogoutConfirm) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirm = false },
+            title = { Text("Sign out?") },
+            text  = { Text("You'll need to sign in again to download.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { viewModel.logout(); showLogoutConfirm = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("Sign out") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirm = false }) { Text("Cancel") }
+            }
+        )
     }
 
     // Update dialog
@@ -410,7 +430,7 @@ fun HomeScreen(
                             DropdownMenuItem(
                                 text = { Text("Log out") },
                                 leadingIcon = { Icon(Icons.AutoMirrored.Filled.Logout, null) },
-                                onClick = { menuOpen = false; viewModel.logout() }
+                                onClick = { menuOpen = false; showLogoutConfirm = true }
                             )
                         } else {
                             DropdownMenuItem(
@@ -488,8 +508,7 @@ fun HomeScreen(
                             Text("Update", color = MaterialTheme.colorScheme.onPrimaryContainer)
                         }
                         IconButton(
-                            onClick = { viewModel.dismissUpdate(info.latestTag) },
-                            modifier = Modifier.size(32.dp)
+                            onClick = { viewModel.dismissUpdate(info.latestTag) }
                         ) {
                             Icon(
                                 Icons.Default.Close,
@@ -538,8 +557,7 @@ fun HomeScreen(
                             Text("Resume", color = MaterialTheme.colorScheme.onSecondaryContainer)
                         }
                         IconButton(
-                            onClick = { viewModel.dismissQueue() },
-                            modifier = Modifier.size(32.dp)
+                            onClick = { viewModel.dismissQueue() }
                         ) {
                             Icon(
                                 Icons.Default.Close,
@@ -659,7 +677,7 @@ fun HomeScreen(
                 }
             } else {
                 SuggestionChip(
-                    onClick = { viewModel.logout() },
+                    onClick = { showLogoutConfirm = true },
                     label = {
                         Text(
                             ui.email.takeIf { it.isNotBlank() }?.let { "Signed in as $it" } ?: "Signed in",

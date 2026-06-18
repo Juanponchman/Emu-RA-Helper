@@ -19,7 +19,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -137,8 +136,11 @@ class DownloadManager @Inject constructor(
 
         batchJob = scope.launch {
             // Persist the queue immediately so a force-close/crash/reboot doesn't lose it.
-            // Cleared only when the batch completes successfully (below) or clear() is called.
-            launch { queueStore.save(games) }
+            // Direct suspend call (NOT a nested launch) so the queue is committed to DataStore
+            // BEFORE any download starts. A fire-and-forget launch raced the batch start: if the
+            // app was killed in that window, the queue wasn't persisted and the resume banner
+            // never appeared. The resume guarantee requires this to complete first.
+            queueStore.save(games)
             val chosenUri = settings.downloadFolder.first()
             // Clamp to SAFE ceilings. Files-at-once is the dangerous multiplier, so cap
             // it low (downloads are network-bound; 2-3 files saturates the source host).
@@ -345,11 +347,23 @@ class DownloadManager @Inject constructor(
         _totalSpeed.value = 0.0
         _eta.value = "--"
         smoothedSpeed = 0.0
+        // FIX 3: clear the SAF subfolder cache after each batch so DocumentFile objects
+        // (which hold a Uri + ContentResolver chain) don't accumulate across sessions.
+        // Folders are cheap to re-resolve, so clearing here is the correct trade-off.
+        safCache.clear()
     }
 
     // ---- one file ---------------------------------------------------------
 
     private suspend fun downloadOne(taskId: String, customRootBase: DocumentFile?, defaultRootBase: File) {
+        // FIX 2: Early cancellation guard — stop wasting HTTP probes (resolveFinalUrl +
+        // supportsRange = 2 round-trips) for files that haven't started yet when a batch cancel
+        // was requested. Without this, queued files still fired both blocking probes before
+        // noticing the cancellation flag at the isCancelled() check inside downloadFileSegmented.
+        if (cancelRequested) {
+            updateTask(taskId) { it.copy(status = DownloadStatus.CANCELLED, speed = 0.0) }
+            return
+        }
         val base = latestTasks.firstOrNull { it.id == taskId } ?: return
         val filename = base.filename
         val expected = base.size
@@ -620,13 +634,18 @@ class DownloadManager @Inject constructor(
         }
         if (terminal.isEmpty()) return
         val now = System.currentTimeMillis()
-        val entries = terminal.map { task ->
+        // FIX 4: give each entry a unique timestamp (now + index offset) so that a 30-game
+        // batch doesn't stamp 30 entries with the exact same millisecond. Without this, the
+        // HistoryScreen LazyColumn key "${timestamp}_${filename}" collides when the same game
+        // appears twice (retry), silently dropping one entry. The +index offset also preserves
+        // the relative order within a batch for the newest-first display.
+        val entries = terminal.mapIndexed { index, task ->
             HistoryEntry(
                 filename = task.filename,
                 subfolder = task.subfolder,
                 sizeBytes = task.size,
                 status = task.status.name,
-                timestampMillis = now,
+                timestampMillis = now + index,
                 identifier = task.identifier,
                 console = task.console,
                 name = task.name

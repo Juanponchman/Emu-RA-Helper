@@ -3,6 +3,7 @@ package io.github.mayusi.emuhelper.ui.login
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
@@ -157,6 +158,10 @@ fun LoginScreen(
                         }
                     },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = {
+                        val canLogin = !state.isLoading && email.isNotBlank() && password.isNotBlank()
+                        if (canLogin) viewModel.login(email, password, rememberMe)
+                    }),
                     shape = MaterialTheme.shapes.extraSmall
                 )
 

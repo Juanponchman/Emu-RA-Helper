@@ -51,6 +51,10 @@ class HistoryViewModel @Inject constructor(
     val entries: StateFlow<List<HistoryEntry>> = historyStore.entries
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    /** True when the persisted history JSON was corrupt and could not be decoded. */
+    val decodeError: StateFlow<Boolean> =
+        historyStore.decodeError.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
+
     fun clearHistory() {
         viewModelScope.launch { historyStore.clear() }
     }
@@ -113,6 +117,7 @@ fun HistoryScreen(
     viewModel: HistoryViewModel = hiltViewModel()
 ) {
     val entries by viewModel.entries.collectAsState()
+    val decodeError by viewModel.decodeError.collectAsState()
     var showClearDialog by remember { mutableStateOf(false) }
     var actionEntry by remember { mutableStateOf<HistoryEntry?>(null) }
     val context = LocalContext.current
@@ -203,7 +208,10 @@ fun HistoryScreen(
             title = { Text("Clear history") },
             text  = { Text("Remove all download history entries? This cannot be undone.") },
             confirmButton = {
-                TextButton(onClick = { viewModel.clearHistory(); showClearDialog = false }) {
+                TextButton(
+                    onClick = { viewModel.clearHistory(); showClearDialog = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
                     Text("Clear")
                 }
             },
@@ -233,57 +241,69 @@ fun HistoryScreen(
             )
         }
     ) { padding ->
-        if (entries.isEmpty()) {
-            Box(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(
-                        Icons.Default.History,
-                        contentDescription = null,
-                        modifier = Modifier.size(64.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    Text(
-                        "No downloads yet",
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            if (decodeError) {
+                Text(
+                    text = "Download history couldn't be read.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Dimens.ScreenHorizontal, vertical = 8.dp)
+                )
             }
-        } else {
-            // Group entries by relative day label (Today / Yesterday / date).
-            // B9: Key on absolute date string (yyyy-MM-dd derived from the earliest timestamp
-            // in each group) so LazyColumn keys remain stable across midnight rollover — the
-            // visible label is still relative ("Today"/"Yesterday") but the key never changes.
-            val grouped: List<Triple<String, String, List<HistoryEntry>>> = remember(entries) {
-                // Group by absolute date string for stable keys.
-                val absDateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
-                entries.groupBy { absDateFmt.format(Date(it.timestampMillis)) }
-                    .entries
-                    .map { (absDate, list) -> Triple(absDate, relativeDay(list.maxOf { it.timestampMillis }), list) }
-                    .sortedByDescending { (_, _, list) -> list.maxOf { it.timestampMillis } }
-            }
-
-            LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(padding),
-                contentPadding = PaddingValues(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                grouped.forEach { (absDate, dayLabel, dayEntries) ->
-                    // B9: key on absolute date, not relative label.
-                    item(key = "header_$absDate") {
+            if (entries.isEmpty()) {
+                Box(
+                    modifier = Modifier.weight(1f),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            Icons.Default.History,
+                            contentDescription = null,
+                            modifier = Modifier.size(64.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                        )
+                        Spacer(Modifier.height(16.dp))
                         Text(
-                            dayLabel,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
+                            "No downloads yet",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    items(dayEntries, key = { entry -> "${entry.timestampMillis}_${entry.filename}" }) { entry ->
-                        HistoryEntryCard(entry, Modifier.animateItem(), onClick = { actionEntry = entry })
+                }
+            } else {
+                // Group entries by relative day label (Today / Yesterday / date).
+                // B9: Key on absolute date string (yyyy-MM-dd derived from the earliest timestamp
+                // in each group) so LazyColumn keys remain stable across midnight rollover — the
+                // visible label is still relative ("Today"/"Yesterday") but the key never changes.
+                val grouped: List<Triple<String, String, List<HistoryEntry>>> = remember(entries) {
+                    // Group by absolute date string for stable keys.
+                    val absDateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+                    entries.groupBy { absDateFmt.format(Date(it.timestampMillis)) }
+                        .entries
+                        .map { (absDate, list) -> Triple(absDate, relativeDay(list.maxOf { it.timestampMillis }), list) }
+                        .sortedByDescending { (_, _, list) -> list.maxOf { it.timestampMillis } }
+                }
+
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    grouped.forEach { (absDate, dayLabel, dayEntries) ->
+                        // B9: key on absolute date, not relative label.
+                        item(key = "header_$absDate") {
+                            Text(
+                                dayLabel,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)
+                            )
+                        }
+                        items(dayEntries, key = { entry -> "${entry.timestampMillis}_${entry.filename}" }) { entry ->
+                            HistoryEntryCard(entry, Modifier.animateItem(), onClick = { actionEntry = entry })
+                        }
                     }
                 }
             }
@@ -317,7 +337,12 @@ private fun HistoryEntryCard(entry: HistoryEntry, modifier: Modifier = Modifier,
             modifier = Modifier.fillMaxWidth().padding(Dimens.CardPadding + 2.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(statusIcon, null, modifier = Modifier.size(20.dp), tint = statusColor)
+            val statusDesc = when {
+                isDone   -> "Done"
+                isFailed -> "Failed"
+                else     -> "Cancelled"
+            }
+            Icon(statusIcon, contentDescription = statusDesc, modifier = Modifier.size(20.dp), tint = statusColor)
             Spacer(Modifier.width(Dimens.ItemGap))
             Column(modifier = Modifier.weight(1f)) {
                 Text(

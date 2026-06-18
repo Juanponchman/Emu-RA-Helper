@@ -310,7 +310,7 @@ private fun HealthRow(health: SourceHealth) {
     ) {
         Icon(
             if (health.alive) Icons.Default.CheckCircle else Icons.Default.Error,
-            contentDescription = if (health.alive) "Alive" else "Dead",
+            contentDescription = if (health.alive) "Reachable" else "Unreachable",
             tint = tint,
             modifier = Modifier.size(18.dp)
         )

@@ -4,6 +4,25 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.5.5] - 2026-06-17
+
+### Fixed
+- **More reliable resume.** The interrupted-batch queue is now saved before a
+  download starts, so a crash during the very first file still lets you resume.
+- **Wi-Fi-only now holds mid-download.** If you start on Wi-Fi and drop to mobile
+  data, downloads auto-pause (and resume when Wi-Fi returns) instead of silently
+  using cellular - so the data-cap protection actually works the whole time.
+- **Confirmations before destructive taps.** Cancelling a whole batch and signing
+  out now ask first (easy to mis-tap on a handheld), and "clear history" is styled
+  as a destructive action.
+- **Cancelling a batch is snappier** - it no longer fires needless network probes
+  for files that had not started, and the source health check now stops its
+  in-flight checks immediately when cancelled.
+- A notice now appears if saved lists or history ever fail to load (instead of
+  silently showing empty), download history entries no longer collide, a small
+  memory cache is cleared between batches, the login screen submits on the
+  keyboard Done key, and several accessibility/touch-target fixes.
+
 ## [0.5.4] — 2026-06-16
 
 ### Fixed

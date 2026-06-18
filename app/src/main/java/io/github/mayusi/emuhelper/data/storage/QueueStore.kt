@@ -10,6 +10,8 @@ import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.mayusi.emuhelper.data.model.CuratedGame
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.json.Json
 import javax.inject.Inject
@@ -38,6 +40,16 @@ class QueueStore @Inject constructor(
     companion object {
         private val KEY_QUEUE = stringPreferencesKey("pending_queue_v1")
     }
+
+    /**
+     * FIX 5: Set to true when a decode exception is caught during queue restore.
+     * Flips true on the first corrupt-JSON read and stays true for the session.
+     * UI layers (e.g. HomeScreen) should observe this and surface a
+     * "saved queue couldn't be read" notice rather than silently losing the queue.
+     * The store still returns emptyList() on failure (safe, no crash).
+     */
+    private val _decodeError = MutableStateFlow(false)
+    val decodeError: StateFlow<Boolean> = _decodeError
 
     /** The pending queue from the last interrupted batch, or empty if none. */
     val pendingQueue: Flow<List<CuratedGame>> = context.queueDataStore.data.map { prefs ->
@@ -75,6 +87,8 @@ class QueueStore @Inject constructor(
             )
         } catch (e: Exception) {
             Log.w("EmuHelper", "Decoding pending queue failed; returning empty", e)
+            // FIX 5: surface the decode failure so UI can warn the user.
+            _decodeError.value = true
             emptyList()
         }
     }

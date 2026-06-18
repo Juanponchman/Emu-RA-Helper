@@ -46,6 +46,7 @@ fun ListLibraryScreen(
     viewModel: ListViewModel = hiltViewModel()
 ) {
     val lists by viewModel.lists.collectAsState()
+    val decodeError by viewModel.decodeError.collectAsState()
     val message by viewModel.message.collectAsState()
     val context = LocalContext.current
     val snackbar = remember { SnackbarHostState() }
@@ -137,8 +138,19 @@ fun ListLibraryScreen(
         },
         snackbarHost = { SnackbarHost(snackbar) }
     ) { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            if (decodeError) {
+                Text(
+                    text = "Some saved lists couldn't be read (the saved data may be corrupted).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Dimens.ScreenHorizontal, vertical = 8.dp)
+                )
+            }
         if (lists.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize().padding(padding).padding(48.dp), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.weight(1f).padding(48.dp), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Text("No saved lists yet", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.onSurface)
                     Spacer(Modifier.height(12.dp))
@@ -174,7 +186,7 @@ fun ListLibraryScreen(
             }
         } else {
             LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(padding),
+                modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 contentPadding = PaddingValues(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap)
             ) {
@@ -299,6 +311,7 @@ fun ListLibraryScreen(
                 }
             }
         }
+        } // end outer Column
     }
 
     deleteTarget?.let { target ->

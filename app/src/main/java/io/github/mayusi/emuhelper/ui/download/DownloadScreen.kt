@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.provider.DocumentsContract
@@ -45,6 +47,7 @@ import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatEta
 import io.github.mayusi.emuhelper.ui.common.formatSize
 import io.github.mayusi.emuhelper.ui.common.formatSpeed
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -84,6 +87,86 @@ class DownloadViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /**
+     * Non-null message when downloads were automatically paused because the network
+     * switched to a metered connection while Wi-Fi-only is enabled.
+     * Cleared when the user manually resumes or when the network returns to unmetered.
+     */
+    private val _wifiPauseMessage = MutableStateFlow<String?>(null)
+    val wifiPauseMessage: StateFlow<String?> = _wifiPauseMessage
+
+    /**
+     * True when the mid-download network callback performed an automatic pause.
+     * Distinguishes auto-pauses from manual pauses so auto-resume only un-does its own
+     * pause and never fights a user-initiated pause/resume.
+     */
+    private var autoPausedByNetworkCallback = false
+
+    private val connectivityManager =
+        appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+            handleNetworkChange(caps)
+        }
+        override fun onLost(network: Network) {
+            // Treat losing the network as becoming metered — pause to protect data.
+            handleNetworkChange(null)
+        }
+    }
+
+    /**
+     * Called by the NetworkCallback whenever the default network's capabilities change.
+     * [caps] is null when the network is lost.
+     *
+     * Rules:
+     * - Only acts when wifiOnly is true AND a download is actively running.
+     * - Auto-pauses when the network is metered (or lost); auto-resumes when it returns
+     *   to unmetered — but ONLY if the callback was the one that paused it, so a user's
+     *   manual pause is never overridden.
+     */
+    private fun handleNetworkChange(caps: NetworkCapabilities?) {
+        if (!wifiOnly.value) return          // preference is off — nothing to enforce
+        if (!isRunning.value) return         // no download in progress — nothing to pause
+
+        val isMetered = caps == null || !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+
+        if (isMetered && !autoPausedByNetworkCallback && !isPaused.value) {
+            // Network became metered / lost while a download is running — auto-pause.
+            autoPausedByNetworkCallback = true
+            manager.pause()
+            _wifiPauseMessage.value = "Paused — on mobile data (Wi-Fi only is on)"
+            Log.i("EmuHelper", "Wi-Fi-only: auto-paused (network metered/lost)")
+        } else if (!isMetered && autoPausedByNetworkCallback) {
+            // Network returned to unmetered — auto-resume only what we auto-paused.
+            autoPausedByNetworkCallback = false
+            _wifiPauseMessage.value = null
+            manager.resume()
+            Log.i("EmuHelper", "Wi-Fi-only: auto-resumed (network unmetered)")
+        }
+    }
+
+    init {
+        // Register a default-network callback so we hear about network changes
+        // mid-download. Uses the broad "any capability" request so we always get
+        // onCapabilitiesChanged; we filter for metered/unmetered inside handleNetworkChange.
+        try {
+            val request = NetworkRequest.Builder().build()
+            connectivityManager?.registerNetworkCallback(request, networkCallback)
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "Could not register network callback; mid-download Wi-Fi gate disabled", e)
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        try {
+            connectivityManager?.unregisterNetworkCallback(networkCallback)
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "Error unregistering network callback", e)
+        }
+    }
+
+    /**
      * True when the Wi-Fi-only preference is on AND the active network is metered
      * (e.g. mobile data). Used to gate downloads before they start. Fails open
      * (returns false) if network state can't be read, so we never block spuriously.
@@ -108,9 +191,21 @@ class DownloadViewModel @Inject constructor(
     }
 
     fun start(games: List<CuratedGame>) = manager.start(games)
-    fun cancelAll() = manager.cancelAll()
+    fun cancelAll() {
+        // Clear auto-pause tracking on cancel so it doesn't linger.
+        autoPausedByNetworkCallback = false
+        _wifiPauseMessage.value = null
+        manager.cancelAll()
+    }
     fun pauseAll() = manager.pause()
-    fun resumeAll() = manager.resume()
+    fun resumeAll() {
+        // A manual resume clears the auto-pause flag: the user is explicitly overriding
+        // the Wi-Fi-only policy for this session, so we won't auto-pause again until the
+        // next network event.
+        autoPausedByNetworkCallback = false
+        _wifiPauseMessage.value = null
+        manager.resume()
+    }
     fun retryTask(task: io.github.mayusi.emuhelper.data.model.DownloadTask) = manager.retry(task.id)
 
     fun clearQueue() {
@@ -141,6 +236,7 @@ fun DownloadScreen(
     val statusText by viewModel.statusText.collectAsState()
     val isRunning by viewModel.isRunning.collectAsState()
     val isPaused by viewModel.isPaused.collectAsState()
+    val wifiPauseMessage by viewModel.wifiPauseMessage.collectAsState()
     val customFolder by viewModel.customFolder.collectAsState()
     val context = LocalContext.current
     // B11: Snackbar host for transient "open folder" error feedback.
@@ -151,6 +247,9 @@ fun DownloadScreen(
     // hold the action to run if they choose "Download anyway".
     var pendingWifiAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val showWifiBlock = pendingWifiAction != null
+
+    // FIX 1: Cancel-all confirmation — prevents fat-finger nuke of running batch.
+    var showCancelConfirm by remember { mutableStateOf(false) }
 
     // Run [action] only if Wi-Fi-only doesn't block it; otherwise stash it and prompt.
     val gateWifiOnly: (() -> Unit) -> Unit = { action ->
@@ -198,6 +297,24 @@ fun DownloadScreen(
         if (tasks.isEmpty() && games.isNotEmpty()) gateWifiOnly { viewModel.start(games) }
     }
 
+    // FIX 1: Cancel-all confirmation dialog.
+    if (showCancelConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCancelConfirm = false },
+            title = { Text("Cancel all downloads?") },
+            text  = { Text("This stops and removes the current batch.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { viewModel.cancelAll(); showCancelConfirm = false },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) { Text("Cancel downloads") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCancelConfirm = false }) { Text("Keep downloading") }
+            }
+        )
+    }
+
     // Wi-Fi-only block dialog: shown when the user tried to download on mobile data.
     // We never silently no-op — the user can connect to Wi-Fi, open Settings via the
     // explainer, or explicitly proceed with "Download anyway".
@@ -241,8 +358,8 @@ fun DownloadScreen(
                                 contentDescription = if (isPaused) "Resume downloads" else "Pause downloads"
                             )
                         }
-                        IconButton(onClick = { viewModel.cancelAll() }) {
-                            Icon(Icons.Default.Close, "Cancel")
+                        IconButton(onClick = { showCancelConfirm = true }) {
+                            Icon(Icons.Default.Close, "Cancel all downloads")
                         }
                     }
                     IconButton(onClick = { folderPicker.launch(null) }) {
@@ -295,6 +412,16 @@ fun DownloadScreen(
                             "Downloads keep running if you leave the app. Force-closing it stops them.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    // Mid-download Wi-Fi-only enforcement: show a banner when the network
+                    // callback auto-paused downloads because the connection became metered.
+                    if (wifiPauseMessage != null) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            wifiPauseMessage!!,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error
                         )
                     }
                 }
@@ -408,7 +535,14 @@ fun DownloadScreen(
                             .padding(Dimens.CardPadding + 2.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(icon, null, modifier = Modifier.size(20.dp), tint = statusColor)
+                                val iconDesc = when (task.status) {
+                                    DownloadStatus.DONE -> "Done"
+                                    DownloadStatus.DOWNLOADING -> "Downloading"
+                                    DownloadStatus.FAILED -> "Failed"
+                                    DownloadStatus.PAUSED -> "Paused"
+                                    else -> "Queued"
+                                }
+                                Icon(icon, contentDescription = iconDesc, modifier = Modifier.size(20.dp), tint = statusColor)
                                 Spacer(Modifier.width(Dimens.ItemGap))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(task.filename, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurface, maxLines = 1, overflow = TextOverflow.Ellipsis)

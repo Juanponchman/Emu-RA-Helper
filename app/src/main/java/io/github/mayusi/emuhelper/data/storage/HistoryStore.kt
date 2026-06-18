@@ -9,6 +9,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -53,6 +55,16 @@ class HistoryStore @Inject constructor(
         private const val MAX_ENTRIES = 100
     }
 
+    /**
+     * FIX 5: Set to true when a decode exception is caught during history restore.
+     * Flips true on the first corrupt-JSON read and stays true for the session.
+     * UI layers (e.g. HistoryScreen) should observe this and surface a
+     * "download history couldn't be read" notice rather than silently showing empty history.
+     * The store still returns emptyList() on failure (safe, no crash).
+     */
+    private val _decodeError = MutableStateFlow(false)
+    val decodeError: StateFlow<Boolean> = _decodeError
+
     /** All history entries, newest first. */
     val entries: Flow<List<HistoryEntry>> = context.historyDataStore.data.map { prefs ->
         decode(prefs[KEY_HISTORY])
@@ -96,6 +108,8 @@ class HistoryStore @Inject constructor(
             )
         } catch (e: Exception) {
             Log.w("EmuHelper", "Decoding history failed; returning empty", e)
+            // FIX 5: surface the decode failure so UI can warn the user.
+            _decodeError.value = true
             emptyList()
         }
     }

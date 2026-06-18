@@ -6,12 +6,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.CookieJar
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -79,16 +82,23 @@ class SourceHealthChecker @Inject constructor(
         }
     }
 
-    /** Send a HEAD request (or ranged GET fallback) and interpret the response. */
+    /**
+     * Send a HEAD request (or ranged GET fallback) and interpret the response.
+     *
+     * FIX 3: The OkHttp [Call] is captured before execute() so we can cancel it in the
+     * finally block when the coroutine is cancelled. Without this, the blocking execute()
+     * keeps the TCP connection open for up to [TIMEOUT_MS] even after the coroutine scope
+     * is cancelled, wasting radios during active downloads on a handheld device.
+     */
     private fun probe(console: String, url: String): SourceHealth {
+        val request = Request.Builder()
+            .url(url)
+            .head()
+            .header("User-Agent", "Mozilla/5.0")
+            .build()
+        val call: Call = client.newCall(request)
         return try {
-            val request = Request.Builder()
-                .url(url)
-                .head()
-                .header("User-Agent", "Mozilla/5.0")
-                .build()
-
-            client.newCall(request).execute().use { resp ->
+            call.execute().use { resp ->
                 val code = resp.code
                 val alive = code in 200..399 // 2xx, 3xx — reachable
                 if (!alive && code == 405) {
@@ -98,33 +108,52 @@ class SourceHealthChecker @Inject constructor(
                 Log.d(TAG, "HEAD $url -> $code")
                 SourceHealth(console, url, alive, code.toString())
             }
-        } catch (e: Exception) {
+        } catch (e: IOException) {
+            // Check if this was due to cancellation (call.isCanceled()) or a real network error.
+            if (call.isCanceled()) throw kotlinx.coroutines.CancellationException("probe cancelled")
             val msg = e.message?.take(80) ?: e.javaClass.simpleName
             Log.d(TAG, "probe $url -> exception: $msg")
             SourceHealth(console, url, alive = false, detail = msg)
+        } catch (e: Exception) {
+            if (call.isCanceled()) throw kotlinx.coroutines.CancellationException("probe cancelled")
+            val msg = e.message?.take(80) ?: e.javaClass.simpleName
+            Log.d(TAG, "probe $url -> exception: $msg")
+            SourceHealth(console, url, alive = false, detail = msg)
+        } finally {
+            // Cancel the in-flight call whenever the coroutine is done with this probe
+            // (either it completed normally, threw, or the coroutine was cancelled).
+            // Calling cancel() on an already-finished call is a safe no-op.
+            call.cancel()
         }
     }
 
     /** Fallback for servers that reject HEAD: fetch first byte only. */
     private fun rangedGet(console: String, url: String): SourceHealth {
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Range", "bytes=0-0")
+            .build()
+        val call: Call = client.newCall(request)
         return try {
-            val request = Request.Builder()
-                .url(url)
-                .get()
-                .header("User-Agent", "Mozilla/5.0")
-                .header("Range", "bytes=0-0")
-                .build()
-
-            client.newCall(request).execute().use { resp ->
+            call.execute().use { resp ->
                 resp.body?.close()
                 val code = resp.code
                 val alive = code in 200..399
                 Log.d(TAG, "GET(ranged) $url -> $code")
                 SourceHealth(console, url, alive, "$code")
             }
-        } catch (e: Exception) {
+        } catch (e: IOException) {
+            if (call.isCanceled()) throw kotlinx.coroutines.CancellationException("rangedGet cancelled")
             val msg = e.message?.take(80) ?: e.javaClass.simpleName
             SourceHealth(console, url, alive = false, detail = msg)
+        } catch (e: Exception) {
+            if (call.isCanceled()) throw kotlinx.coroutines.CancellationException("rangedGet cancelled")
+            val msg = e.message?.take(80) ?: e.javaClass.simpleName
+            SourceHealth(console, url, alive = false, detail = msg)
+        } finally {
+            call.cancel()
         }
     }
 }
