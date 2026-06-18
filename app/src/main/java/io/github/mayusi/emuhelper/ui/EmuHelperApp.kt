@@ -27,11 +27,13 @@ import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.about.AboutScreen
 import io.github.mayusi.emuhelper.ui.about.ErrorLogScreen
 import io.github.mayusi.emuhelper.ui.health.SourceHealthScreen
+import io.github.mayusi.emuhelper.ui.browse.BrowseViewModel
 import io.github.mayusi.emuhelper.ui.browse.ConsoleSelectScreen
 import io.github.mayusi.emuhelper.ui.browse.ScanStateHolder
 import io.github.mayusi.emuhelper.ui.history.HistoryScreen
 import io.github.mayusi.emuhelper.ui.browse.GamePickerScreen
 import io.github.mayusi.emuhelper.ui.browse.ScanProgressScreen
+import io.github.mayusi.emuhelper.ui.search.SearchAllScreen
 import io.github.mayusi.emuhelper.ui.download.DownloadPreviewScreen
 import io.github.mayusi.emuhelper.ui.download.DownloadScreen
 import io.github.mayusi.emuhelper.ui.home.HomeScreen
@@ -71,6 +73,8 @@ object Routes {
     const val PICK = "pick"
     const val PICK_ROUTE = "pick?instant={instant}"
     fun pick(instant: Boolean) = "pick?instant=$instant"
+    /** Search all of the Internet Archive (public search; no auth needed). */
+    const val SEARCH_ALL = "search_all"
     const val LIST_LIBRARY = "list_library"
     const val SAVE_LIST = "save_list"
     const val DOWNLOAD_PREVIEW = "download_preview"
@@ -170,10 +174,29 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
         ) {
 
             composable(Routes.HOME) {
+                // BrowseViewModel scoped to the HOME entry — used only to drive the SHARED
+                // "identifier -> file list -> picker" loader for the paste-a-link feature. It
+                // writes into the @Singleton ScanStateHolder, which the GamePickerScreen (a
+                // separate nav entry) reads, so the picker shows the loaded item identically to
+                // a normal scan completing with one source.
+                val browseVm: BrowseViewModel = hiltViewModel()
                 HomeScreen(
                     onMakeList = { navController.navigate(Routes.consoleSelect(instant = false)) },
                     onInstall = { navController.navigate(Routes.consoleSelect(instant = true)) },
                     onDownload = { navController.navigate(Routes.LIST_LIBRARY) },
+                    onAddFromUrl = { url, onResult ->
+                        // Reuse the SAME loader the search feature uses. On success, route into
+                        // the EXISTING picker in instant-install mode (select -> download).
+                        browseVm.loadIdentifierIntoPicker(
+                            input = url,
+                            onReady = {
+                                onResult(true, "")
+                                navController.navigate(Routes.pick(instant = true))
+                            },
+                            onError = { msg -> onResult(false, msg) }
+                        )
+                    },
+                    onSearchArchive = { navController.navigate(Routes.SEARCH_ALL) },
                     onSignIn = { navController.navigate(Routes.login(Routes.HOME)) },
                     onSettings = { navController.navigate(Routes.SETTINGS) },
                     onOpenDownloads = { navController.navigate(Routes.DOWNLOAD) },
@@ -341,6 +364,25 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
             composable(Routes.SAVE_LIST) {
                 SaveListScreen(
                     onSaved = { navController.popBackStack(Routes.HOME, inclusive = false) },
+                    onBack = { navController.popBackStack() }
+                )
+            }
+
+            // ---- Search all of the Internet Archive --------------------------
+            composable(Routes.SEARCH_ALL) {
+                // Same BrowseViewModel-driven shared loader as the paste-a-link feature. Tapping a
+                // result loads that identifier's file list into the @Singleton ScanStateHolder and
+                // routes into the EXISTING picker in instant-install mode.
+                val browseVm: BrowseViewModel = hiltViewModel()
+                SearchAllScreen(
+                    onOpenIdentifier = { identifier, title, onError ->
+                        browseVm.loadIdentifierIntoPicker(
+                            input = identifier,
+                            displayKey = title,
+                            onReady = { navController.navigate(Routes.pick(instant = true)) },
+                            onError = onError
+                        )
+                    },
                     onBack = { navController.popBackStack() }
                 )
             }

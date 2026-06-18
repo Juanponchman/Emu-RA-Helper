@@ -121,6 +121,92 @@ class BrowseViewModel @Inject constructor(
         // after the screen fully leaves composition.
     }
 
+    /**
+     * SHARED "identifier -> file list -> picker" path. Both the paste-a-link feature and the
+     * search-the-archive feature funnel through this single method so the integration with the
+     * existing [GamePickerScreen] is identical to a normal scan completing with ONE source.
+     *
+     * Given a pasted archive.org URL / identifier (or a search result's identifier), it:
+     *  1. extracts the canonical identifier via the SAME [RemoteSource.getIdentifier] used by scan,
+     *  2. fetches that item's file list via the SAME [RemoteSource.fetchFileList] used by scan,
+     *  3. populates [ScanStateHolder.scannedFiles] with a single entry keyed by [displayKey]
+     *     (defaults to the identifier) so the picker groups it under that label,
+     *  4. publishes a completed [ScanUiState] so the picker's empty-state guards behave,
+     *  5. invokes [onReady] on success, or [onError] with a clear message on failure.
+     *
+     * The map key is arbitrary from the picker's perspective (it groups by map key and falls back
+     * to showing the raw key when it isn't a known console), so the identifier is a safe label.
+     */
+    fun loadIdentifierIntoPicker(
+        input: String,
+        displayKey: String? = null,
+        onReady: () -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val raw = input.trim()
+        if (raw.isEmpty()) {
+            onError("Enter an archive.org item link or identifier.")
+            return
+        }
+        // Reuse RemoteSource's identifier extraction (handles /details/, /download/, and bare ids).
+        val identifier = source.getIdentifier(raw)
+        if (identifier.isBlank() || identifier.contains(' ') || identifier.contains('/')) {
+            onError("That doesn't look like a valid archive.org link or identifier.")
+            return
+        }
+        // Cancel any in-flight scan so its results can't clobber what we're about to publish.
+        scanJob?.cancel()
+        previousScanKeys = emptySet()
+        val key = displayKey?.takeIf { it.isNotBlank() } ?: identifier
+        viewModelScope.launch {
+            stateHolder.uiState.value = ScanUiState(isScanning = true, currentSource = identifier)
+            try {
+                val files = source.fetchFileList(identifier)
+                if (files.isEmpty()) {
+                    stateHolder.uiState.value = ScanUiState(
+                        scanComplete = true,
+                        emptyMessage = "No downloadable files found for \"$identifier\"."
+                    )
+                    onError("No downloadable files found for that item.")
+                    return@launch
+                }
+                stateHolder.scannedFiles.value = mapOf(key to files)
+                stateHolder.selectedGames.value = mapOf(key to mutableSetOf())
+                stateHolder.uiState.value = ScanUiState(
+                    scanComplete = true,
+                    totalSources = 1,
+                    completedSources = 1,
+                    totalFiles = files.size
+                )
+                Log.i("EmuHelper", "loadIdentifierIntoPicker: $identifier -> ${files.size} files")
+                onReady()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w("EmuHelper", "loadIdentifierIntoPicker failed for $identifier", e)
+                stateHolder.uiState.value = ScanUiState(
+                    scanComplete = true,
+                    error = "${e.javaClass.simpleName}: ${e.message}"
+                )
+                onError(friendlyLoadError(e))
+            }
+        }
+    }
+
+    /** Maps a fetch exception to a short, neutral, user-facing message. */
+    private fun friendlyLoadError(e: Exception): String {
+        val msg = e.message ?: ""
+        return when {
+            msg.contains("HTTP 404") || msg.contains("no files", ignoreCase = true) ->
+                "Item not found, or it has no downloadable files."
+            msg.contains("Non-JSON", ignoreCase = true) ->
+                "That item couldn't be read (it may be private or removed)."
+            e is java.io.IOException ->
+                "Couldn't reach the Internet Archive. Check your connection and try again."
+            else -> "Couldn't load that item. Check the link and try again."
+        }
+    }
+
     /** Tracks the running scan so a new scan can cancel a stale one (prevents the
      *  "isScanning stuck true / only 1 source scanned on the 2nd run" bug). */
     private var scanJob: kotlinx.coroutines.Job? = null

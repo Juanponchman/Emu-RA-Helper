@@ -18,8 +18,10 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.NewReleases
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PlayArrow
@@ -28,6 +30,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
@@ -280,6 +284,11 @@ fun HomeScreen(
     onInstall: () -> Unit,
     onDownload: () -> Unit,
     onSignIn: () -> Unit,
+    /** Paste-a-link: called with the typed link/identifier and a result callback
+     *  (success, errorMessage). On success the host navigates into the picker. */
+    onAddFromUrl: (url: String, onResult: (Boolean, String) -> Unit) -> Unit = { _, _ -> },
+    /** Open the "search all of the Internet Archive" screen. */
+    onSearchArchive: () -> Unit = {},
     onSettings: () -> Unit = {},
     onOpenDownloads: () -> Unit = {},
     onEmulatorSetup: () -> Unit = {},
@@ -303,6 +312,11 @@ fun HomeScreen(
     var showUpdateDialog by remember { mutableStateOf(false) }
     // FIX 1: Logout confirmation dialog state.
     var showLogoutConfirm by remember { mutableStateOf(false) }
+    // Paste-an-archive.org-link dialog state.
+    var showAddUrlDialog by remember { mutableStateOf(false) }
+    var addUrlText by remember { mutableStateOf("") }
+    var addUrlLoading by remember { mutableStateOf(false) }
+    var addUrlError by remember { mutableStateOf("") }
     // Track whether the Discord dialog has been actioned in this session (prevents re-trigger on recomposition).
     var discordDialogHandled by remember { mutableStateOf(false) }
 
@@ -341,6 +355,76 @@ fun HomeScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showLogoutConfirm = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Paste-an-archive.org-link dialog. Reuses the ListLibrary "Import from URL" dialog style:
+    // a short hint, a single-line field, an inline progress bar while loading, and an inline
+    // error. On submit it hands the text to onAddFromUrl, which runs the shared loader and (on
+    // success) navigates into the existing picker.
+    if (showAddUrlDialog) {
+        val focusRequester = remember { FocusRequester() }
+        AlertDialog(
+            onDismissRequest = { if (!addUrlLoading) showAddUrlDialog = false },
+            title = { Text("Add from a link") },
+            text = {
+                Column {
+                    Text(
+                        "Paste an archive.org item link or identifier.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = addUrlText,
+                        onValueChange = { addUrlText = it; addUrlError = "" },
+                        label = { Text("Link or identifier") },
+                        placeholder = { Text("https://archive.org/details/…") },
+                        singleLine = true,
+                        isError = addUrlError.isNotBlank(),
+                        enabled = !addUrlLoading,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .focusRequester(focusRequester)
+                    )
+                    if (addUrlError.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            addUrlError,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                    if (addUrlLoading) {
+                        Spacer(Modifier.height(8.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        addUrlLoading = true
+                        addUrlError = ""
+                        onAddFromUrl(addUrlText.trim()) { success, msg ->
+                            addUrlLoading = false
+                            if (success) {
+                                showAddUrlDialog = false
+                            } else {
+                                addUrlError = msg.ifBlank { "Couldn't load that item." }
+                            }
+                        }
+                    },
+                    enabled = !addUrlLoading && addUrlText.isNotBlank()
+                ) { Text("Load") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showAddUrlDialog = false },
+                    enabled = !addUrlLoading
+                ) { Text("Cancel") }
             }
         )
     }
@@ -425,6 +509,20 @@ fun HomeScreen(
                             text = { Text("Downloads") },
                             leadingIcon = { Icon(Icons.Default.Download, null) },
                             onClick = { menuOpen = false; onOpenDownloads() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Add from a link") },
+                            leadingIcon = { Icon(Icons.Default.Link, null) },
+                            onClick = {
+                                menuOpen = false
+                                addUrlText = ""; addUrlError = ""; addUrlLoading = false
+                                showAddUrlDialog = true
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Search the Internet Archive") },
+                            leadingIcon = { Icon(Icons.Default.Search, null) },
+                            onClick = { menuOpen = false; onSearchArchive() }
                         )
                         if (ui.loggedIn) {
                             DropdownMenuItem(

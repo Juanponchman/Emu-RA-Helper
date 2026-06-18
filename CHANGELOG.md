@@ -4,6 +4,16 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.6.0] - 2026-06-17
+
+### Added
+- **Search all of the Internet Archive.** A new search lets you find any public
+  item across the whole archive.org - not just the configured collections - and
+  download it through the normal flow. (Home menu -> Search the Internet Archive.)
+- **Add from a link.** Paste any archive.org item link (or identifier) and the
+  app pulls that item's files straight into the picker to select and download.
+  Great for links shared in the Discord or found elsewhere.
+
 ## [0.5.5] - 2026-06-17
 
 ### Fixed
