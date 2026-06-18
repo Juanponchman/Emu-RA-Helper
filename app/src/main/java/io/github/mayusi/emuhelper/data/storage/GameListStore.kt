@@ -76,6 +76,19 @@ class GameListStore @Inject constructor(
         }
     }
 
+    /**
+     * Persist the per-list download-folder override.
+     * Pass [uri] as a string to set it; pass `null` to clear it (revert to global folder).
+     */
+    suspend fun setListFolder(id: String, uri: String?) {
+        context.gameListStore.edit { prefs ->
+            val current = decode(prefs[KEY_LISTS]).map {
+                if (it.id == id) it.copy(customFolderUri = uri) else it
+            }
+            prefs[KEY_LISTS] = encode(current)
+        }
+    }
+
     // ---- JSON helpers, shared with export/import -------------------------
 
     /** Serialize a single list (used for file export). */

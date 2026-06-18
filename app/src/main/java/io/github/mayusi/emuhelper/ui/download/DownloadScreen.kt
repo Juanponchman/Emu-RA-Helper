@@ -50,6 +50,7 @@ import io.github.mayusi.emuhelper.ui.common.formatSpeed
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -81,6 +82,18 @@ class DownloadViewModel @Inject constructor(
     // frame — no async-init race that briefly shows null while the launch{} completes.
     val customFolder: StateFlow<Uri?> = settings.downloadFolder
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /**
+     * Per-list folder override (SAF tree URI) set when the user opens a saved list that has
+     * [io.github.mayusi.emuhelper.data.model.GameList.customFolderUri] != null.
+     * Null means "use the global download folder".
+     * Exposed so the Download screen can display "Using list folder: …" and so [start] can
+     * forward it once DownloadManager.start() accepts a folderOverride parameter.
+     */
+    val listFolderOverride: StateFlow<Uri?> =
+        scanState.pendingListFolderUri
+            .map { uriStr -> uriStr?.let { Uri.parse(it) } }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     /** Wi-Fi-only download preference; gated at the call site before starting downloads. */
     val wifiOnly: StateFlow<Boolean> = settings.wifiOnly
@@ -190,7 +203,22 @@ class DownloadViewModel @Inject constructor(
         }
     }
 
-    fun start(games: List<CuratedGame>) = manager.start(games)
+    /**
+     * Start downloading [games].
+     *
+     * Per-list folder override: when the user opens a saved list that has a
+     * [io.github.mayusi.emuhelper.data.model.GameList.customFolderUri], the override is
+     * carried via [scanState.pendingListFolderUri] and surfaced in the UI via
+     * [listFolderOverride]. It is passed straight through to DownloadManager.start() below,
+     * which targets that SAF tree instead of the global Settings download folder. The
+     * override is cleared in [clearQueue] when the batch ends.
+     */
+    fun start(games: List<CuratedGame>) {
+        // A per-list custom folder (if the batch came from a saved list that pinned one)
+        // overrides the global download folder for this batch.
+        val override = scanState.pendingListFolderUri.value?.let { Uri.parse(it) }
+        manager.start(games, folderOverride = override)
+    }
     fun cancelAll() {
         // Clear auto-pause tracking on cancel so it doesn't linger.
         autoPausedByNetworkCallback = false
@@ -210,6 +238,7 @@ class DownloadViewModel @Inject constructor(
 
     fun clearQueue() {
         scanState.downloadQueue.value = emptyList()
+        scanState.pendingListFolderUri.value = null
         manager.clear()
     }
 
@@ -238,6 +267,7 @@ fun DownloadScreen(
     val isPaused by viewModel.isPaused.collectAsState()
     val wifiPauseMessage by viewModel.wifiPauseMessage.collectAsState()
     val customFolder by viewModel.customFolder.collectAsState()
+    val listFolderOverride by viewModel.listFolderOverride.collectAsState()
     val context = LocalContext.current
     // B11: Snackbar host for transient "open folder" error feedback.
     val snackbarHostState = remember { SnackbarHostState() }
@@ -401,9 +431,17 @@ fun DownloadScreen(
                         )
                     }
                     Spacer(Modifier.height(4.dp))
+                    // Show the per-list folder override when set; fall back to the global folder.
                     Text(
-                        text = customFolder?.let { "Folder: ${it.lastPathSegment ?: "selected"}" }
-                            ?: "Folder: app-private (Android/data/.../files/Download/ROMs)",
+                        text = run {
+                            val lfo = listFolderOverride
+                            val cf = customFolder
+                            when {
+                                lfo != null -> "Folder (list): ${lfo.lastPathSegment ?: "selected"}"
+                                cf  != null -> "Folder: ${cf.lastPathSegment ?: "selected"}"
+                                else        -> "Folder: app-private (Android/data/.../files/Download/ROMs)"
+                            }
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

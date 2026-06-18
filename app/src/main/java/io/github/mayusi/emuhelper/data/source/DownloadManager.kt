@@ -101,6 +101,12 @@ class DownloadManager @Inject constructor(
      *  settings on each start()/retry(). When false the proven static path runs unchanged. */
     @Volatile private var adaptiveEngine = false
 
+    /** Per-list destination override for the CURRENT batch. Set by start(folderOverride),
+     *  null = use the global Settings download folder. Held on the manager (not just read
+     *  inside start) so a retry() of a task from a custom-folder list re-targets the SAME
+     *  folder instead of silently falling back to the global one. Cleared on clear(). */
+    @Volatile private var activeFolderOverride: Uri? = null
+
     // HARD SAFETY CEILING on simultaneous HTTP connections across ALL files+segments.
     // Without this, concurrentFiles(16) × segmentsPerFile(32) = 512 sockets + 128 MB of
     // buffers could peg the CPU/network and thermally force-shutdown a handheld (which
@@ -121,7 +127,10 @@ class DownloadManager @Inject constructor(
     @Volatile private var lastNotifProgressMs = 0L
     private val NOTIF_PROGRESS_INTERVAL_MS = 1500L
 
-    fun start(games: List<CuratedGame>) {
+    /** @param folderOverride when non-null, this batch downloads into THIS SAF tree instead of
+     *  the global Settings download folder. Used by per-list custom destinations (a saved list
+     *  can pin its own folder, e.g. PS1 on internal, N64 on the SD card). */
+    fun start(games: List<CuratedGame>, folderOverride: Uri? = null) {
         // B2: Atomic check-and-set prevents two concurrent callers (e.g. LaunchedEffect
         // refiring) from both passing the guard and spinning up duplicate batch jobs.
         synchronized(this) {
@@ -129,6 +138,8 @@ class DownloadManager @Inject constructor(
             if (games.isEmpty()) return
             _isRunning.value = true
         }
+        // Remember the override for the whole batch so retry() of any task lands in the same place.
+        activeFolderOverride = folderOverride
         _isPaused.value = false
         cancelRequested = false
         batchHistoryRecorded.set(false)
@@ -141,7 +152,8 @@ class DownloadManager @Inject constructor(
             // app was killed in that window, the queue wasn't persisted and the resume banner
             // never appeared. The resume guarantee requires this to complete first.
             queueStore.save(games)
-            val chosenUri = settings.downloadFolder.first()
+            // Per-list override wins over the global folder when one is pinned.
+            val chosenUri = activeFolderOverride ?: settings.downloadFolder.first()
             // Clamp to SAFE ceilings. Files-at-once is the dangerous multiplier, so cap
             // it low (downloads are network-bound; 2-3 files saturates the source host).
             concurrentFiles = settings.concurrency.first().coerceIn(1, 4)
@@ -240,7 +252,8 @@ class DownloadManager @Inject constructor(
         }
         if (shouldLaunch) DownloadService.start(appContext)
         scope.launch {
-            val chosenUri = settings.downloadFolder.first()
+            // Honour the active per-list override so a retry re-targets the same custom folder.
+            val chosenUri = activeFolderOverride ?: settings.downloadFolder.first()
             // B11: Re-run the SAF folder-permission check before re-downloading.
             val permError = checkFolderPermission(chosenUri)
             if (permError != null) {
@@ -322,6 +335,8 @@ class DownloadManager @Inject constructor(
     /** Reset visible state when the user leaves a finished batch. */
     fun clear() {
         if (_isRunning.value) return
+        // Drop the per-list folder override so the next non-list batch uses the global folder.
+        activeFolderOverride = null
         // B4: Attempt to record history via the same CAS guard used at batch-end.
         // If batch-end already recorded, the CAS in recordBatchHistory returns early (no-op).
         // Reset the AtomicBoolean BEFORE launching so the next batch starts clean,
@@ -648,7 +663,10 @@ class DownloadManager @Inject constructor(
                 timestampMillis = now + index,
                 identifier = task.identifier,
                 console = task.console,
-                name = task.name
+                name = task.name,
+                // Carry the source checksum into history so the on-disk Library view can
+                // integrity-verify a file later against the hash it was downloaded with.
+                md5 = task.md5
             )
         }
         historyStore.addAll(entries)

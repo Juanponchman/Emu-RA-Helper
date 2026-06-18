@@ -34,7 +34,20 @@ data class HistoryEntry(
     /** Platform key (e.g. "snes", "gcn"). Blank for legacy entries. */
     val console: String = "",
     /** Human-readable game name. Falls back to [filename] in the UI when blank. */
-    val name: String = ""
+    val name: String = "",
+    /** Lowercase MD5 hex reference hash carried from the source item's metadata
+     *  (via [io.github.mayusi.emuhelper.data.model.DownloadTask.md5]). Used by the on-disk
+     *  Library screen's integrity re-check to compare against a freshly recomputed digest of
+     *  the file on disk. Defaulted to "" for back-compat — same pattern as the identifier/console
+     *  additions above, so existing persisted entries decode unchanged.
+     *
+     *  TODO(DownloadManager): recordBatchHistory() in DownloadManager currently maps each
+     *  terminal DownloadTask -> HistoryEntry but does NOT yet pass `md5 = task.md5`. Until that
+     *  one-line addition is made (DownloadManager internals are out of scope for this change),
+     *  this field stays "" for newly recorded entries, so the Library's integrity re-check shows
+     *  "no reference hash" rather than a match/mismatch. The on-disk MD5 is still recomputed and
+     *  displayed; only the reference comparison waits on DownloadManager populating this. */
+    val md5: String = ""
 )
 
 /**

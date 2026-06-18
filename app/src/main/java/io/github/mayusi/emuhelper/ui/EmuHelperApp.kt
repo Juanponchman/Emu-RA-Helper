@@ -37,6 +37,7 @@ import io.github.mayusi.emuhelper.ui.search.SearchAllScreen
 import io.github.mayusi.emuhelper.ui.download.DownloadPreviewScreen
 import io.github.mayusi.emuhelper.ui.download.DownloadScreen
 import io.github.mayusi.emuhelper.ui.home.HomeScreen
+import io.github.mayusi.emuhelper.ui.library.LibraryScreen
 import io.github.mayusi.emuhelper.ui.lists.ListLibraryScreen
 import io.github.mayusi.emuhelper.ui.lists.SaveListScreen
 import io.github.mayusi.emuhelper.ui.login.CreateAccountGuideScreen
@@ -81,6 +82,8 @@ object Routes {
     const val DOWNLOAD = "download"
     const val SETTINGS = "settings"
     const val ABOUT = "about"
+    /** On-device library: shows files already downloaded to the chosen folder. */
+    const val LIBRARY = "library"
     const val HISTORY = "history"
     const val SOURCE_HEALTH = "source_health"
     const val ERROR_LOG = "error_log"
@@ -208,6 +211,7 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
                         }
                     },
                     onAbout = { navController.navigate(Routes.ABOUT) },
+                    onLibrary = { navController.navigate(Routes.LIBRARY) },
                     onResume = { queue ->
                         // Seed the interrupted queue into the download flow, then navigate
                         // to the preview screen (mirrors how the normal instant-install flow works).
@@ -235,6 +239,10 @@ fun EmuHelperApp(modifier: Modifier = Modifier) {
 
             composable(Routes.SETTINGS) {
                 SettingsScreen(onBack = { navController.popBackStack() })
+            }
+
+            composable(Routes.LIBRARY) {
+                LibraryScreen(onBack = { navController.popBackStack() })
             }
 
             composable(Routes.ONBOARDING) {

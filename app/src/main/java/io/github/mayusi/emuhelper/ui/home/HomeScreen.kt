@@ -15,6 +15,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Info
@@ -293,6 +294,8 @@ fun HomeScreen(
     onOpenDownloads: () -> Unit = {},
     onEmulatorSetup: () -> Unit = {},
     onAbout: () -> Unit = {},
+    /** Open the on-device library (files already downloaded to the chosen folder). */
+    onLibrary: () -> Unit = {},
     /** Called when the user taps "Resume" on the interrupted-batch banner.
      *  The queue is already seeded into [ScanStateHolder.downloadQueue] before this fires. */
     onResume: ((List<CuratedGame>) -> Unit)? = null,
@@ -509,6 +512,11 @@ fun HomeScreen(
                             text = { Text("Downloads") },
                             leadingIcon = { Icon(Icons.Default.Download, null) },
                             onClick = { menuOpen = false; onOpenDownloads() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("On-device library") },
+                            leadingIcon = { Icon(Icons.Default.FolderOpen, null) },
+                            onClick = { menuOpen = false; onLibrary() }
                         )
                         DropdownMenuItem(
                             text = { Text("Add from a link") },

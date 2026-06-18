@@ -69,9 +69,22 @@ class ListViewModel @Inject constructor(
         viewModelScope.launch { store.rename(id, trimmed) }
     }
 
-    /** Load a saved list into the download queue (all games), then the preview screen filters. */
+    /**
+     * Persist the per-list folder override.
+     * [uri] is the SAF tree URI as a string, or null to clear (revert to global folder).
+     */
+    fun setListFolder(id: String, uri: String?) {
+        viewModelScope.launch { store.setListFolder(id, uri) }
+    }
+
+    /**
+     * Load a saved list into the download queue (all games), then the preview screen filters.
+     * Also carries the list's [GameList.customFolderUri] into [ScanStateHolder.pendingListFolderUri]
+     * so the DownloadViewModel can apply the override without touching DownloadManager internals.
+     */
     fun loadForDownload(list: GameList) {
         scanState.downloadQueue.value = list.games
+        scanState.pendingListFolderUri.value = list.customFolderUri
     }
 
     /** Serialize a list for file export. */

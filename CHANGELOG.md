@@ -4,6 +4,25 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.6.1] - 2026-06-18
+
+### Added
+- **On-device library.** A new "On-device library" view (Home menu) walks your
+  download folder and shows everything you've already pulled, grouped by
+  category folder, with file sizes and a running total. Files that aren't in
+  your download history are flagged as "not tracked", and you can **verify** any
+  file on demand - it re-hashes the file on disk and checks it against the
+  checksum it was downloaded with, so you can confirm a file isn't corrupt
+  (it's opt-in per file, to spare your battery on big libraries).
+- **Per-list download folders.** Each saved list can now have its own
+  destination folder, overriding the global one - so you can keep, say, PS1 on
+  internal storage and N64 on the SD card. Set it from the list's menu
+  ("Set download folder"), or clear it back to the default. Downloads (and
+  retries) from that list land in the folder you pinned.
+- **Favourite consoles.** Star the categories you use most and they float to the
+  top of the category picker, so you're not scrolling past everything you don't
+  use every time. Independent of the "remember last selection" tick.
+
 ## [0.6.0] - 2026-06-17
 
 ### Added

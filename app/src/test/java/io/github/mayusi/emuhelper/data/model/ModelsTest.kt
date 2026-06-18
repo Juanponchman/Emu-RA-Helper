@@ -110,4 +110,63 @@ class ModelsTest {
         assertEquals(0L, list.totalSize)
         assertEquals(0, list.count)
     }
+
+    // ---- GameList.customFolderUri -------------------------------------------
+
+    @Test
+    fun `GameList customFolderUri defaults to null`() {
+        val list = GameList(id = "1", name = "Test", createdAt = 0L, games = emptyList())
+        assertEquals(null, list.customFolderUri)
+    }
+
+    @Test
+    fun `GameList customFolderUri can be set to a URI string`() {
+        val uri = "content://com.android.externalstorage.documents/tree/primary%3AROMs%2FPS1"
+        val list = GameList(
+            id = "2",
+            name = "PS1 games",
+            createdAt = 1234L,
+            games = emptyList(),
+            customFolderUri = uri
+        )
+        assertEquals(uri, list.customFolderUri)
+    }
+
+    @Test
+    fun `GameList copy preserves customFolderUri when not overridden`() {
+        val uri = "content://example.authority/tree/primary%3ATest"
+        val original = GameList(id = "3", name = "Original", createdAt = 0L, games = emptyList(), customFolderUri = uri)
+        val copy = original.copy(name = "Renamed")
+        assertEquals(uri, copy.customFolderUri)
+    }
+
+    @Test
+    fun `GameList copy can clear customFolderUri to null`() {
+        val original = GameList(
+            id = "4",
+            name = "With folder",
+            createdAt = 0L,
+            games = emptyList(),
+            customFolderUri = "content://example.authority/tree/primary%3ATest"
+        )
+        val cleared = original.copy(customFolderUri = null)
+        assertEquals(null, cleared.customFolderUri)
+    }
+
+    @Test
+    fun `GameList with customFolderUri still computes totalSize correctly`() {
+        val games = listOf(
+            CuratedGame(name = "A", size = 100L),
+            CuratedGame(name = "B", size = 200L)
+        )
+        val list = GameList(
+            id = "5",
+            name = "With folder",
+            createdAt = 0L,
+            games = games,
+            customFolderUri = "content://example/tree/root"
+        )
+        assertEquals(300L, list.totalSize)
+        assertEquals(2, list.count)
+    }
 }

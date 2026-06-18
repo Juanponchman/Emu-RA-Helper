@@ -43,6 +43,13 @@ class ScanStateHolder @Inject constructor() {
     val downloadQueue = MutableStateFlow<List<io.github.mayusi.emuhelper.data.model.CuratedGame>>(emptyList())
     /** Games handed from the picker (BUILD mode) to the Save-list screen. */
     val pendingListGames = MutableStateFlow<List<io.github.mayusi.emuhelper.data.model.CuratedGame>>(emptyList())
+    /**
+     * Per-list download folder override (SAF tree URI string) set when the user opens a saved
+     * list that has [io.github.mayusi.emuhelper.data.model.GameList.customFolderUri] != null.
+     * Null means "use the global download folder from SettingsStore".
+     * Consumed by [io.github.mayusi.emuhelper.ui.download.DownloadViewModel] at download start.
+     */
+    val pendingListFolderUri = MutableStateFlow<String?>(null)
 
     /**
      * Release the large scannedFiles map (can be 10s of MB) once the user has committed

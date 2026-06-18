@@ -37,6 +37,7 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         val KEY_LAST_UPDATE_CHECK = longPreferencesKey("last_update_check_ts")
         val KEY_DISMISSED_UPDATE_TAG = stringPreferencesKey("dismissed_update_tag")
         val KEY_LAST_CONSOLES = stringSetPreferencesKey("last_selected_consoles")
+        val KEY_FAVORITE_CONSOLES = stringSetPreferencesKey("favorite_consoles")
         // ---- Theme mode (Feature 1) -------------------------------------------
         private val KEY_THEME_MODE = stringPreferencesKey("theme_mode")
         // ---- Remote catalog cache --------------------------------------------
@@ -146,6 +147,17 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setLastSelectedConsoles(consoles: Set<String>) {
         context.settingsStore.edit { it[KEY_LAST_CONSOLES] = consoles }
+    }
+
+    // ---- Favorite consoles -----------------------------------------------
+
+    val favoriteConsoles: Flow<Set<String>> = context.settingsStore.data.map { it[KEY_FAVORITE_CONSOLES] ?: emptySet() }
+
+    suspend fun toggleFavoriteConsole(key: String) {
+        context.settingsStore.edit { prefs ->
+            val current = prefs[KEY_FAVORITE_CONSOLES] ?: emptySet()
+            prefs[KEY_FAVORITE_CONSOLES] = if (key in current) current - key else current + key
+        }
     }
 
     // ---- Theme mode (Feature 1) -------------------------------------------

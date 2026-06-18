@@ -13,6 +13,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.FolderOff
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -28,6 +30,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import io.github.mayusi.emuhelper.data.model.GameList
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import io.github.mayusi.emuhelper.ui.common.formatSize
+import io.github.mayusi.emuhelper.ui.common.rememberFolderPicker
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -100,6 +103,17 @@ fun ListLibraryScreen(
 
     // Export: remember which list, then write its JSON to the chosen file.
     var exportTarget by remember { mutableStateOf<GameList?>(null) }
+
+    // Per-list folder picker: track which list we're picking a folder for.
+    var folderPickTarget by remember { mutableStateOf<GameList?>(null) }
+    val folderPicker = rememberFolderPicker { uri ->
+        val target = folderPickTarget
+        if (target != null) {
+            viewModel.setListFolder(target.id, uri.toString())
+            scope.launch { snackbar.showSnackbar("Download folder set for \"${target.name}\".") }
+        }
+        folderPickTarget = null
+    }
     val exporter = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
     ) { uri ->
@@ -275,6 +289,18 @@ fun ListLibraryScreen(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
+                                // Show per-list folder override when set.
+                                if (list.customFolderUri != null) {
+                                    val folderLabel = android.net.Uri.parse(list.customFolderUri)
+                                        .lastPathSegment ?: "custom folder"
+                                    Text(
+                                        "Folder: $folderLabel",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                             Box {
                                 IconButton(onClick = { menuOpen = true }) {
@@ -290,6 +316,26 @@ fun ListLibraryScreen(
                                             renameTarget = list
                                         }
                                     )
+                                    DropdownMenuItem(
+                                        text = { Text("Set download folder") },
+                                        leadingIcon = { Icon(Icons.Default.Folder, null) },
+                                        onClick = {
+                                            menuOpen = false
+                                            folderPickTarget = list
+                                            folderPicker.launch(null)
+                                        }
+                                    )
+                                    if (list.customFolderUri != null) {
+                                        DropdownMenuItem(
+                                            text = { Text("Use default folder") },
+                                            leadingIcon = { Icon(Icons.Default.FolderOff, null) },
+                                            onClick = {
+                                                menuOpen = false
+                                                viewModel.setListFolder(list.id, null)
+                                                scope.launch { snackbar.showSnackbar("Reverted to default folder for \"${list.name}\".") }
+                                            }
+                                        )
+                                    }
                                     DropdownMenuItem(
                                         text = { Text("Export to file") },
                                         leadingIcon = { Icon(Icons.Default.FileDownload, null) },

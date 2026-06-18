@@ -51,7 +51,11 @@ data class GameList(
     val id: String,
     val name: String,
     val createdAt: Long,
-    val games: List<CuratedGame>
+    val games: List<CuratedGame>,
+    /** SAF tree URI (as a string) for the per-list download folder override, or null to use the
+     *  global download folder from [io.github.mayusi.emuhelper.data.storage.SettingsStore].
+     *  Nullable with a default so existing saved lists (which lack this key) deserialise fine. */
+    val customFolderUri: String? = null
 ) {
     val totalSize: Long get() = games.sumOf { it.size }
     val count: Int get() = games.size

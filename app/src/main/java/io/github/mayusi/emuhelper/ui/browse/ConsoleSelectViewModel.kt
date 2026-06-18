@@ -29,6 +29,17 @@ class ConsoleSelectViewModel @Inject constructor(
         }
     }
 
+    // ---- Favorite consoles -----------------------------------------------
+
+    val favoriteConsoles: StateFlow<Set<String>> =
+        settings.favoriteConsoles.stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
+
+    fun toggleFavorite(key: String) {
+        viewModelScope.launch {
+            settings.toggleFavoriteConsole(key)
+        }
+    }
+
     // ---- Remote catalog refresh ------------------------------------------
 
     /** True while a refresh network call is in progress. */
