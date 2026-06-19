@@ -57,7 +57,7 @@ class SettingsViewModel @Inject constructor(
     val concurrency: StateFlow<Int> = settings.concurrency.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), DEFAULT_CONCURRENCY)
     val extractArchives: StateFlow<Boolean> = settings.extractArchives.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
     val wifiOnly: StateFlow<Boolean> = settings.wifiOnly.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
-    val adaptiveEngine: StateFlow<Boolean> = settings.adaptiveEngine.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+    val adaptiveEngine: StateFlow<Boolean> = settings.adaptiveEngine.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
     val themeMode: StateFlow<ThemeMode> = settings.themeMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ThemeMode.SYSTEM)
     val downloadFolder: StateFlow<Uri?> = settings.downloadFolder.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
@@ -254,12 +254,12 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
                         Text(
-                            "Adaptive download engine",
+                            "Faster multi-mirror downloads",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            "Faster downloads by racing Internet Archive mirrors. Experimental — turn off if downloads misbehave.",
+                            "Reuses warm connections and spreads across Internet Archive mirrors. On by default — turn off to use the simpler single-path downloader if downloads ever misbehave.",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

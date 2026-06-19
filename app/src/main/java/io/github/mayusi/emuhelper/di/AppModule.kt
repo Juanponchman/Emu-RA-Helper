@@ -319,7 +319,21 @@ object AppModule {
         }
         return OkHttpClient.Builder()
             .dispatcher(dispatcher)
-            .connectionPool(okhttp3.ConnectionPool(24, 30, TimeUnit.SECONDS))
+            // WARM-LANE REUSE (v3 laned engine): the durable resource is a small set of warm h2
+            // connections, ~2 PINNED per mirror, reused for every 8 MB chunk on that lane. For
+            // OkHttp to reuse the SAME warm connection across chunks, the idle connection must
+            // survive the brief gap between one chunk finishing and the next ranged GET starting on
+            // that lane. The old pool (24 idle, 30s keep-alive) evicted aggressively under churn and
+            // the lane could pay a fresh TCP/TLS handshake + h2 slow-start on the next chunk. Widen
+            // the keep-alive to 5 MINUTES so a pinned lane's connection stays warm for the whole
+            // file; 8 max-idle is plenty (~2/host × up to 3 mirrors = ~6 warm sockets) without
+            // hoarding. This is the change that lets the laned engine kill the per-chunk slow-start
+            // tax (measured 8× median-vs-peak gap on the old per-chunk-host-repick engine).
+            .connectionPool(okhttp3.ConnectionPool(8, 5, TimeUnit.MINUTES))
+            // Hygiene: state the protocol preference explicitly. IA serves HTTP/2 end-to-end and
+            // OkHttp already negotiates h2 via ALPN, but pinning the list documents intent and keeps
+            // h2 (multiplexed, low-handshake) first with http/1.1 as the graceful fallback.
+            .protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(180, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)

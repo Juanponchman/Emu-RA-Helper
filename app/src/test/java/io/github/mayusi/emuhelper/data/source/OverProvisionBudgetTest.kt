@@ -143,6 +143,57 @@ class OverProvisionBudgetTest {
     }
 
     @Test
+    fun `laned runners plus tail racers never exceed the shared semaphore capacity`() = runBlocking {
+        // v3: the laned engine spawns one PINNED runner per planned stream (Σ ~mirrors×2) plus tail
+        // racers (tryAcquire). All of them share the global 24-permit Semaphore. This asserts the #1
+        // safety invariant holds for the LANED topology specifically: combined runners + racers never
+        // hold more than `capacity` permits at once — the same acquire/release discipline the engine
+        // uses (runners acquire(); racers tryAcquire()). A handheld thermally shut down once; this is
+        // the non-negotiable guard.
+        val capacity = 24
+        val budget = Semaphore(capacity)
+        val gauge = PermitGauge(capacity)
+        // Plan lanes for 3 mirrors (the max IA case) — flatten to runners exactly like the engine.
+        val mirrors = listOf("https://m1/x", "https://m2/x", "https://m3/x")
+        val lanes = planLanes(mirrors, budget = capacity)
+        val runnerHosts = lanes.flatMap { lane -> List(lane.streams) { lane.host } }
+        assertTrue(runnerHosts.isNotEmpty(), "lane plan must produce runners")
+
+        val raceAttempts = AtomicLong(0)
+        withContext(Dispatchers.Default) {
+            coroutineScope {
+                // PINNED runners: blocking acquire(), like the real primary lane runners.
+                val runners = runnerHosts.map { _ ->
+                    async {
+                        repeat(40) {
+                            budget.acquire()
+                            try { gauge.onAcquire(); delay(1) }
+                            finally { gauge.onRelease(); budget.release() }
+                        }
+                    }
+                }
+                // Extra tail racers using tryAcquire — they must NEVER push the total over the cap.
+                val racers = (0 until 16).map {
+                    async {
+                        repeat(40) {
+                            raceAttempts.incrementAndGet()
+                            if (budget.tryAcquire()) {
+                                try { gauge.onAcquire(); delay(1) }
+                                finally { gauge.onRelease(); budget.release() }
+                            } else delay(1)
+                        }
+                    }
+                }
+                (runners + racers).awaitAll()
+            }
+        }
+        assertEquals(0, gauge.violations.get(), "laned runners + racers must NEVER exceed the cap")
+        assertTrue(gauge.peak.get() <= capacity, "peak ${gauge.peak.get()} must be <= $capacity")
+        assertEquals(0, gauge.current(), "all permits released at the end (no leak)")
+        assertTrue(raceAttempts.get() > 0, "racers must have attempted")
+    }
+
+    @Test
     fun `worker over-provision count scales toward the budget but is bounded by chunk count`() {
         // Mirror the engine's worker-count formula directly (no network): the pool is over-
         // provisioned UP toward MAX_ADAPTIVE_WORKERS but never exceeds the chunk count, and never

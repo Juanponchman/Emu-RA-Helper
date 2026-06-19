@@ -125,6 +125,132 @@ internal object AdaptiveEngine {
      * regardless; this just bounds per-chunk duplication.
      */
     const val MAX_RACERS_PER_CHUNK: Int = 1
+
+    // ===================================================================================
+    // v3 LANED ENGINE — HOST-PINNED WARM-CONNECTION LANES.
+    //
+    // MEASURED on a real on-device IA connection sweep:
+    //   - IA serves HTTP/2 end-to-end; OkHttp 4.12 negotiates h2.
+    //   - Each item is served from 2 GENUINELY INDEPENDENT mirror datacenters (ia6xxxxx +
+    //     ia8xxxxx; sometimes a 3rd dn7xxxxx.ca node). The live list comes from metadata's
+    //     workable_servers / alternate_locations.workable.
+    //   - Per-connection throttle ~1.2 MB/s; per-host ceiling ~2 MB/s. Past ~4 connections to ONE
+    //     host, IA SHEDS LOAD (we saw 3/8 conns fail). So never exceed ~4 streams/host.
+    //   - THE KEY LEVER: spreading across the 2 independent datacenters nearly DOUBLES throughput
+    //     (4 conns one host = 2.00 MB/s; 2+2 split across 2 hosts = 3.86 MB/s, +93% for the SAME
+    //     connection count). SPREAD is the lever, not raw count.
+    //   - The v1/v2 adaptive engine re-picked the host per 8 MB chunk, so OkHttp could not reuse a
+    //     warm h2 connection — every chunk paid the TCP/TLS handshake + slow-start tax (measured 8x
+    //     median-vs-peak gap). The laned engine PINS each lane runner to one host for the file's
+    //     whole duration, so OkHttp reuses the SAME warm h2 connection for every chunk on that lane
+    //     (the connection pool keep-alive must outlive the brief gaps between chunks — see
+    //     AppModule's widened ConnectionPool). This kills slow-start.
+    // ===================================================================================
+
+    /**
+     * PREFERRED streams (warm h2 lane runners) per mirror host (v3). The measured stable sweet spot
+     * is ~2/host: two connections nearly saturate a host's ~2 MB/s ceiling, and the throughput win
+     * comes from SPREADING these pairs across the independent datacenters, not from piling more onto
+     * one host. [planLanes] aims for this per host, shrinking only if the global budget can't fund it.
+     */
+    const val PREFERRED_STREAMS_PER_HOST: Int = 2
+
+    /**
+     * HARD cap on streams to a SINGLE host (v3). IA sheds load past ~4 connections to one host
+     * (measured: 3/8 failed). [planLanes] never assigns more than this to any one host even when
+     * there is only one mirror and budget to spare — going past it COSTS throughput, it doesn't add.
+     */
+    const val MAX_STREAMS_PER_HOST: Int = 4
+}
+
+/**
+ * One LANE in the laned engine (v3): a host plus the number of warm, host-PINNED stream runners to
+ * open against it. Each runner reuses ONE warm h2 connection for every chunk it pulls (no per-chunk
+ * host re-pick), so OkHttp's connection pool serves all of that runner's chunks off the same socket.
+ *
+ * [streams] is how many concurrent runners pin THIS host. The sum of [streams] across all lanes is
+ * the file's nominal warm-stream count; at runtime every runner still acquires a shared
+ * connectionBudget permit before opening its socket, so the global 24-cap holds regardless.
+ */
+internal data class Lane(val host: String, val streams: Int)
+
+/**
+ * Plan the laned topology for a SINGLE file (v3) — PURE, Android-free, unit-testable.
+ *
+ * Given the distinct workable mirror hosts and the global connection [budget], return one [Lane] per
+ * host with a streams-per-host count that:
+ *   - prefers [AdaptiveEngine.PREFERRED_STREAMS_PER_HOST] (~2) per host — the measured sweet spot,
+ *   - never exceeds [AdaptiveEngine.MAX_STREAMS_PER_HOST] (~4) per host — past that IA sheds load,
+ *   - keeps Σ streams ≤ [budget] (the global 24-cap, shared across files via the Semaphore),
+ *   - SPREADS across ALL available mirrors before deepening any one (never piles all streams on a
+ *     single host when >1 mirror exists — spread is the throughput lever),
+ *   - returns at least 1 stream total whenever ≥1 host and budget ≥1 exist.
+ *
+ * Allocation is breadth-first by rounds: round 1 gives every host its 1st stream, round 2 its 2nd,
+ * etc., stopping at the per-host PREFERENCE and at the global budget. Breadth-first is what
+ * guarantees the spread invariant — with 2 hosts and budget 4 you get 2+2, never 4+0.
+ *
+ * For the MULTI-mirror case the preference (~2/host) IS the target — spread across the independent
+ * datacenters is the throughput lever, NOT raw depth, and going past ~2/host adds connections that
+ * just split a host's ~2 MB/s ceiling. Only the SINGLE-mirror case deepens past the preference (up
+ * to the per-host hard cap) so a lone-mirror file still gets a few warm streams instead of one.
+ *
+ * @param allowDeepen when true AND there is exactly one mirror, that lone lane may grow past the
+ *   preference up to [maxPerHost]. For the multi-mirror case the preference is always the target
+ *   (deepening is suppressed) — spread, don't pile on. Default true.
+ */
+internal fun planLanes(
+    mirrors: List<String>,
+    budget: Int,
+    preferredPerHost: Int = AdaptiveEngine.PREFERRED_STREAMS_PER_HOST,
+    maxPerHost: Int = AdaptiveEngine.MAX_STREAMS_PER_HOST,
+    allowDeepen: Boolean = true
+): List<Lane> {
+    val distinct = mirrors.distinct().filter { it.isNotBlank() }
+    if (distinct.isEmpty() || budget <= 0) return emptyList()
+    val cap = budget.coerceAtLeast(1)
+    val pref = preferredPerHost.coerceIn(1, maxPerHost)
+    val hardPerHost = maxPerHost.coerceAtLeast(1)
+
+    // Streams assigned to each host, indexed alongside `distinct`. Start at 0; fill breadth-first.
+    val streams = IntArray(distinct.size)
+    var assigned = 0
+
+    // PHASE 1: breadth-first up to the PREFERRED per-host count. Each round adds one stream to every
+    // host that is still under the preference, so spread always wins over depth (2 hosts, budget 4
+    // -> 2+2). Stop when the budget is exhausted or every host reached the preference.
+    var round = 0
+    while (assigned < cap && round < pref) {
+        var progressed = false
+        for (i in distinct.indices) {
+            if (assigned >= cap) break
+            if (streams[i] < pref) {
+                streams[i]++
+                assigned++
+                progressed = true
+            }
+        }
+        if (!progressed) break
+        round++
+    }
+
+    // PHASE 2 (deepen) — SINGLE-MIRROR ONLY. With just one workable mirror, spreading isn't possible,
+    // so let that lone lane grow past the preference up to the per-host HARD cap (~4) — but NEVER
+    // beyond it (past ~4/host IA sheds load). For the multi-mirror case we deliberately STOP at the
+    // preference: more depth on an already-spread plan just splits a host's ceiling, it doesn't add
+    // throughput (the measured lever is spread across datacenters, not raw count).
+    if (allowDeepen && distinct.size == 1) {
+        while (assigned < cap && streams[0] < hardPerHost) {
+            streams[0]++
+            assigned++
+        }
+    }
+
+    val lanes = ArrayList<Lane>(distinct.size)
+    for (i in distinct.indices) {
+        if (streams[i] > 0) lanes.add(Lane(distinct[i], streams[i]))
+    }
+    return lanes
 }
 
 /**
@@ -542,6 +668,17 @@ internal class RecentRateWindow(
 
     /** Number of samples currently buffered (caps at [capacity]). */
     fun sampleCount(): Int = synchronized(lock) { size }
+
+    /**
+     * Bench-only: a snapshot copy of all currently-buffered per-chunk throughput samples
+     * (bytes/ms) in ring-insertion order. Used at download completion to compute median
+     * and peak rates for the diagnostic log line. Returns an empty array when empty.
+     * Thread-safe: holds [lock] while copying, so no concurrent [record] can interleave.
+     */
+    fun snapshotSamples(): DoubleArray = synchronized(lock) {
+        if (size == 0) return DoubleArray(0)
+        DoubleArray(size) { i -> buf[i] }
+    }
 
     /**
      * Median of the buffered completed-chunk rates (bytes/ms), or 0.0 when empty. Median (not

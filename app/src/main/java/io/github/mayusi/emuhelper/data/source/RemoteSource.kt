@@ -552,6 +552,16 @@ class RemoteSource @Inject constructor(
             }.awaitAll()
         }
         val total = downloadedTotal.get()
+        // DIAG static bench: log in the same tag as the adaptive path so one grep compares both.
+        // segments == the number of parallel connections used (one coroutine per range).
+        val staticWallMs = (System.currentTimeMillis() - startTime).coerceAtLeast(1)
+        val staticMb = total.toDouble() / (1024.0 * 1024.0)
+        val staticMbps = staticMb / (staticWallMs / 1000.0)
+        Log.i(
+            "EmuHelper-ADAPTIVE-BENCH",
+            "static: ${"%.1f".format(staticMb)}MB in ${"%.1f".format(staticWallMs / 1000.0)}s = " +
+                "${"%.2f".format(staticMbps)}MB/s, segments=$segments peakConns=$segments"
+        )
         onProgress(total, 0.0)
         total
     }
@@ -579,11 +589,10 @@ class RemoteSource @Inject constructor(
         destFile: File,
         workerHint: Int,
         connectionBudget: Semaphore,
-        // FIX B: real measured probe rates (bytes/ms) per host, used to seed the EWMA in correct
-        // units. May be empty (single host, probe failed, or unit test) -> falls back to the
-        // scoreboard's small default prior, which is safe because soft-stall is independently
-        // gated on the RecentRateWindow's min-sample guardrail, not on the seed.
-        probeRates: Map<String, Double>,
+        // v3: formerly the EWMA seed source for the (now-retired) per-chunk HostScoreboard. The
+        // laned engine pins hosts and does NOT score per chunk, so this is unused — kept only so the
+        // static-path call site needn't change. Suppress the unused warning.
+        @Suppress("UNUSED_PARAMETER") probeRates: Map<String, Double>,
         onProgress: suspend (Long, Double) -> Unit,
         isCancelled: () -> Boolean
     ): Long {
@@ -595,19 +604,14 @@ class RemoteSource @Inject constructor(
         val chunks = partitionChunks(expectedSize)
         val queue = ChunkQueue(chunks)
 
-        // FIX B: seed EWMA in CORRECT units (bytes/ms) from the rankHosts() probe's actual measured
-        // rate per host. The OLD seed was "slot-count × 100" (range 100-400) which is NOT bytes/ms
-        // — recordSuccess feeds bytesThisChunk/ms (thousands), so the EWMA climbed into the
-        // thousands while the seed stayed tiny, making the old soft-stall baseline wrong-scaled.
-        // Unseeded hosts fall back to HostScoreboard's small default prior. The soft-stall baseline
-        // no longer depends on this seed at all (it uses the RecentRateWindow), so an absent seed
-        // is fully safe — it only biases initial host PREFERENCE, not the stall decision.
-        val seed: Map<String, Double> = distinctHosts.mapNotNull { h ->
-            probeRates[h]?.takeIf { it > 0.0 }?.let { h to it }
-        }.toMap()
-        val scoreboard = HostScoreboard(distinctHosts, seedEwma = seed)
+        // v3 RETIRED the per-chunk HostScoreboard.pickHost() re-pick. The laned engine PINS each
+        // runner to one host (see below), so there is no per-chunk host selection to score: warm h2
+        // reuse comes from the pin, not from a live scoreboard. Host failover is handled coarsely by
+        // the liveHosts set (a dead lane is dropped), not by per-chunk EWMA weighting. [probeRates]
+        // (the old EWMA seed source) is therefore unused now — kept in the signature only so the
+        // static-path call site needn't change.
 
-        // FIX B: the CURRENT, decaying soft-stall baseline. A ring buffer of the last N
+        // The CURRENT, decaying soft-stall baseline. A ring buffer of the last N
         // completed-chunk throughputs across ALL hosts. The soft-stall decision compares a chunk's
         // sustained rate against the MEDIAN of these real recent rates (not a never-decaying peak),
         // and is DISABLED until enough samples exist (the min-sample guardrail).
@@ -622,21 +626,83 @@ class RemoteSource @Inject constructor(
         var lastReport = startTime
         val reportLock = Any()
 
-        // v2 OVER-PROVISION the worker pool. v1 capped workers at `segments` (workerHint), so a
-        // single big file never opened more than `segments` connections even when the global
-        // 24-permit connectionBudget was free — leaving IA's other fast nodes idle. Now we scale
-        // UP toward [AdaptiveEngine.MAX_ADAPTIVE_WORKERS] (the global ceiling), still bounded by
-        // the chunk count (no point exceeding chunks). The SAFETY INVARIANT is unchanged and
-        // enforced at runtime, NOT here: every worker (and every racer) acquire()s a permit from
-        // the shared connectionBudget before opening a socket and releases it in a finally, so the
-        // total concurrent permits across ALL files+workers+racers is <= the Semaphore's capacity
-        // (24) no matter how many workers are spawned. Spawning more workers than free permits is
-        // safe: the extras simply block on acquire() until a permit frees, and yield to other
-        // concurrent files that share the same Semaphore. workerHint stays the FLOOR.
-        val workerCount = workerHint
+        // v3 LANED TOPOLOGY. The durable resource is a small set of WARM, host-PINNED stream
+        // runners — NOT a big over-provisioned pool that re-picks the host per chunk. [planLanes]
+        // assigns ~2 streams per mirror (the measured sweet spot), spread across the (2-3)
+        // independent IA datacenters, never exceeding ~4/host (past that IA sheds load) and never
+        // exceeding the global budget. Each resulting runner PINS one host for the file's whole
+        // duration, so OkHttp reuses the SAME warm h2 connection for every chunk that runner pulls
+        // (the connection pool keep-alive — see AppModule's widened ConnectionPool — outlives the
+        // brief gaps between chunks). That reuse is what kills the per-chunk slow-start tax the
+        // v1/v2 per-chunk-host-repick engine paid (measured 8x median-vs-peak gap).
+        //
+        // workerHint (segmentsPerFile) is a FLOOR for the budget the file may use, but the actual
+        // permit cap is still the shared connectionBudget Semaphore (24): every runner AND every
+        // racer acquire()s a permit before opening a socket and releases it in a finally, so the
+        // global cap holds regardless of how many runners exist. We size the lane plan to the
+        // smaller of (the shared budget ceiling) and (chunk count) so we never spawn more runners
+        // than there is work for; the runner FLOOR keeps small files responsive.
+        val laneBudget = workerHint
             .coerceAtLeast(1)
             .coerceAtLeast(minOf(chunks.size, AdaptiveEngine.MAX_ADAPTIVE_WORKERS))
             .coerceIn(1, chunks.size)
+        // Plan the warm-lane topology: one Lane per host with its streams-per-host count.
+        val lanes = planLanes(distinctHosts, laneBudget).ifEmpty {
+            // Degenerate fallback (no usable host) — single lane on whatever host we have.
+            listOf(Lane(distinctHosts.first(), 1))
+        }
+        // Flatten lanes into one PINNED-HOST runner per stream. Each runner carries the host it is
+        // pinned to; it never re-picks per chunk (warm h2 reuse). Multiple runners can pin the same
+        // host (e.g. 2 streams/host).
+        val laneRunners: List<String> = lanes.flatMap { lane -> List(lane.streams) { lane.host } }
+        val workerCount = laneRunners.size
+        // Live mirror set for failover: a host that exhausts its lane error budget is removed here
+        // so its pinned runners re-target to a SURVIVING host on their next chunk (redistributing
+        // the dead lane's stream budget to survivors without exceeding the global cap — the
+        // Semaphore is unchanged). Seeded with every planned host.
+        val liveHosts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>().apply {
+            addAll(distinctHosts)
+        }
+        // Per-host consecutive-error tally for lane death (mirror dies mid-download). A host that
+        // racks up this many real transport errors across its lane is declared dead and removed
+        // from [liveHosts]; its in-flight chunks are already requeued by the normal error path, so
+        // survivors finish them. Reset on any success on that host.
+        val hostErrorStreak = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+        // A host is declared dead after this many CONSECUTIVE real errors (no intervening success).
+        // Generous so a single transient blip never kills a mirror, but a genuinely-down datacenter
+        // is dropped before it wastes the whole error budget.
+        val laneDeathThreshold = AdaptiveEngine.MAX_ERROR_ATTEMPTS
+        // Pick a still-live host for a runner whose pinned host died, or fall back to the pinned host
+        // if somehow none survive (the queue's error budget then governs final failure). Prefer a
+        // host DIFFERENT from [avoid] so a racer spreads across datacenters.
+        val pickLiveHost: (pinned: String, avoid: String?) -> String = { pinned, avoid ->
+            if (pinned in liveHosts && pinned != avoid) {
+                pinned
+            } else {
+                val live = liveHosts.toList()
+                live.firstOrNull { it != avoid }
+                    ?: live.firstOrNull()
+                    ?: pinned
+            }
+        }
+        // Record the outcome of a chunk attempt on [host] for lane-failover bookkeeping. A success
+        // resets the streak and re-confirms the host live; a real error bumps the streak and, past
+        // the threshold, declares the lane dead (removed from liveHosts) so its runners re-target.
+        val onHostOutcome: (host: String, ok: Boolean) -> Unit = { host, ok ->
+            if (ok) {
+                hostErrorStreak[host]?.set(0)
+                liveHosts.add(host)
+            } else {
+                val streak = hostErrorStreak.computeIfAbsent(host) {
+                    java.util.concurrent.atomic.AtomicInteger(0)
+                }.incrementAndGet()
+                // Only kill a lane while at least one OTHER host survives — never strand the file.
+                if (streak >= laneDeathThreshold && liveHosts.size > 1) {
+                    liveHosts.remove(host)
+                    Log.w("EmuHelper", "lane died: $host (streak=$streak) — redistributing to survivors")
+                }
+            }
+        }
 
         // v2 BENCH stats (cheap, aggregated at completion — no per-chunk spam). Concurrent permit
         // tracking lets us log the PEAK simultaneous connections actually used; race counters let
@@ -653,6 +719,39 @@ class RemoteSource @Inject constructor(
         }
         val onConnReleased: () -> Unit = { liveConns.decrementAndGet() }
 
+        // ---- DIAGNOSTIC BENCH COLLECTORS (instrumentation-only, zero behavior change) ----
+        // (1) Protocol collector: counts how many chunks were served over each HTTP protocol
+        //     (e.g. "h2", "http/1.1"). Many workers write concurrently -> ConcurrentHashMap.
+        val protocolCounts = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+
+        // (2) Per-host byte+ms accumulators for MB/s breakdown. Value is a 2-element LongArray
+        //     [totalBytes, totalMs]. We use a ConcurrentHashMap for the outer map (concurrent
+        //     insertions from multiple workers) and AtomicLong pairs for each host's counters
+        //     so workers accumulate without locking each other. Each host entry is a 2-element
+        //     AtomicLongArray: [0]=totalBytes [1]=totalMs.
+        val hostStats = java.util.concurrent.ConcurrentHashMap<String,
+            Array<java.util.concurrent.atomic.AtomicLong>>()
+
+        val onChunkCompleted: (host: String, bytes: Long, elapsedMs: Long, protocol: String) -> Unit =
+            { host, bytes, elapsedMs, protocol ->
+                // Protocol counts (answers: H2 vs HTTP/1.1?).
+                // computeIfAbsent is the atomic ConcurrentHashMap primitive — safe under concurrent
+                // writes from many workers; Kotlin's getOrPut extension is NOT atomic here.
+                protocolCounts.computeIfAbsent(protocol) {
+                    java.util.concurrent.atomic.AtomicInteger(0)
+                }.incrementAndGet()
+                // Per-host accumulator (answers A: per-mirror ceiling?).
+                // computeIfAbsent ensures each host's AtomicLong pair is created exactly once.
+                val entry = hostStats.computeIfAbsent(host) {
+                    arrayOf(
+                        java.util.concurrent.atomic.AtomicLong(0L),
+                        java.util.concurrent.atomic.AtomicLong(0L)
+                    )
+                }
+                entry[0].addAndGet(bytes)
+                entry[1].addAndGet(elapsedMs)
+            }
+
         val onReport: suspend () -> Unit = {
             // ~3x/sec aggregate report, identical shape & cadence to the static path.
             val now = System.currentTimeMillis()
@@ -668,30 +767,34 @@ class RemoteSource @Inject constructor(
         }
 
         coroutineScope {
-            (0 until workerCount).map {
+            laneRunners.mapIndexed { runnerIdx, pinnedHost ->
                 async {
                     val buf = ByteArray(256 * 1024)
-                    // Each worker loops, stealing chunks until the queue is drained AND nothing
-                    // is in flight (so a requeued chunk from a stalled peer is still picked up).
+                    // Each runner is PINNED to one host for the file's whole duration: it pulls
+                    // every chunk from `pinnedHost`, so OkHttp serves all of them off the SAME warm
+                    // h2 connection (no per-chunk re-pick, no slow-start tax). It loops, stealing
+                    // chunks until the queue is drained AND nothing is in flight (so a requeued
+                    // chunk from a stalled/failed peer lane is still picked up).
                     while (queue.shouldKeepWorking()) {
                         if (isCancelled()) throw CancellationException()
                         val chunk = queue.poll()
                         if (chunk == null) {
-                            // No fresh chunk to start. v2: in the TAIL (queue drained, only a few
-                            // chunks still in-flight) an idle worker RACES a slow in-flight chunk on
-                            // a SECOND, different host instead of busy-waiting — first to finish the
+                            // No fresh chunk to start. v2/v3: in the TAIL (queue drained, only a few
+                            // chunks still in-flight) an idle runner RACES a slow in-flight chunk on
+                            // a SECOND, DIFFERENT host instead of busy-waiting — first to finish the
                             // range wins, the loser bails (see downloadChunkAttempt's done-check).
                             // pickRaceTarget returns null unless the strict tail-gate holds, so this
-                            // never fires early or on small files.
+                            // never fires early or on small files. The racer spreads across
+                            // datacenters: it pins a live host different from this runner's own host.
                             val raceChunk = queue.pickRaceTarget()
                             if (raceChunk != null) {
+                                val raceHost = pickLiveHost(pinnedHost, pinnedHost)
                                 racesStarted.incrementAndGet()
                                 downloadChunkAttempt(
                                     chunk = raceChunk,
+                                    pinnedHost = raceHost,
                                     queue = queue,
-                                    scoreboard = scoreboard,
                                     recentRates = recentRates,
-                                    distinctHosts = distinctHosts,
                                     destFile = destFile,
                                     expectedSize = expectedSize,
                                     buf = buf,
@@ -703,7 +806,9 @@ class RemoteSource @Inject constructor(
                                     isRace = true,
                                     onConnAcquired = onConnAcquired,
                                     onConnReleased = onConnReleased,
-                                    onRaceWon = { racesWon.incrementAndGet() }
+                                    onRaceWon = { racesWon.incrementAndGet() },
+                                    onChunkCompleted = onChunkCompleted,
+                                    onHostOutcome = onHostOutcome
                                 )
                             } else {
                                 // Nothing to claim right now but peers hold in-flight chunks that
@@ -712,12 +817,18 @@ class RemoteSource @Inject constructor(
                             }
                             continue
                         }
+                        // FAILOVER: if this runner's pinned host has been declared dead (its lane
+                        // exhausted its error budget — a mirror went down mid-download), re-target
+                        // to a surviving host for this chunk. This redistributes the dead lane's
+                        // stream budget onto the live mirrors WITHOUT exceeding the global cap (the
+                        // shared Semaphore is unchanged). While the host stays live this is a no-op
+                        // and the runner keeps reusing its own warm connection.
+                        val effectiveHost = pickLiveHost(pinnedHost, null)
                         downloadChunkAttempt(
                             chunk = chunk,
+                            pinnedHost = effectiveHost,
                             queue = queue,
-                            scoreboard = scoreboard,
                             recentRates = recentRates,
-                            distinctHosts = distinctHosts,
                             destFile = destFile,
                             expectedSize = expectedSize,
                             buf = buf,
@@ -729,9 +840,12 @@ class RemoteSource @Inject constructor(
                             isRace = false,
                             onConnAcquired = onConnAcquired,
                             onConnReleased = onConnReleased,
-                            onRaceWon = { /* primary path is never a race win */ }
+                            onRaceWon = { /* primary path is never a race win */ },
+                            onChunkCompleted = onChunkCompleted,
+                            onHostOutcome = onHostOutcome
                         )
                     }
+                    @Suppress("UNUSED_EXPRESSION") runnerIdx  // keep index in scope for clarity/debug
                 }
             }.awaitAll()
         }
@@ -764,12 +878,65 @@ class RemoteSource @Inject constructor(
         val wallMs = (System.currentTimeMillis() - startTime).coerceAtLeast(1)
         val mb = total.toDouble() / (1024.0 * 1024.0)
         val mbps = mb / (wallMs / 1000.0)
+
+        // DIAG (1): build protocol summary string, e.g. "h2×12 http/1.1×3"
+        val protocolSummary = if (protocolCounts.isEmpty()) "unknown"
+        else protocolCounts.entries
+            .sortedByDescending { it.value.get() }
+            .joinToString(" ") { "${it.key}×${it.value.get()}" }
+
+        // v3: surface the lane plan (host=streams …) so the maintainer can confirm spread-across-
+        // mirrors at a glance, e.g. "lanes=[ia6=2 ia8=2]". peakConns should be SMALL (~Σ streams,
+        // ~4) — proof warm reuse is working and we're NOT opening a fresh socket per chunk.
+        val laneSummary = lanes.joinToString(" ") { l ->
+            "${l.host.hostLabel()}=${l.streams}"
+        }
         Log.i(
             "EmuHelper-ADAPTIVE-BENCH",
             "adaptive: ${"%.1f".format(mb)}MB in ${"%.1f".format(wallMs / 1000.0)}s = " +
-                "${"%.2f".format(mbps)}MB/s, workers=$workerCount peakConns=${peakConns.get()} " +
-                "races=${racesStarted.get()}/${racesWon.get()} (started/won)"
+                "${"%.2f".format(mbps)}MB/s, lanes=[$laneSummary] streams=$workerCount " +
+                "peakConns=${peakConns.get()} " +
+                "races=${racesStarted.get()}/${racesWon.get()} (started/won) " +
+                "protocols=[$protocolSummary]"
         )
+
+        // DIAG (2): per-host MB/s breakdown — answers: are all mirrors at a similar ceiling?
+        // Format: "host1=X.XMB/s(Y.YMB) host2=... distinctHosts=K"
+        if (hostStats.isNotEmpty()) {
+            val perHostStr = hostStats.entries
+                .sortedByDescending { it.value[0].get() }
+                .joinToString(" ") { (host, counters) ->
+                    val hostBytes = counters[0].get()
+                    val hostMs = counters[1].get().coerceAtLeast(1)
+                    val hostMb = hostBytes / (1024.0 * 1024.0)
+                    val hostMbps = hostMb / (hostMs / 1000.0)
+                    val label = host.substringAfter("//").substringBefore('/')
+                    "$label=${"%.2f".format(hostMbps)}MB/s(${"%.1f".format(hostMb)}MB)"
+                }
+            Log.i(
+                "EmuHelper-ADAPTIVE-BENCH",
+                "per-host: $perHostStr distinctHosts=${hostStats.size}"
+            )
+        }
+
+        // DIAG (3): per-chunk rate median vs peak — answers: is slow-start hurting each chunk?
+        // Uses the RecentRateWindow ring buffer that already records every completed chunk's rate.
+        val chunkSamples = recentRates.snapshotSamples()
+        if (chunkSamples.isNotEmpty()) {
+            val sorted = chunkSamples.copyOf().also { it.sort() }
+            val medianBytesPerMs = if (sorted.size % 2 == 1) sorted[sorted.size / 2]
+                else (sorted[sorted.size / 2 - 1] + sorted[sorted.size / 2]) / 2.0
+            val peakBytesPerMs = sorted.last()
+            val medianMbps = medianBytesPerMs * 1000.0 / (1024.0 * 1024.0)
+            val peakMbps = peakBytesPerMs * 1000.0 / (1024.0 * 1024.0)
+            Log.i(
+                "EmuHelper-ADAPTIVE-BENCH",
+                "per-chunk: medianMB/s=${"%.2f".format(medianMbps)} " +
+                    "peakMB/s=${"%.2f".format(peakMbps)} " +
+                    "samples=${sorted.size} " +
+                    "(median<<peak => slow-start signature per chunk)"
+            )
+        }
         onProgress(total, 0.0)
         return total
     }
@@ -799,10 +966,14 @@ class RemoteSource @Inject constructor(
      */
     private suspend fun downloadChunkAttempt(
         chunk: Chunk,
+        // v3 LANED: the host this attempt is PINNED to. For a primary it is the runner's lane host
+        // (re-targeted to a survivor if the lane died); for a racer it is a live host DIFFERENT from
+        // the primary's. Because it is the SAME host for every chunk a runner pulls, OkHttp reuses
+        // the runner's warm h2 connection — no per-chunk re-pick, no slow-start tax. There is NO
+        // HostScoreboard anymore: warm reuse comes from the pin, failover from the liveHosts set.
+        pinnedHost: String,
         queue: ChunkQueue,
-        scoreboard: HostScoreboard,
         recentRates: RecentRateWindow,
-        distinctHosts: List<String>,
         destFile: File,
         expectedSize: Long,
         buf: ByteArray,
@@ -826,7 +997,17 @@ class RemoteSource @Inject constructor(
         onConnAcquired: () -> Unit = {},
         onConnReleased: () -> Unit = {},
         // v2: invoked iff THIS attempt was a race that WON (its markDone transitioned the chunk).
-        onRaceWon: () -> Unit = {}
+        onRaceWon: () -> Unit = {},
+        // DIAG bench: called once per successfully-completed chunk (primary or winning racer)
+        // to accumulate per-host bytes+ms and HTTP protocol stats. NO-OP by default so all
+        // existing callers (unit tests) are unaffected. Thread-safe: lambda body uses
+        // ConcurrentHashMap + AtomicLong — no additional locking needed here.
+        onChunkCompleted: (host: String, bytes: Long, elapsedMs: Long, protocol: String) -> Unit = { _, _, _, _ -> },
+        // v3 LANE FAILOVER: report this attempt's outcome on [pinnedHost] (true=success, false=real
+        // error) so the caller can declare a dead lane and redistribute. NO-OP for primaries that
+        // don't care (and for racers, which never affect lane health). Stalls do NOT call this — a
+        // stall is not a lane-death signal, only a migration.
+        onHostOutcome: (host: String, ok: Boolean) -> Unit = { _, _ -> }
     ) {
         if (isCancelled()) throw CancellationException()
         // v2 racer: if the chunk already finished between pickRaceTarget and here, there's nothing
@@ -835,12 +1016,10 @@ class RemoteSource @Inject constructor(
             queue.endRace(chunk)
             return
         }
-        // How many real errors this chunk has already taken — used to prefer a DIFFERENT host on
-        // retries (fastest-first failover), matching the static path's per-attempt host rotation.
-        val priorTries = queue.errorAttemptsOf(chunk.index)
-        val host = scoreboard.pickHost()
-            ?: distinctHosts[priorTries % distinctHosts.size]
-        var hostReleased = false
+        // v3: the host is PINNED (passed in), not re-picked per chunk. This is the single change
+        // that makes OkHttp reuse the warm h2 connection for every chunk on this runner's lane.
+        val host = pinnedHost
+        var hostReleased = false  // retained for symmetry with the finally guard below (no-op now)
         // Fix D: set true once the chunk is reconciled (markDone OR requeued/failed). If still
         // false in the finally, the chunk leaked in-flight and is force-requeued. A RACER never
         // owns reconciliation (the primary does), so it starts and stays "reconciled" — its finally
@@ -849,6 +1028,9 @@ class RemoteSource @Inject constructor(
         var call: okhttp3.Call? = null
         var connAcquired = false
         var bytesThisChunk = 0L
+        // DIAG: HTTP protocol observed on THIS chunk's response (captured inside the use{} block,
+        // read after it closes). Empty string = no response received yet (stall/error before 206).
+        var chunkProtocol = ""
         val chunkStart = System.currentTimeMillis()
         var lastReadAt = chunkStart
         // Soft-stall sustain counter: how many consecutive measurement windows this chunk has read
@@ -856,14 +1038,13 @@ class RemoteSource @Inject constructor(
         var consecutiveSlowWindows = 0
         var lastSoftCheck = chunkStart
         // Acquire a GLOBAL connection slot BEFORE opening the socket; release in finally. This is
-        // what makes the 24-connection thermal cap robust to any (variable) worker count. A RACER
+        // what makes the 24-connection thermal cap robust to any (variable) runner count. A RACER
         // uses tryAcquire so it never blocks a permit a fresh chunk could use and never pushes the
         // total over the cap; if no permit is free it abandons the race immediately.
         if (isRace) {
             if (!connectionBudget.tryAcquire()) {
                 // No free permit — don't block. The primary still owns the chunk; just give up the
-                // race. (host was picked but never used; release its scoreboard load slot.)
-                scoreboard.releaseHost(host)
+                // race.
                 queue.endRace(chunk)
                 return
             }
@@ -883,6 +1064,9 @@ class RemoteSource @Inject constructor(
             call = okHttpClient.newCall(req)
             call.execute().use { resp ->
                 if (resp.code != 206) throw IOException("No range (HTTP ${resp.code})")
+                // DIAG: capture the negotiated HTTP protocol (h2, http/1.1, etc.) for the bench log.
+                // resp.protocol is the okhttp3.Protocol enum; toString() gives the canonical lowercase name.
+                chunkProtocol = resp.protocol.toString()
                 // Guard against stale metadata: if the server's real total differs from the size
                 // we pre-sized/partitioned against, our offsets are wrong — abort. Same
                 // CLEAR-mismatch-only policy as the static path (absent header => proceed).
@@ -911,7 +1095,6 @@ class RemoteSource @Inject constructor(
                             // own markDone (its own markDone is the no-op if a racer beat it).
                             if (isRace && queue.isDone(chunk.index)) {
                                 hostReleased = true
-                                scoreboard.releaseHost(host)
                                 return  // finally cancels the Call, releases permit + race slot
                             }
                             if (read > 0) {
@@ -967,18 +1150,18 @@ class RemoteSource @Inject constructor(
                 if (isRace) {
                     // A short-read RACER never errors/requeues the chunk (the primary owns it). Just
                     // give up the race; the primary (or another racer) will complete the range.
-                    scoreboard.releaseHost(host)
                     hostReleased = true
                     return
                 }
                 throw IOException("Short chunk ${chunk.index}: got $bytesThisChunk of ${chunk.length}")
             }
-            // Success: record the observed rate (releases the host slot), mark done, count bytes.
+            // Success: record the observed rate, reset the lane's error streak, mark done, count
+            // bytes. A primary success re-confirms its pinned host as a healthy lane (failover).
             val ms = (System.currentTimeMillis() - chunkStart).coerceAtLeast(1)
             val observedRate = bytesThisChunk.toDouble() / ms
-            scoreboard.recordSuccess(host, observedRate)
             hostReleased = true
-            // Fix B: feed the CURRENT recent-rate baseline with this real completed-chunk rate.
+            if (!isRace) onHostOutcome(host, true)   // v3: lane is healthy — reset its error streak
+            // Feed the CURRENT recent-rate baseline with this real completed-chunk rate.
             recentRates.record(observedRate)
             // markDone is the single atomic winner-decider under the chunk's lock: it returns true
             // for EXACTLY ONE caller (the first to finish the range — primary or racer), false for
@@ -988,27 +1171,33 @@ class RemoteSource @Inject constructor(
                 confirmedBytes.addAndGet(chunk.length)
                 if (isRace) onRaceWon()   // v2: this racer beat the primary — count the win.
             }
+            // DIAG: accumulate per-host stats and HTTP protocol for the bench log.
+            // Called for EVERY successful chunk attempt (primary or winning racer) so the
+            // per-host bytes/ms totals are accurate even when racing is active.
+            // chunkProtocol is set right after the 206 check; if empty (shouldn't happen on
+            // this path) we fall back to "unknown" to avoid a blank entry.
+            onChunkCompleted(
+                host,
+                bytesThisChunk,
+                (System.currentTimeMillis() - chunkStart).coerceAtLeast(1),
+                chunkProtocol.ifEmpty { "unknown" }
+            )
             reconciled = true  // Fix D: chunk reached a terminal-done state on this path.
             onReport()
         } catch (c: CancellationException) {
-            // Structured cancellation: release the host slot and requeue is unnecessary (the whole
-            // scope is being torn down). Re-throw so the caller deletes the .part. The finally must
-            // NOT force-requeue here, so mark reconciled — the scope teardown is authoritative.
-            scoreboard.releaseHost(host)
+            // Structured cancellation: requeue is unnecessary (the whole scope is being torn down).
+            // Re-throw so the caller deletes the .part. The finally must NOT force-requeue here, so
+            // mark reconciled — the scope teardown is authoritative. (A cancellation is NOT a lane
+            // error: don't touch the failover streak.)
             hostReleased = true
             reconciled = true
             throw c
         } catch (s: StallException) {
-            // STALL (Fix A + C): NOT an error. It never consumes the error budget and never fails
-            // the download — the chunk is always requeued for another worker/host.
-            if (s.soft) {
-                // Soft stall (Fix C): the host is just slower than the current baseline, not broken.
-                // DEMOTE it (no cooldown) so we don't funnel all workers onto one host.
-                scoreboard.recordSoftStall(host)
-            } else {
-                // Hard stall: zero bytes for the timeout is an unambiguous bad-host signal -> cool it.
-                scoreboard.recordStall(host)
-            }
+            // STALL (Fix A + C): NOT an error. It never consumes the error budget, never fails the
+            // download, and is NOT a lane-death signal — the chunk is just requeued for another
+            // runner/host. (No scoreboard anymore: a stall doesn't demote/cool a pinned host; the
+            // soft-stall sustain logic on the next runner governs migration. We deliberately do NOT
+            // bump the lane error streak for a stall — only real transport errors kill a lane.)
             hostReleased = true
             // v2: a RACER never requeues — the primary owns the chunk and is still running. A racer
             // stalling on its second host just abandons the race (the primary completes the chunk).
@@ -1017,20 +1206,24 @@ class RemoteSource @Inject constructor(
                 reconciled = true                // Fix D: chunk reconciled (requeued).
             }
             // No exponential backoff for a stall — the point is to migrate PROMPTLY to a peer/host.
+            @Suppress("UNUSED_EXPRESSION") s     // keep the binding referenced (soft/hard distinction
+                                                 // is logged in the message); no per-host action now.
         } catch (e: Exception) {
-            // REAL transport error (non-206, short read, IOException, timeout): cool the host
-            // (releases its slot) and consume the per-chunk ERROR budget. When exhausted, the chunk
-            // enters the terminal FAILED state and we rethrow so the whole download fails — same
-            // terminal semantics as the static per-segment loop, but ONLY for genuine errors.
-            scoreboard.recordStall(host)
+            // REAL transport error (non-206, short read, IOException, timeout): consume the per-chunk
+            // ERROR budget. When exhausted, the chunk enters the terminal FAILED state and we rethrow
+            // so the whole download fails — same terminal semantics as the static per-segment loop,
+            // but ONLY for genuine errors. v3: ALSO report the error to the lane-failover bookkeeping
+            // so a host that racks up consecutive errors is declared dead and its runners re-target.
             hostReleased = true
             // v2: a RACER never consumes the error budget and never fails the download — it is
             // purely additive. On any racer error we just abandon the race; the primary still owns
-            // the chunk and its own error budget governs whether the download ultimately fails.
+            // the chunk and its own error budget governs whether the download ultimately fails. A
+            // racer also does NOT affect lane health (only primaries on their pinned lane do).
             if (isRace) {
                 // reconciled stays true (a racer never owns reconciliation) — nothing to requeue.
                 return
             }
+            onHostOutcome(host, false)           // v3: bump this lane's consecutive-error streak
             val exhausted = queue.recordErrorOrFail(chunk, AdaptiveEngine.MAX_ERROR_ATTEMPTS)
             reconciled = true                    // Fix D: chunk reconciled (requeued or failed).
             if (exhausted) throw e
@@ -1044,14 +1237,12 @@ class RemoteSource @Inject constructor(
             // Always release the global connection slot we actually acquired (a racer that failed
             // tryAcquire returned before this point and never reaches here). Pairing acquire with
             // release in finally is THE invariant that keeps total permits <= the cap (24) across
-            // all workers AND racers.
+            // all runners AND racers.
             if (connAcquired) {
                 connectionBudget.release()
                 onConnReleased()
             }
-            // Defensive: if neither success nor failure released the host (shouldn't happen),
-            // release it so the scoreboard's load count stays accurate.
-            if (!hostReleased) scoreboard.releaseHost(host)
+            @Suppress("UNUSED_EXPRESSION") hostReleased  // retained for readability; no scoreboard now
             // v2: release the racer slot on EVERY racer exit path (won, lost, errored, cancelled).
             // A no-op for the primary. Pairs with pickRaceTarget's racer-count increment so racer
             // accounting can never leak.

@@ -119,6 +119,7 @@ object Catalog {
         "n64", "gcn", "wii", "wiiu", "3ds", "ds",
         "snes", "gba", "gb",
         "genesis", "dreamcast", "saturn",
+        "xbox", "xbox360",
         "arcade", "bios"
     )
 

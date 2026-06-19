@@ -410,9 +410,18 @@ class DownloadManager @Inject constructor(
                 expectedSize = expected,
                 destFile = cacheFile,
                 segments = segmentsPerFile,
-                // EXPERIMENTAL: gate the adaptive chunk-queue path behind the default-OFF flag.
-                // When false, the static path runs UNCHANGED. The shared 24-connection budget is
-                // passed through so the thermal cap holds across files regardless of engine.
+                // EXPERIMENTAL: gate the LANED chunk-queue path behind the default-OFF flag. When
+                // false, the static path runs UNCHANGED. The shared 24-connection budget is passed
+                // through so the thermal cap holds across files regardless of engine.
+                //
+                // TODO (multi-file batch spreading — FOLLOW-UP): today each concurrent file plans
+                // its OWN lanes over ALL mirrors and they contend for the shared 24-permit budget
+                // via the Semaphore (correct + safe, never over-cap, but two files can both pin the
+                // same mirror and split its ~2 MB/s ceiling). The follow-up is a batch-level lane
+                // scheduler that assigns DISTINCT mirrors/lane-budgets across the concurrentFiles so
+                // N files spread over the datacenters instead of overlapping. The per-file laned
+                // path here is the foundation that work builds on; the single-file case (the success
+                // metric) is correct, warm, and spread-across-mirrors as-is.
                 adaptive = adaptiveEngine,
                 connectionBudget = connectionBudget,
                 onProgress = { bytes, bps ->

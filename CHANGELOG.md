@@ -4,6 +4,25 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.7.0] - 2026-06-19
+
+### Added
+- **Xbox and Xbox 360 support.** Two big new consoles are now wired up. Xbox 360
+  ships with the full Redump alphabetical disc set, Title Updates, the Digital
+  collections, plus DLC, XBLIG, XBLA, and a Rock Band DLC pack (66 sources).
+  Xbox brings the complete Redump alphabetical disc set (34 sources). Both show
+  up in the category picker like every other console.
+
+### Changed
+- **Faster downloads, now on by default.** The multi-mirror download engine has
+  been rebuilt around how the Internet Archive actually serves files. It opens a
+  few *warm*, reused HTTP/2 connections per mirror and spreads the work across
+  the Archive's independent mirror datacenters, instead of opening many cold
+  connections that each restart from scratch. On-device testing showed it
+  matches or beats the old downloader while running cooler on handhelds, so it's
+  now the default. You can still switch back to the simpler single-path
+  downloader in Settings if you ever need to.
+
 ## [0.6.1] - 2026-06-18
 
 ### Added

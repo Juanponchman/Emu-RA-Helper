@@ -68,10 +68,14 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
     /** When true, downloads are only allowed on an unmetered (Wi-Fi) network. Default off. */
     val wifiOnly: Flow<Boolean> = context.settingsStore.data.map { it[KEY_WIFI_ONLY] ?: false }
 
-    /** EXPERIMENTAL: when true, downloads use the adaptive chunk-queue engine that spreads
-     *  work across Internet Archive mirrors. Default FALSE — the proven static path runs
-     *  unless the user explicitly opts in. */
-    val adaptiveEngine: Flow<Boolean> = context.settingsStore.data.map { it[KEY_ADAPTIVE_ENGINE] ?: false }
+    /** When true, downloads use the LANED chunk-queue engine that opens a few warm, host-pinned
+     *  HTTP/2 connections per Internet Archive mirror and reuses them across chunks (killing
+     *  per-chunk slow-start), spreading work across the independent mirror datacenters.
+     *  Default TRUE as of v0.7.0 — on-device A/B benchmarking confirmed it matches or beats the
+     *  old static path while running cooler (warm connections instead of socket churn). Users can
+     *  still turn it OFF in Settings to fall back to the proven static path. The preference KEY is
+     *  unchanged ("adaptive_download_engine") so existing explicit opt-ins/opt-outs are preserved. */
+    val adaptiveEngine: Flow<Boolean> = context.settingsStore.data.map { it[KEY_ADAPTIVE_ENGINE] ?: true }
 
     suspend fun setDownloadFolder(uri: Uri?) {
         context.settingsStore.edit {
