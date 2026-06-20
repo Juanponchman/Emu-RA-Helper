@@ -67,6 +67,36 @@ import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
 
+/**
+ * Pure decision function: should the "gentle re-nag" banner be shown?
+ *
+ * Returns true only when ALL of the following hold:
+ *  1. A newer version is available ([isNewer] == true).
+ *  2. The user has already dismissed THIS exact version tag before
+ *     ([dismissedTag] == [latestTag] && [latestTag].isNotBlank()).
+ *  3. Enough time has elapsed since the nag was last shown:
+ *     ([nowMs] - [lastNagMs]) >= 24 hours.
+ *
+ * Mutual exclusion with the "fresh" prompt is enforced by condition 2: when
+ * [dismissedTag] != [latestTag] the fresh prompt is shown, so this returns false.
+ * When a brand-new version arrives [latestTag] changes, making them unequal again,
+ * so the fresh prompt takes over automatically until dismissed.
+ */
+internal fun shouldShowGentleNag(
+    isNewer: Boolean,
+    latestTag: String,
+    dismissedTag: String,
+    lastNagMs: Long,
+    nowMs: Long
+): Boolean {
+    if (!isNewer) return false
+    if (latestTag.isBlank()) return false
+    // Only gentle-nag when the user has ALREADY dismissed this exact version.
+    if (dismissedTag != latestTag) return false
+    val twentyFourHours = 24L * 60L * 60L * 1000L
+    return (nowMs - lastNagMs) >= twentyFourHours
+}
+
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     listStore: GameListStore,
@@ -90,6 +120,27 @@ class HomeViewModel @Inject constructor(
     // Persisted dismissed tag (loaded from DataStore so it survives restarts).
     val dismissedUpdateTag: StateFlow<String> = settings.dismissedUpdateTag
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    /**
+     * Tier-2 gentle nag: true when the user is on an old version they've already dismissed,
+     * and at least 24h have passed since the gentle reminder was last shown.
+     * Mutually exclusive with the tier-1 fresh banner (enforced by [shouldShowGentleNag]).
+     * This is a derived StateFlow — no extra mutable state needed.
+     */
+    val gentleNagVisible: StateFlow<Boolean> = combine(
+        _updateInfo,
+        settings.dismissedUpdateTag,
+        settings.lastUpdateNag
+    ) { info, dismissed, lastNag ->
+        if (info == null) return@combine false
+        shouldShowGentleNag(
+            isNewer     = info.isNewer,
+            latestTag   = info.latestTag,
+            dismissedTag = dismissed,
+            lastNagMs   = lastNag,
+            nowMs       = System.currentTimeMillis()
+        )
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     /** The interrupted batch queue, if any. Non-empty only when the app was killed mid-batch. */
     val pendingQueue: StateFlow<List<CuratedGame>> = queueStore.pendingQueue
@@ -169,7 +220,12 @@ class HomeViewModel @Inject constructor(
             }
         }
 
-        // Throttled update check: only run if >24h since last check.
+        // Throttled update check: only run if >24h since last network check.
+        // Even when the network check is skipped, the gentle-nag decision is re-evaluated
+        // reactively via [gentleNagVisible] (which combines _updateInfo + DataStore flows),
+        // so a cached updateInfo from a previous session continues to drive the nag on days
+        // we don't hit the network — as long as _updateInfo was set in a prior launch.
+        // On first launch (no cache) we always do the network check.
         viewModelScope.launch {
             val lastCheck = settings.lastUpdateCheck.first()
             val now = System.currentTimeMillis()
@@ -210,6 +266,15 @@ class HomeViewModel @Inject constructor(
 
     fun dismissUpdate(tag: String) {
         viewModelScope.launch { settings.setDismissedUpdateTag(tag) }
+    }
+
+    /**
+     * User dismissed the gentle re-nag banner.  Record the current timestamp so
+     * the 24h cooldown restarts; no change to [dismissedUpdateTag] (it's already set
+     * for this version — dismissing the nag shouldn't reset the "already seen" state).
+     */
+    fun dismissGentleNag() {
+        viewModelScope.launch { settings.setLastUpdateNag(System.currentTimeMillis()) }
     }
 
     fun startDownload(apkUrl: String, apkSize: Long, expectedSha256: String? = null) {
@@ -308,6 +373,7 @@ fun HomeScreen(
     val updateInfo by viewModel.updateInfo.collectAsState()
     val updateFlow by viewModel.updateFlow.collectAsState()
     val dismissedTag by viewModel.dismissedUpdateTag.collectAsState()
+    val gentleNagVisible by viewModel.gentleNagVisible.collectAsState()
     val pendingQueue by viewModel.pendingQueue.collectAsState()
     val seenDiscordPrompt by viewModel.seenDiscordPrompt.collectAsState()
     val context = LocalContext.current
@@ -322,8 +388,14 @@ fun HomeScreen(
     var addUrlError by remember { mutableStateOf("") }
     // Track whether the Discord dialog has been actioned in this session (prevents re-trigger on recomposition).
     var discordDialogHandled by remember { mutableStateOf(false) }
+    // Gentle nag: once the nag fires this session, don't re-surface it on recomposition.
+    // The persistent 24h guard is in [gentleNagVisible]; this session flag prevents it from
+    // reappearing after the user dismisses it within the same app launch.
+    var gentleNagHandled by remember { mutableStateOf(false) }
 
-    // Compute whether the banner should be visible.
+    // Compute whether the FRESH banner (tier 1) should be visible.
+    // Tier 1 = newer version available AND user has NOT yet dismissed this exact tag.
+    // Tier 2 (gentle re-nag) is mutually exclusive: it only fires when dismissedTag == latestTag.
     val info = updateInfo
     val bannerVisible = info != null && info.isNewer && dismissedTag != info.latestTag
 
@@ -492,6 +564,37 @@ fun HomeScreen(
                 }) {
                     Text("Maybe later")
                 }
+            }
+        )
+    }
+
+    // Gentle re-nag (tier 2): when gentleNagVisible is true and not handled this session,
+    // record the nag timestamp immediately (so repeated opens don't re-show it this 24h window)
+    // and show a low-key snackbar-style dialog.
+    if (gentleNagVisible && !gentleNagHandled && info != null) {
+        // Fire setLastUpdateNag as a side-effect on first composition where this becomes true.
+        LaunchedEffect(info.latestTag) {
+            viewModel.dismissGentleNag()
+        }
+        AlertDialog(
+            onDismissRequest = { gentleNagHandled = true },
+            title = { Text("Still on ${io.github.mayusi.emuhelper.BuildConfig.VERSION_NAME}?") },
+            text = {
+                Text(
+                    "${info.latestTag} is available. Tap below to update when you're ready — " +
+                    "we'll remind you again tomorrow if you're still on an older version.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    gentleNagHandled = true
+                    showUpdateDialog = true
+                }) { Text("Update") }
+            },
+            dismissButton = {
+                TextButton(onClick = { gentleNagHandled = true }) { Text("Not now") }
             }
         )
     }

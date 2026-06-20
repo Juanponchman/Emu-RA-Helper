@@ -4,6 +4,36 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.8.0] - 2026-06-20
+
+### Added
+- **Download several games at full speed at once.** When you download multiple
+  files together, the engine now assigns each one to a *different* Internet
+  Archive mirror datacenter, so two games download in parallel each at full
+  speed instead of fighting over the same mirror and splitting it. The more
+  independent mirrors a batch can use, the more it downloads at once.
+- **Resume after an interruption — even a crash or reboot.** Downloads now keep
+  their progress on disk. If the app is killed, the network drops, or the device
+  restarts mid-download, you pick up from where you left off instead of starting
+  a multi-GB file over. (A finished file is still checksum-verified end to end,
+  so a resumed download can never leave you with a corrupt file.)
+- **Safer overnight batches.** Two new safeguards for big, leave-it-running
+  downloads: if you've turned on Wi-Fi-only, dropping to mobile data now actually
+  pauses the batch (and resumes when Wi-Fi returns); and if the device gets hot,
+  the engine automatically eases off the number of connections to let it cool,
+  then ramps back up — so a long overnight download won't cook a handheld.
+
+### Changed
+- **Public-search safety notice.** The "search all of the Internet Archive"
+  feature now shows a one-time notice (and a small always-present reminder) that
+  results come from the public Archive, where anyone can upload, so they aren't
+  curated or vetted like the built-in collections. EmuHelper still verifies every
+  download's checksum for integrity. Download content you recognise and trust.
+- **Gentler update reminders.** If a new version is out and you've dismissed the
+  prompt but are still on an older build, the app now gives one low-key reminder
+  per day (at most) instead of going silent forever — so you don't get stuck on
+  an old version, without being nagged.
+
 ## [0.7.0] - 2026-06-19
 
 ### Added

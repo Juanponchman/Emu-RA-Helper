@@ -22,13 +22,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.mayusi.emuhelper.data.source.RemoteSource
+import io.github.mayusi.emuhelper.data.storage.SettingsStore
 import io.github.mayusi.emuhelper.ui.common.Dimens
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -68,7 +71,8 @@ class SearchViewModel @Inject constructor(
     // RemoteSource is injected so it COULD be reused for the per-item load, but the screen routes
     // the actual "identifier -> picker" load through the shared BrowseViewModel.loadIdentifierIntoPicker
     // (the same path the paste-a-link feature uses). It's kept here to keep the search self-contained.
-    @Suppress("unused") private val source: RemoteSource
+    @Suppress("unused") private val source: RemoteSource,
+    private val settings: SettingsStore
 ) : ViewModel() {
 
     /**
@@ -83,6 +87,18 @@ class SearchViewModel @Inject constructor(
 
     private val _state = MutableStateFlow<SearchUiState>(SearchUiState.Idle)
     val state: StateFlow<SearchUiState> = _state.asStateFlow()
+
+    /**
+     * Whether the user has already acknowledged the public-search safety disclaimer.
+     * Defaults to `true` while DataStore is loading so the dialog never flashes before
+     * the real value arrives; the actual persisted value takes over immediately after.
+     */
+    val seenSearchDisclaimer: StateFlow<Boolean> = settings.seenSearchDisclaimer
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    fun acknowledgeSearchDisclaimer() {
+        viewModelScope.launch { settings.setSeenSearchDisclaimer(true) }
+    }
 
     private var searchJob: Job? = null
 
@@ -181,6 +197,9 @@ fun SearchAllScreen(
     viewModel: SearchViewModel = hiltViewModel()
 ) {
     val state by viewModel.state.collectAsState()
+    val seenDisclaimer by viewModel.seenSearchDisclaimer.collectAsState()
+    // Prevent re-triggering the dialog on recomposition after the user taps "I understand".
+    var disclaimerHandled by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var loadError by remember { mutableStateOf("") }
     val snackbar = remember { SnackbarHostState() }
@@ -196,6 +215,32 @@ fun SearchAllScreen(
             snackbar.showSnackbar(loadError)
             loadError = ""
         }
+    }
+
+    // One-time safety disclaimer — shown on the first visit before seenSearchDisclaimer is set.
+    // seenDisclaimer starts as `true` until DataStore loads (Eagerly, default true) to avoid a
+    // flash; disclaimerHandled prevents re-opening after the user acknowledges it in this session.
+    if (!seenDisclaimer && !disclaimerHandled) {
+        AlertDialog(
+            onDismissRequest = { /* non-dismissible: user must tap "I understand" to proceed */ },
+            title = { Text("Public Internet Archive content") },
+            text = {
+                Text(
+                    "Results come from the public Internet Archive, where anyone can upload files. " +
+                    "They are not curated or vetted like EmuHelper's built-in console collections.\n\n" +
+                    "EmuHelper verifies each download's checksum (MD5) for integrity, but does not " +
+                    "scan for malware. Download content you recognise and trust."
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    disclaimerHandled = true
+                    viewModel.acknowledgeSearchDisclaimer()
+                }) {
+                    Text("I understand")
+                }
+            }
+        )
     }
 
     Scaffold(
@@ -221,6 +266,17 @@ fun SearchAllScreen(
                 shape = MaterialTheme.shapes.small,
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { viewModel.search(query) })
+            )
+
+            // Persistent quiet reminder — always visible once the screen is loaded so the
+            // user is never surprised that results are from the public IA, not a curated list.
+            Text(
+                "Results are from the public Internet Archive and aren't vetted — download what you trust.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Dimens.ScreenHorizontal, vertical = 4.dp)
             )
 
             when (val s = state) {

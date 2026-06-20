@@ -45,6 +45,12 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
         val KEY_CACHED_REMOTE_CATALOG = stringPreferencesKey("cached_remote_catalog_json")
         // ---- Discord community prompt ----------------------------------------
         private val KEY_SEEN_DISCORD_PROMPT = booleanPreferencesKey("seen_discord_prompt")
+        // ---- Public-search safety disclaimer ---------------------------------
+        private val KEY_SEEN_SEARCH_DISCLAIMER = booleanPreferencesKey("seen_search_disclaimer")
+        // ---- Update nag re-surfacing (gentle, at most once per 24h) -----------
+        // Distinct from KEY_LAST_UPDATE_CHECK (which throttles the network check):
+        // this throttles how often a STILL-DISMISSED-but-outdated reminder re-appears.
+        val KEY_LAST_UPDATE_NAG = longPreferencesKey("last_update_nag_ts")
     }
 
     /** Persisted SAF URI for the user-chosen download folder, or null if using app-private dir. */
@@ -143,6 +149,23 @@ class SettingsStore @Inject constructor(@ApplicationContext private val context:
 
     suspend fun setDismissedUpdateTag(tag: String) {
         context.settingsStore.edit { it[KEY_DISMISSED_UPDATE_TAG] = tag }
+    }
+
+    // ---- Update re-nag throttle (gentle reminder, at most once per 24h) ----
+    // When the user has dismissed an update but is still on an older version, we
+    // re-surface a low-key reminder no more than once per 24h. This timestamp
+    // tracks when that reminder was last shown (0L = never).
+    val lastUpdateNag: Flow<Long> = context.settingsStore.data.map { it[KEY_LAST_UPDATE_NAG] ?: 0L }
+
+    suspend fun setLastUpdateNag(timestamp: Long) {
+        context.settingsStore.edit { it[KEY_LAST_UPDATE_NAG] = timestamp }
+    }
+
+    // ---- Public-search safety disclaimer (acknowledged once) --------------
+    val seenSearchDisclaimer: Flow<Boolean> = context.settingsStore.data.map { it[KEY_SEEN_SEARCH_DISCLAIMER] ?: false }
+
+    suspend fun setSeenSearchDisclaimer(value: Boolean) {
+        context.settingsStore.edit { it[KEY_SEEN_SEARCH_DISCLAIMER] = value }
     }
 
     // ---- Last selected consoles -------------------------------------------

@@ -35,6 +35,14 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
+ * RESUME (v0.8): a DISTINCT exception for "the assembled file failed its MD5 verify". It is the ONLY
+ * failure that discards the cache .part + resume manifest — a genuinely corrupt file must be
+ * re-fetched from scratch, never resumed. Every OTHER (retryable) failure keeps the .part for resume.
+ * IOException so it still flows through the existing IOException-aware error messaging.
+ */
+private class CorruptDownloadException(message: String) : IOException(message)
+
+/**
  * App-scoped download engine. Lives in the Hilt SingletonComponent and runs work on
  * an application-lifetime CoroutineScope, so downloads keep running when the user
  * leaves the Download screen or backgrounds the app (the foreground DownloadService
@@ -114,6 +122,35 @@ class DownloadManager @Inject constructor(
     private val MAX_TOTAL_CONNECTIONS = 24
     private val connectionBudget = kotlinx.coroutines.sync.Semaphore(MAX_TOTAL_CONNECTIONS)
 
+    // MULTI-FILE BATCH SCHEDULER. One instance for the whole manager (stateless between calls, so it
+    // is safe to reuse across batches). It assigns DISTINCT mirrors to concurrently-downloading files
+    // so two files don't both pin the same datacenter and split its ~2 MB/s ceiling — file A runs on
+    // ia6, file B on ia8, each at full speed. It is ONLY a host-assignment layer: the global
+    // 24-connection cap stays enforced by [connectionBudget] (the scheduler never mints permits).
+    private val mirrorScheduler = MirrorScheduler(globalBudget = MAX_TOTAL_CONNECTIONS)
+
+    // Live demand registry: the resolved mirrors + size of every file CURRENTLY downloading, keyed by
+    // taskId. The adaptive engine's runners read a snapshot of this (via the liveDemands supplier) to
+    // re-consult the scheduler between chunks, so a freed mirror (peer file finished) flows to the
+    // remaining files. Entries are added once a file's mirrors resolve and removed on completion.
+    private val activeDemands =
+        java.util.concurrent.ConcurrentHashMap<String, FileDemand>()
+
+    // ---- OVERNIGHT GOVERNORS (v0.8) ----------------------------------------------------------
+    // (3a) WI-FI-ONLY: when SettingsStore.wifiOnly is ON and the active network becomes metered
+    // (cellular), pause the batch; auto-resume when unmetered Wi-Fi returns. We only pause/resume
+    // what the governor itself paused — never a batch the user manually paused.
+    @Volatile private var userPaused = false       // a USER-initiated pause is in effect
+    @Volatile private var governorPaused = false   // the Wi-Fi governor paused the batch itself
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    // (3b) THERMAL BACKOFF: on SEVERE+ thermal status, shrink the live connection cap toward ~8 by
+    // HOLDING permits from the shared budget Semaphore (fewer permits = fewer connections = always
+    // cap-safe). Restore on cool-down. The governor only ever REDUCES the live cap, never raises it
+    // past 24.
+    private val thermalGovernor = ThermalPermitGovernor(connectionBudget, MAX_TOTAL_CONNECTIONS)
+    private var thermalListener: android.os.PowerManager.OnThermalStatusChangedListener? = null
+
     /** Smoothed speed for stable ETA calculations. Prevents jitter when concurrent files start/stop. */
     @Volatile private var smoothedSpeed = 0.0
 
@@ -141,9 +178,13 @@ class DownloadManager @Inject constructor(
         // Remember the override for the whole batch so retry() of any task lands in the same place.
         activeFolderOverride = folderOverride
         _isPaused.value = false
+        userPaused = false
+        governorPaused = false
         cancelRequested = false
         batchHistoryRecorded.set(false)
         DownloadService.start(appContext)
+        // OVERNIGHT GOVERNORS: start the Wi-Fi-only + thermal listeners for this batch's lifetime.
+        startGovernors()
 
         batchJob = scope.launch {
             // Persist the queue immediately so a force-close/crash/reboot doesn't lose it.
@@ -227,6 +268,7 @@ class DownloadManager @Inject constructor(
             // leaves the queue set because this line is never reached.
             queueStore.clear()
             _isRunning.value = false
+            stopGovernors()
             DownloadService.stop(appContext)
         }
     }
@@ -250,7 +292,11 @@ class DownloadManager @Inject constructor(
                 cancelRequested = false
             }
         }
-        if (shouldLaunch) DownloadService.start(appContext)
+        if (shouldLaunch) {
+            DownloadService.start(appContext)
+            // OVERNIGHT GOVERNORS: a retry that (re)starts the batch gets the listeners too.
+            startGovernors()
+        }
         scope.launch {
             // Honour the active per-list override so a retry re-targets the same custom folder.
             val chosenUri = activeFolderOverride ?: settings.downloadFolder.first()
@@ -264,6 +310,7 @@ class DownloadManager @Inject constructor(
                         }
                     ) {
                         _isRunning.value = false
+                        stopGovernors()
                         DownloadService.stop(appContext)
                     }
                 }
@@ -282,6 +329,7 @@ class DownloadManager @Inject constructor(
                         }
                     ) {
                         _isRunning.value = false
+                        stopGovernors()
                         DownloadService.stop(appContext)
                     }
                 }
@@ -317,19 +365,154 @@ class DownloadManager @Inject constructor(
     }
 
     fun pause() {
+        // USER pause. Records userPaused so the Wi-Fi governor never auto-resumes a batch the user
+        // deliberately paused (the governor only ever resumes a pause IT caused).
+        userPaused = true
         _isPaused.value = true
         if (_isRunning.value) DownloadService.updatePausedState(appContext, paused = true)
     }
     fun resume() {
+        // USER resume. Clears BOTH the user-pause and governor-pause flags: an explicit user resume
+        // overrides any governor pause currently in effect.
+        userPaused = false
+        governorPaused = false
         _isPaused.value = false
         if (_isRunning.value) DownloadService.updatePausedState(appContext, paused = false)
     }
     fun cancelAll() {
         cancelRequested = true
         batchJob?.cancel()
+        userPaused = false
+        governorPaused = false
         _isPaused.value = false
         _isRunning.value = false
+        stopGovernors()
         DownloadService.stop(appContext)
+    }
+
+    // ---- OVERNIGHT GOVERNORS: thin Android-framework wiring ----------------------------------
+
+    /**
+     * (3a) Apply the Wi-Fi-only DECISION (computed by the pure [decideWifiGovernorAction]) given the
+     * current network's connected + metered state. Pauses/resumes ONLY the governor's own pause —
+     * never a user pause. Reads the live [wifiOnly] setting each call so toggling the setting takes
+     * effect immediately.
+     */
+    private fun applyWifiGovernor(isConnected: Boolean, isMetered: Boolean) {
+        scope.launch {
+            val wifiOnly = settings.wifiOnly.first()
+            val action = decideWifiGovernorAction(
+                wifiOnly = wifiOnly,
+                isConnected = isConnected,
+                isMetered = isMetered,
+                governorPaused = governorPaused
+            )
+            when (action) {
+                WifiGovernorAction.PAUSE -> {
+                    // Don't override a manual user pause; just record that the governor wants it
+                    // paused so it knows to auto-resume later.
+                    if (!userPaused) {
+                        governorPaused = true
+                        _isPaused.value = true
+                        if (_isRunning.value) DownloadService.updatePausedState(appContext, paused = true)
+                        Log.i("EmuHelper", "wifi-only governor: PAUSED (metered network, wifiOnly on)")
+                    } else {
+                        governorPaused = true  // remember our intent even while user-paused
+                    }
+                }
+                WifiGovernorAction.RESUME -> {
+                    governorPaused = false
+                    // Only actually un-pause if the user hasn't manually paused.
+                    if (!userPaused) {
+                        _isPaused.value = false
+                        if (_isRunning.value) DownloadService.updatePausedState(appContext, paused = false)
+                        Log.i("EmuHelper", "wifi-only governor: RESUMED (unmetered Wi-Fi returned)")
+                    }
+                }
+                WifiGovernorAction.NONE -> { /* no change */ }
+            }
+        }
+    }
+
+    /** Register the connectivity + thermal listeners for the lifetime of a batch. Idempotent. */
+    private fun startGovernors() {
+        // (3a) Connectivity callback.
+        if (networkCallback == null) {
+            runCatching {
+                val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as? android.net.ConnectivityManager
+                if (cm != null) {
+                    val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+                        override fun onCapabilitiesChanged(
+                            network: android.net.Network,
+                            caps: android.net.NetworkCapabilities
+                        ) {
+                            val metered = !caps.hasCapability(
+                                android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED
+                            )
+                            val connected = caps.hasCapability(
+                                android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET
+                            )
+                            applyWifiGovernor(isConnected = connected, isMetered = metered)
+                        }
+
+                        override fun onLost(network: android.net.Network) {
+                            // Lost the network entirely -> treat as not-connected (governor pauses if
+                            // wifiOnly is on).
+                            applyWifiGovernor(isConnected = false, isMetered = true)
+                        }
+                    }
+                    cm.registerDefaultNetworkCallback(cb)
+                    networkCallback = cb
+                }
+            }
+        }
+        // (3b) Thermal status listener (API 29+, minSdk is 29).
+        if (thermalListener == null) {
+            runCatching {
+                val pm = appContext.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                if (pm != null) {
+                    val listener = android.os.PowerManager.OnThermalStatusChangedListener { status ->
+                        Log.i(
+                            "EmuHelper",
+                            "thermal governor: status=$status -> holding " +
+                                "${thermalPermitsToHold(status)} permits (liveCap " +
+                                "${MAX_TOTAL_CONNECTIONS - thermalPermitsToHold(status)})"
+                        )
+                        scope.launch { runCatching { thermalGovernor.applyThermalStatus(status) } }
+                    }
+                    pm.addThermalStatusListener(listener)
+                    thermalListener = listener
+                    // Apply the CURRENT status immediately so a batch started while already hot backs
+                    // off without waiting for the next transition.
+                    val current = runCatching { pm.currentThermalStatus }.getOrDefault(0)
+                    scope.launch { runCatching { thermalGovernor.applyThermalStatus(current) } }
+                }
+            }
+        }
+    }
+
+    /** Unregister listeners and release any held thermal permits. Called at batch end / cancel. */
+    private fun stopGovernors() {
+        networkCallback?.let { cb ->
+            runCatching {
+                val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+                    as? android.net.ConnectivityManager
+                cm?.unregisterNetworkCallback(cb)
+            }
+        }
+        networkCallback = null
+        thermalListener?.let { l ->
+            runCatching {
+                val pm = appContext.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+                pm?.removeThermalStatusListener(l)
+            }
+        }
+        thermalListener = null
+        // Release any permits the thermal governor is still holding so the next batch starts with the
+        // full budget. governorPaused is reset so a new batch isn't born paused.
+        governorPaused = false
+        scope.launch { runCatching { thermalGovernor.release() } }
     }
 
     /** Reset visible state when the user leaves a finished batch. */
@@ -397,12 +580,27 @@ class DownloadManager @Inject constructor(
         // Download into app cache (real File, supports random-access multi-connection).
         val cacheDir = File(appContext.cacheDir, "dl").apply { mkdirs() }
         val cacheFile = File(cacheDir, "${taskId.hashCode()}_$filename.part")
+        // RESUME (v0.8): the adaptive engine writes a sidecar manifest of completed chunk indices
+        // next to the .part. When we discard the .part we must drop its manifest too, else a stale
+        // "all done" manifest could mislead a future resume. delete both via [discardPartAndManifest].
+        val cacheManifest = File(cacheDir, cacheFile.name + ".manifest")
+        fun discardPartAndManifest() {
+            cacheFile.delete()
+            cacheManifest.delete()
+        }
 
         // Gather mirror hosts for this file (primary + d1/d2 + CDN nodes) so the
         // segmented downloader can spread load and fail over between them.
         val mirrors = runCatching { source.mirrorUrls(base.identifier, base.relativeName) }
             .getOrDefault(listOf(url))
             .ifEmpty { listOf(url) }
+
+        // Register this file's demand so the batch MirrorScheduler can assign it a distinct mirror
+        // away from other concurrent files (and so peers re-consult the scheduler between chunks).
+        // Removed in the finally below on EVERY exit path (done/failed/cancelled) so a finished file
+        // frees its mirror for the survivors. Only meaningful for the adaptive engine; harmless for
+        // the static path (which ignores the scheduler args).
+        activeDemands[taskId] = FileDemand(fileId = taskId, mirrors = mirrors, sizeBytes = expected)
 
         try {
             val total = source.downloadFileSegmented(
@@ -414,16 +612,18 @@ class DownloadManager @Inject constructor(
                 // false, the static path runs UNCHANGED. The shared 24-connection budget is passed
                 // through so the thermal cap holds across files regardless of engine.
                 //
-                // TODO (multi-file batch spreading — FOLLOW-UP): today each concurrent file plans
-                // its OWN lanes over ALL mirrors and they contend for the shared 24-permit budget
-                // via the Semaphore (correct + safe, never over-cap, but two files can both pin the
-                // same mirror and split its ~2 MB/s ceiling). The follow-up is a batch-level lane
-                // scheduler that assigns DISTINCT mirrors/lane-budgets across the concurrentFiles so
-                // N files spread over the datacenters instead of overlapping. The per-file laned
-                // path here is the foundation that work builds on; the single-file case (the success
-                // metric) is correct, warm, and spread-across-mirrors as-is.
+                // MULTI-FILE BATCH SCHEDULER: the batch-level [mirrorScheduler] assigns DISTINCT
+                // mirrors to concurrent files (file A on datacenter-6, file B on datacenter-8) so two
+                // files no longer both pin the same mirror and split its ~2 MB/s ceiling. The
+                // [liveDemands] supplier hands the engine a snapshot of every CURRENTLY-active file's
+                // mirrors so runners re-consult the scheduler between chunks (a finished peer frees
+                // its mirror for the survivors). The scheduler only decides WHICH host each runner
+                // pins — the global 24-connection cap is still enforced by [connectionBudget].
                 adaptive = adaptiveEngine,
                 connectionBudget = connectionBudget,
+                scheduler = mirrorScheduler,
+                fileId = taskId,
+                liveDemands = { activeDemands.values.toList() },
                 onProgress = { bytes, bps ->
                     // honour pause: suspend until unpaused instead of busy-polling every 200ms.
                     // _isPaused is a StateFlow; .first { !it } suspends cheaply with no polling
@@ -455,9 +655,11 @@ class DownloadManager @Inject constructor(
             if (expectedMd5.isNotBlank()) {
                 val actualMd5 = computeMd5OrNull(cacheFile)  // off-main, cancellation-safe
                 if (actualMd5 != null && !actualMd5.equals(expectedMd5, ignoreCase = true)) {
-                    // Don't rename/copy: throwing here lands in the catch below, which deletes
-                    // the cache file and marks the task FAILED with this message.
-                    throw java.io.IOException("File corrupt - retry")
+                    // Don't rename/copy: throwing CorruptDownloadException lands in the catch below,
+                    // which DELETES the .part + manifest (a genuinely corrupt file must NOT be
+                    // resumed — every byte is suspect) and marks the task FAILED. This is the ONLY
+                    // failure path that discards the .part; all other (retryable) failures keep it.
+                    throw CorruptDownloadException("File corrupt - retry")
                 }
             }
 
@@ -467,14 +669,29 @@ class DownloadManager @Inject constructor(
             } else {
                 copyToDestination(cacheFile, customRootBase, defaultRootBase, subfolder, filename)
             }
-            cacheFile.delete()
+            // Published successfully — the .part + manifest have done their job; drop both.
+            discardPartAndManifest()
             updateTask(taskId) { it.copy(downloaded = if (expected > 0) expected else total, status = DownloadStatus.DONE, speed = 0.0) }
         } catch (c: CancellationException) {
-            cacheFile.delete()
+            // The user explicitly cancelled (or paused-then-cancelled): there is nothing to resume,
+            // so drop the .part + manifest. (A process FORCE-KILL never reaches this catch — the
+            // coroutine is killed outright — so the .part + manifest survive on disk for resume,
+            // which is exactly the overnight-resume win.)
+            discardPartAndManifest()
             updateTask(taskId) { it.copy(status = DownloadStatus.CANCELLED, speed = 0.0) }
+        } catch (e: CorruptDownloadException) {
+            // MD5 mismatch — the assembled bytes are genuinely corrupt. DELETE the .part + manifest
+            // so the next attempt re-fetches from scratch (a resume would just re-assemble the same
+            // bad bytes). This is the final correctness gate the resume feature relies on.
+            Log.w("EmuHelper", "Download corrupt (md5 mismatch): $filename", e)
+            discardPartAndManifest()
+            updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, speed = 0.0, error = e.message ?: "File corrupt - retry") }
         } catch (e: Exception) {
-            Log.w("EmuHelper", "Download failed: $filename", e)
-            cacheFile.delete()
+            // RETRYABLE failure (network error, incomplete, host blip). KEEP the .part + manifest so
+            // a retry / next-launch resume continues from the chunks already done instead of
+            // restarting a multi-GB download from zero. The end-of-download MD5 verify still runs on
+            // the next completed attempt, so a kept-but-bad .part can never publish a corrupt file.
+            Log.w("EmuHelper", "Download failed (retryable, keeping .part for resume): $filename", e)
             // B11: Detect out-of-disk-space and surface a clear message.
             val errorMessage = if (e is IOException) {
                 val msg = e.message ?: ""
@@ -483,6 +700,10 @@ class DownloadManager @Inject constructor(
                 else msg.ifBlank { e.javaClass.simpleName }
             } else e.message ?: e.javaClass.simpleName
             updateTask(taskId) { it.copy(status = DownloadStatus.FAILED, speed = 0.0, error = errorMessage) }
+        } finally {
+            // Free this file's mirror demand on EVERY exit path (done/failed/cancelled) so the batch
+            // scheduler reassigns its datacenter to the remaining files on their next rebalance.
+            activeDemands.remove(taskId)
         }
     }
 

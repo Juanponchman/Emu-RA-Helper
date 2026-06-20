@@ -21,7 +21,7 @@
 
 EmuHelper is an Android download manager built for the [Internet Archive](https://archive.org). **Grab the APK, sign in with your free Internet Archive account, and you're downloading in under a minute** — the collections are already wired up, so there's nothing to configure. It browses those collections, lets you assemble and save selections, and fetches them with a fast multi-connection transfer engine that drops everything into tidy per-category folders.
 
-> **Status: Early / Alpha — v0.7.0.** Now with Xbox & Xbox 360 support and a faster, warmer-connection multi-mirror download engine. Still actively being built — expect rough edges, and please file issues.
+> **Status: Early / Alpha — v0.8.0.** Now downloads multiple games in parallel across Internet Archive mirrors, resumes interrupted downloads (even after a crash or reboot), and protects long overnight batches with Wi-Fi-only and thermal safeguards. Plus Xbox & Xbox 360 support from v0.7.0. Still actively being built — expect rough edges, and please file issues.
 
 > *Builders:* the source repository itself is content-free by design — it ships with no collections, generated from an empty template. The prebuilt release is the ready-to-use one; if you build from source you supply your own. See [Build from source](#-build-from-source).
 

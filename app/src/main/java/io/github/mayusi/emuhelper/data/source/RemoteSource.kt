@@ -89,6 +89,10 @@ class RemoteSource @Inject constructor(
         private const val MAX_ATTEMPTS = 5
         /** FIX #12: hard cap on cached metadata roots (LRU eviction beyond this). */
         private const val METADATA_CACHE_MAX = 20
+        /** RESUME (v0.8): the sidecar manifest filename is `<part>.manifest`. */
+        private const val MANIFEST_SUFFIX = ".manifest"
+        /** RESUME: throttle manifest writes to at most one per this interval (cheap, not per-byte). */
+        private const val MANIFEST_SAVE_INTERVAL_MS = 750L
         // Browser-like UA. The configured source host occasionally serves different
         // content to non-browser UAs; this pattern maximises compatibility.
         private const val USER_AGENT =
@@ -406,7 +410,11 @@ class RemoteSource @Inject constructor(
         pool.ifEmpty { listOf(good.first().url) }
     }
 
-    suspend fun downloadFileSegmented(
+    // INTERNAL (was public): the new MULTI-FILE BATCH SCHEDULER params reference the engine's
+    // internal types ([MirrorScheduler], [FileDemand]). Kotlin forbids a public function from
+    // exposing internal parameter types, and this method is only ever called by [DownloadManager]
+    // (same module), so making it internal is correct and changes nothing for callers.
+    internal suspend fun downloadFileSegmented(
         candidateUrls: List<String>,
         expectedSize: Long,
         destFile: File,
@@ -417,7 +425,17 @@ class RemoteSource @Inject constructor(
         adaptive: Boolean = false,
         // Shared global connection budget (the DownloadManager's Semaphore(24)). When null we
         // fall back to a per-file internal Semaphore(segments) for back-compat / unit tests.
-        connectionBudget: Semaphore? = null
+        connectionBudget: Semaphore? = null,
+        // MULTI-FILE BATCH SCHEDULER (default null = today's per-file behaviour, so the static path
+        // and existing unit tests are byte-for-byte unchanged). When a [scheduler] AND [fileId] are
+        // provided, the adaptive path uses the BATCH-LEVEL lane assignment (distinct mirrors per
+        // concurrent file) instead of this file's own [planLanes]. [liveDemands] supplies the
+        // currently-active file demands so the runner can re-consult the scheduler between chunks
+        // (rebalancing when a peer file finishes). The scheduler only decides WHICH host each runner
+        // pins; the global 24-cap is still enforced by [connectionBudget].
+        scheduler: MirrorScheduler? = null,
+        fileId: String? = null,
+        liveDemands: (() -> List<FileDemand>)? = null
     ): Long = withContext(Dispatchers.IO) {
         // Resolve each candidate's redirect once to its real node, dedup.
         val resolvedHosts = candidateUrls.map { resolveFinalUrl(it) ?: it }.distinct()
@@ -454,7 +472,10 @@ class RemoteSource @Inject constructor(
                 connectionBudget = connectionBudget ?: Semaphore(segments.coerceAtLeast(1)),
                 probeRates = probeRates ?: emptyMap(),
                 onProgress = onProgress,
-                isCancelled = isCancelled
+                isCancelled = isCancelled,
+                scheduler = scheduler,
+                fileId = fileId,
+                liveDemands = liveDemands
             )
         }
 
@@ -594,15 +615,89 @@ class RemoteSource @Inject constructor(
         // static-path call site needn't change. Suppress the unused warning.
         @Suppress("UNUSED_PARAMETER") probeRates: Map<String, Double>,
         onProgress: suspend (Long, Double) -> Unit,
-        isCancelled: () -> Boolean
+        isCancelled: () -> Boolean,
+        // MULTI-FILE BATCH SCHEDULER (default null = single-file per-file planLanes, unchanged). When
+        // present alongside [fileId] and [liveDemands], the lane topology comes from the batch-level
+        // [MirrorScheduler.assign] (distinct mirrors per concurrent file) and is RE-CONSULTED between
+        // chunks so a freed mirror (peer file finished) flows to this file. The scheduler only picks
+        // WHICH host each runner pins; the 24-cap stays enforced by [connectionBudget].
+        scheduler: MirrorScheduler? = null,
+        fileId: String? = null,
+        liveDemands: (() -> List<FileDemand>)? = null
     ): Long {
         val distinctHosts = hosts.distinct()
         destFile.parentFile?.mkdirs()
-        // Pre-size the .part so each worker can seek to any absolute offset (kept from static path).
-        RandomAccessFile(destFile, "rw").use { it.setLength(expectedSize) }
 
         val chunks = partitionChunks(expectedSize)
-        val queue = ChunkQueue(chunks)
+
+        // ---- PARTIAL-BYTE RESUME (v0.8) ----------------------------------------------------------
+        // BEFORE pre-sizing, try to resume from a persisted manifest sitting next to the .part. The
+        // manifest records which chunk indices a PRIOR interrupted run finished, plus the file's
+        // expectedSize+chunkSize so we can validate it. We trust it ONLY when the recorded
+        // size/chunking match AND the existing .part is already at least the full pre-sized length
+        // (so seek-writes into it are valid). On ANY mismatch we discard it and start fresh — the
+        // safe fallback. The end-of-download MD5 verify (in DownloadManager) is the final correctness
+        // gate regardless, so a bad resume can NEVER ship a corrupt file.
+        val manifestFile = File(destFile.parentFile, destFile.name + MANIFEST_SUFFIX)
+        val existingPartLength = if (destFile.exists()) destFile.length() else 0L
+        val resumedDone: Set<Int> = run {
+            val raw = runCatching { if (manifestFile.exists()) manifestFile.readText() else null }
+                .getOrNull()
+            val validated = ResumeManifest.parseAndValidate(
+                raw = raw,
+                expectedSize = expectedSize,
+                chunkSize = AdaptiveEngine.CHUNK_SIZE,
+                partLength = existingPartLength
+            )
+            if (validated != null && validated.isNotEmpty()) {
+                Log.i(
+                    "EmuHelper",
+                    "resume: ${validated.size}/${chunks.size} chunks already done for ${destFile.name}"
+                )
+                validated
+            } else {
+                // No trustworthy manifest -> start fresh; remove any stale manifest so we don't keep
+                // re-reading a mismatched one.
+                if (validated == null && manifestFile.exists()) runCatching { manifestFile.delete() }
+                emptySet()
+            }
+        }
+
+        // Pre-size the .part so each worker can seek to any absolute offset (kept from static path).
+        // setLength to expectedSize is a no-op when the .part is already full (the resume case), and
+        // creates/extends it on a fresh download — so this is safe for both paths.
+        RandomAccessFile(destFile, "rw").use { it.setLength(expectedSize) }
+
+        // Construct the queue, pre-seeding the resumed done-set so ONLY the missing chunks are
+        // fetched. A fresh download passes emptySet -> every chunk is queued, unchanged behaviour.
+        val queue = ChunkQueue(chunks, preDone = resumedDone)
+
+        // Persist the done-set to the manifest. Called on chunk completion (THROTTLED — at most once
+        // per ~750ms via [lastManifestSaveMs]) and once at the very end, never per byte, so it's
+        // cheap. Writes the compact single-line manifest atomically-ish (write to a temp then rename)
+        // so an app-kill mid-write can't leave a half-written manifest.
+        val lastManifestSaveMs = java.util.concurrent.atomic.AtomicLong(0L)
+        val saveManifest: (force: Boolean) -> Unit = { force ->
+            val now = System.currentTimeMillis()
+            val prev = lastManifestSaveMs.get()
+            if (force || now - prev >= MANIFEST_SAVE_INTERVAL_MS) {
+                if (force || lastManifestSaveMs.compareAndSet(prev, now)) {
+                    runCatching {
+                        val line = ResumeManifest.serialize(
+                            expectedSize, AdaptiveEngine.CHUNK_SIZE, queue.doneIndices()
+                        )
+                        val tmp = File(manifestFile.parentFile, manifestFile.name + ".tmp")
+                        tmp.writeText(line)
+                        // Rename over the real manifest (best-effort atomic). Fall back to a direct
+                        // write if rename fails (e.g. odd filesystem) so we still persist progress.
+                        if (!tmp.renameTo(manifestFile)) {
+                            manifestFile.writeText(line)
+                            runCatching { tmp.delete() }
+                        }
+                    }
+                }
+            }
+        }
 
         // v3 RETIRED the per-chunk HostScoreboard.pickHost() re-pick. The laned engine PINS each
         // runner to one host (see below), so there is no per-chunk host selection to score: warm h2
@@ -620,7 +715,14 @@ class RemoteSource @Inject constructor(
         // Progress: confirmedBytes counts only fully-completed chunks (monotonic — a requeue can
         // never make it go backwards or over-count). It is what we REPORT, keeping the progress
         // bar monotonic. A separate liveBytes feeds the windowed speed number only.
-        val confirmedBytes = java.util.concurrent.atomic.AtomicLong(0)
+        //
+        // RESUME: pre-seed confirmedBytes with the bytes of the chunks already done from the manifest
+        // so the progress bar starts where the prior run left off (not at 0). The final completion
+        // check asserts confirmedBytes == expectedSize, and every done chunk's length is counted
+        // exactly once (resumed-done here + freshly-completed below = all chunks), so the invariant
+        // still holds exactly.
+        val resumedBytes = resumedDone.sumOf { chunks[it].length }
+        val confirmedBytes = java.util.concurrent.atomic.AtomicLong(resumedBytes)
         val liveBytes = java.util.concurrent.atomic.AtomicLong(0)
         val startTime = System.currentTimeMillis()
         var lastReport = startTime
@@ -646,8 +748,34 @@ class RemoteSource @Inject constructor(
             .coerceAtLeast(1)
             .coerceAtLeast(minOf(chunks.size, AdaptiveEngine.MAX_ADAPTIVE_WORKERS))
             .coerceIn(1, chunks.size)
+
+        // MULTI-FILE BATCH SCHEDULER seam. When a [scheduler] is wired (multi-file batch), the lane
+        // topology for THIS file comes from the batch-level assignment ([MirrorScheduler.assign]) so
+        // concurrent files pin DISTINCT mirrors (file A on datacenter-6, file B on datacenter-8) —
+        // each at its full ~2 MB/s instead of splitting one mirror. When the scheduler is null (the
+        // single-file path and all unit tests), this is byte-identical to the old planLanes call.
+        //
+        // [planLanesNow] is RE-QUERYABLE: runners call it between chunks so that when a peer file
+        // finishes, the freed mirror flows back to this file on the next chunk (the scheduler returns
+        // a wider plan once fewer files are active). It's a pure read of the scheduler + the live
+        // demand snapshot — no permits minted; the 24-cap is still the Semaphore's job.
+        val planLanesNow: () -> List<Lane> = {
+            val sched = scheduler
+            val fid = fileId
+            val demandsSupplier = liveDemands
+            if (sched != null && fid != null && demandsSupplier != null) {
+                val demands = demandsSupplier()
+                // If we're the only active file (peers finished), fall back to the full single-file
+                // plan over all our mirrors (the scheduler does this internally too, but guard here).
+                val plan = sched.assign(demands).firstOrNull { it.fileId == fid }?.lanes
+                if (plan.isNullOrEmpty()) planLanes(distinctHosts, laneBudget) else plan
+            } else {
+                planLanes(distinctHosts, laneBudget)
+            }
+        }
+
         // Plan the warm-lane topology: one Lane per host with its streams-per-host count.
-        val lanes = planLanes(distinctHosts, laneBudget).ifEmpty {
+        val lanes = planLanesNow().ifEmpty {
             // Degenerate fallback (no usable host) — single lane on whatever host we have.
             listOf(Lane(distinctHosts.first(), 1))
         }
@@ -683,6 +811,25 @@ class RemoteSource @Inject constructor(
                 live.firstOrNull { it != avoid }
                     ?: live.firstOrNull()
                     ?: pinned
+            }
+        }
+        // BATCH-SCHEDULER RE-TARGET. Decide the host a primary runner should pull its NEXT chunk
+        // from, consulting the live scheduler plan between chunks. If the runner's [pinnedHost] is
+        // still both ASSIGNED to this file by the scheduler AND live, keep it (warm h2 reuse). Else
+        // re-pin to a host that is currently assigned-to-this-file AND live (so a peer file finishing
+        // hands this file the freed mirror), falling back to the plain live-host failover when the
+        // scheduler offers nothing usable. When no scheduler is wired this is exactly
+        // pickLiveHost(pinnedHost, null) — the single-file path is unchanged.
+        val effectiveHostFor: (pinnedHost: String) -> String = { pinned ->
+            if (scheduler == null) {
+                pickLiveHost(pinned, null)
+            } else {
+                val assigned = planLanesNow().map { it.host }
+                when {
+                    pinned in assigned && pinned in liveHosts -> pinned
+                    else -> assigned.firstOrNull { it in liveHosts }
+                        ?: pickLiveHost(pinned, null)
+                }
             }
         }
         // Record the outcome of a chunk attempt on [host] for lane-failover bookkeeping. A success
@@ -808,7 +955,8 @@ class RemoteSource @Inject constructor(
                                     onConnReleased = onConnReleased,
                                     onRaceWon = { racesWon.incrementAndGet() },
                                     onChunkCompleted = onChunkCompleted,
-                                    onHostOutcome = onHostOutcome
+                                    onHostOutcome = onHostOutcome,
+                                    onChunkDone = { saveManifest(false) }
                                 )
                             } else {
                                 // Nothing to claim right now but peers hold in-flight chunks that
@@ -817,13 +965,15 @@ class RemoteSource @Inject constructor(
                             }
                             continue
                         }
-                        // FAILOVER: if this runner's pinned host has been declared dead (its lane
-                        // exhausted its error budget — a mirror went down mid-download), re-target
-                        // to a surviving host for this chunk. This redistributes the dead lane's
-                        // stream budget onto the live mirrors WITHOUT exceeding the global cap (the
-                        // shared Semaphore is unchanged). While the host stays live this is a no-op
-                        // and the runner keeps reusing its own warm connection.
-                        val effectiveHost = pickLiveHost(pinnedHost, null)
+                        // FAILOVER + BATCH RE-TARGET: if this runner's pinned host has been declared
+                        // dead (its lane exhausted its error budget — a mirror went down mid-download)
+                        // OR the batch scheduler has re-assigned mirrors (a peer file finished and
+                        // freed a datacenter), re-target to the right surviving host for this chunk.
+                        // This redistributes stream budget onto the correct live mirrors WITHOUT
+                        // exceeding the global cap (the shared Semaphore is unchanged). While the
+                        // pinned host stays assigned + live this is a no-op and the runner keeps
+                        // reusing its own warm connection.
+                        val effectiveHost = effectiveHostFor(pinnedHost)
                         downloadChunkAttempt(
                             chunk = chunk,
                             pinnedHost = effectiveHost,
@@ -842,7 +992,8 @@ class RemoteSource @Inject constructor(
                             onConnReleased = onConnReleased,
                             onRaceWon = { /* primary path is never a race win */ },
                             onChunkCompleted = onChunkCompleted,
-                            onHostOutcome = onHostOutcome
+                            onHostOutcome = onHostOutcome,
+                            onChunkDone = { saveManifest(false) }
                         )
                     }
                     @Suppress("UNUSED_EXPRESSION") runnerIdx  // keep index in scope for clarity/debug
@@ -871,6 +1022,10 @@ class RemoteSource @Inject constructor(
         if (total != expectedSize) {
             throw IOException("Adaptive download size mismatch: confirmed $total != expected $expectedSize")
         }
+        // RESUME: the file is fully assembled — the manifest has done its job. Delete it so a later
+        // copy/extract failure or a re-run doesn't trip over a stale "all done" manifest. The .part
+        // is the source of truth from here; the MD5 verify in DownloadManager is the final gate.
+        runCatching { if (manifestFile.exists()) manifestFile.delete() }
         // v2 HONEST BENCH LOG (aggregate, once at completion — cheap, no per-chunk spam). Lets the
         // maintainer compare adaptive-on vs adaptive-off MB/s on a real device from logcat, and see
         // whether over-provisioning actually opened more connections and whether tail-racing fired
@@ -1007,7 +1162,11 @@ class RemoteSource @Inject constructor(
         // error) so the caller can declare a dead lane and redistribute. NO-OP for primaries that
         // don't care (and for racers, which never affect lane health). Stalls do NOT call this — a
         // stall is not a lane-death signal, only a migration.
-        onHostOutcome: (host: String, ok: Boolean) -> Unit = { _, _ -> }
+        onHostOutcome: (host: String, ok: Boolean) -> Unit = { _, _ -> },
+        // RESUME (v0.8): invoked exactly once when THIS attempt's markDone transitioned the chunk to
+        // DONE, so the caller can persist the (throttled) resume manifest. NO-OP by default so unit
+        // tests are unaffected.
+        onChunkDone: () -> Unit = {}
     ) {
         if (isCancelled()) throw CancellationException()
         // v2 racer: if the chunk already finished between pickRaceTarget and here, there's nothing
@@ -1170,6 +1329,9 @@ class RemoteSource @Inject constructor(
             if (queue.markDone(chunk)) {
                 confirmedBytes.addAndGet(chunk.length)
                 if (isRace) onRaceWon()   // v2: this racer beat the primary — count the win.
+                // RESUME: persist the (throttled) done-set so an app-kill resumes from here. Fired
+                // only on a real DONE transition (exactly once per chunk), never per byte.
+                onChunkDone()
             }
             // DIAG: accumulate per-host stats and HTTP protocol for the bench log.
             // Called for EVERY successful chunk attempt (primary or winning racer) so the

@@ -1,5 +1,7 @@
 package io.github.mayusi.emuhelper.data.source
 
+import kotlinx.coroutines.sync.withLock
+
 /**
  * Pure, Android-free logic for the ADAPTIVE DOWNLOAD ENGINE (v1: chunk-queue work-stealing).
  *
@@ -161,6 +163,26 @@ internal object AdaptiveEngine {
      * there is only one mirror and budget to spare — going past it COSTS throughput, it doesn't add.
      */
     const val MAX_STREAMS_PER_HOST: Int = 4
+
+    // ===================================================================================
+    // OVERNIGHT GOVERNORS (v0.8) — THERMAL BACKOFF target cap.
+    //
+    // A long overnight batch can slowly cook a handheld. On a SEVERE+ thermal status the thermal
+    // governor SHRINKS the live connection cap toward [THERMAL_REDUCED_CAP] by HOLDING permits from
+    // the shared 24-permit Semaphore — fewer available permits = fewer concurrent connections =
+    // always cap-safe (the governor only ever REDUCES the live cap, never raises it past 24). When
+    // the device cools, the held permits are released and the full budget is restored.
+    // ===================================================================================
+
+    /**
+     * The reduced LIVE connection cap the thermal governor shrinks toward on a SEVERE-or-worse
+     * thermal status. ~8 keeps a couple of warm lanes per mirror alive (download keeps making
+     * progress) while roughly a third of the normal connection pressure — enough to let the device
+     * shed heat over a long overnight batch. The governor reaches this by holding
+     * ([MAX_ADAPTIVE_WORKERS] − this) permits; it never holds so many that the live cap drops below
+     * 1 (always at least one connection survives so the download never fully stalls).
+     */
+    const val THERMAL_REDUCED_CAP: Int = 8
 }
 
 /**
@@ -289,6 +311,95 @@ internal fun partitionChunks(size: Long, chunkSize: Long = AdaptiveEngine.CHUNK_
 }
 
 /**
+ * PARTIAL-BYTE RESUME MANIFEST (v0.8) — the pure, Android-free serialisation + VALIDATION of a
+ * persisted set of completed chunk indices, written next to a download's .part file so an
+ * interrupted (app-killed / network-blip) multi-GB download resumes from where it left off instead
+ * of restarting from zero.
+ *
+ * WHY A MANIFEST AT ALL. The adaptive engine partitions [0,size) into independent, idempotent,
+ * absolute-offset chunks ([partitionChunks]). A chunk is either fully written or not — there's no
+ * partial-chunk ambiguity to reconstruct. So "where did we get to" reduces to "which chunk indices
+ * are done", a tiny set we can persist cheaply (on chunk completion, NOT per byte). On resume we
+ * pre-seed the [ChunkQueue] with that set ([ChunkQueue.preDone]) and only the MISSING chunks are
+ * fetched.
+ *
+ * WHY VALIDATE BEFORE TRUSTING. A .part on disk could be stale (the file changed size on the server,
+ * the chunking constant changed in an app update, the .part was truncated). Trusting a mismatched
+ * manifest would seek-write the wrong offsets. So [parseAndValidate] returns the done-set ONLY when
+ * the manifest's recorded expectedSize AND chunkSize match what THIS download expects AND the on-disk
+ * .part is at least the expected size (it was pre-sized to expectedSize via setLength). On ANY
+ * mismatch it returns null and the caller starts fresh — the safe fallback. The end-of-download MD5
+ * verify is the FINAL correctness gate regardless: a bad resume can never publish a corrupt file
+ * because MD5 still runs on the assembled .part.
+ *
+ * FORMAT (a single compact line, version-tagged so a future format bump is detectable):
+ *   "v1|<expectedSize>|<chunkSize>|<comma-separated-sorted-done-indices>"
+ * e.g. "v1|104857600|8388608|0,1,2,5,7" — done chunks 0,1,2,5,7 of a 100 MB file in 8 MB chunks.
+ * The done-list may be empty ("v1|...|...|"). Pure text, no JSON dependency, trivially testable.
+ */
+internal object ResumeManifest {
+    /** Current manifest format version tag. Bumped only if the line format itself changes. */
+    const val VERSION = "v1"
+    private const val SEP = "|"
+
+    /**
+     * Serialise [doneIndices] for a download of [expectedSize] bytes chunked at [chunkSize] into the
+     * single-line manifest format. Indices are written sorted+distinct for a stable, diff-friendly
+     * line. Pure — no I/O.
+     */
+    fun serialize(expectedSize: Long, chunkSize: Long, doneIndices: Set<Int>): String {
+        val sorted = doneIndices.toSortedSet().joinToString(",")
+        return listOf(VERSION, expectedSize.toString(), chunkSize.toString(), sorted)
+            .joinToString(SEP)
+    }
+
+    /**
+     * Parse + VALIDATE a manifest line against the CURRENT download's [expectedSize] and [chunkSize]
+     * and the on-disk [partLength]. Returns the trusted done-set, or null when the resume must NOT be
+     * trusted (start fresh). Returns null when ANY of these hold:
+     *   - [raw] is null/blank, malformed, or a different VERSION,
+     *   - the recorded expectedSize/chunkSize don't match this download's (the file or chunking
+     *     changed — old offsets are meaningless),
+     *   - [partLength] < [expectedSize] (the .part was never pre-sized to full, or was truncated —
+     *     a seek-write into it would be unsafe / the resume can't be trusted),
+     *   - any recorded index is outside the valid chunk-count range for this size+chunkSize.
+     *
+     * Never throws — a parse failure is just an untrusted resume (null), and the caller starts fresh.
+     */
+    fun parseAndValidate(
+        raw: String?,
+        expectedSize: Long,
+        chunkSize: Long,
+        partLength: Long
+    ): Set<Int>? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            // Keep the trailing empty done-field: split with limit=4 so an empty index list parses.
+            val parts = raw.trim().split(SEP, limit = 4)
+            if (parts.size < 4) return null
+            if (parts[0] != VERSION) return null
+            val recordedSize = parts[1].toLongOrNull() ?: return null
+            val recordedChunk = parts[2].toLongOrNull() ?: return null
+            // The file's size and chunking MUST match what we're about to download.
+            if (recordedSize != expectedSize) return null
+            if (recordedChunk != chunkSize) return null
+            // The .part must already be (at least) the full pre-sized length — we seek-write into it.
+            if (partLength < expectedSize) return null
+            val chunkCount = partitionChunks(expectedSize, chunkSize).size
+            if (chunkCount <= 0) return null
+            val idxField = parts[3]
+            val indices = if (idxField.isBlank()) emptySet()
+            else idxField.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
+            // Defensive: every recorded index must be a valid chunk index for this partition.
+            if (indices.any { it < 0 || it >= chunkCount }) return null
+            indices
+        } catch (e: Exception) {
+            null  // any parse failure -> untrusted -> start fresh
+        }
+    }
+}
+
+/**
  * Thread-safe work queue of [Chunk]s for the work-stealing pool.
  *
  * Lifecycle of a chunk: it starts QUEUED. A worker [poll]s it (-> IN-FLIGHT), then either
@@ -306,7 +417,17 @@ internal fun partitionChunks(size: Long, chunkSize: Long = AdaptiveEngine.CHUNK_
 internal class ChunkQueue(
     chunks: List<Chunk>,
     /** Injected clock so tail-race timing is deterministic in tests. */
-    private val nowProvider: () -> Long = { System.currentTimeMillis() }
+    private val nowProvider: () -> Long = { System.currentTimeMillis() },
+    /**
+     * PARTIAL-BYTE RESUME (v0.8). Chunk indices already known-complete from a persisted manifest of
+     * a prior, interrupted download of the SAME file. These are marked DONE at construction and are
+     * NOT enqueued, so a resumed download only fetches the MISSING chunks. The caller must have
+     * already validated that the on-disk .part length and the manifest match the file's expected
+     * size + chunking BEFORE trusting these (a mismatch -> pass emptySet and start fresh). Invalid
+     * indices (outside 0..count-1) are ignored defensively. The end-of-download MD5 verify is still
+     * the final correctness gate — a bad resume can never ship a corrupt file because MD5 still runs.
+     */
+    preDone: Set<Int> = emptySet()
 ) {
     private val lock = Any()
 
@@ -365,11 +486,26 @@ internal class ChunkQueue(
     private var dones = 0L
 
     init {
-        // Every chunk starts queued, in index order.
-        for (c in all) queued.add(c.index)
+        // PARTIAL-BYTE RESUME: pre-seed the persisted done-set (defensively filtered to valid
+        // indices), then enqueue ONLY the still-missing chunks in index order. A fresh download
+        // passes preDone=emptySet, so every chunk is enqueued exactly as before (unchanged behaviour).
+        val validPreDone = preDone.filter { it in all.indices }
+        done.addAll(validPreDone)
+        for (c in all) {
+            if (c.index !in done) queued.add(c.index)
+        }
     }
 
     val count: Int get() = all.size
+
+    /**
+     * Snapshot of the indices currently DONE (for persisting the resume manifest). A copy, so the
+     * caller can never mutate internal state. Thread-safe.
+     */
+    fun doneIndices(): Set<Int> = synchronized(lock) { done.toSet() }
+
+    /** Count of indices currently DONE (cheap, for confirmed-byte pre-seeding on resume). */
+    fun doneCount(): Int = synchronized(lock) { done.size }
 
     /**
      * Claim the next queued chunk, or null if none is currently available. A null return does
@@ -894,5 +1030,148 @@ internal class HostScoreboard(
         private const val MIN_WEIGHT = 1e-6
         /** Sentinel for "this host has never stalled" — treated as not cooled (overflow-safe). */
         private const val NEVER_STALLED = Long.MIN_VALUE
+    }
+}
+
+// =====================================================================================
+// OVERNIGHT GOVERNORS (v0.8) — PURE, Android-free DECISION logic + the Semaphore-only thermal
+// permit governor. The Android framework wiring (ConnectivityManager / PowerManager callbacks) in
+// DownloadManager is kept deliberately THIN: it just observes a state change and forwards it to one
+// of these testable units. Per the spec, the DECISIONS live here so they can be unit-tested without
+// the framework.
+// =====================================================================================
+
+/** What the Wi-Fi-only governor decides to do in response to a network change. */
+internal enum class WifiGovernorAction { PAUSE, RESUME, NONE }
+
+/**
+ * (3a) WI-FI-ONLY ENFORCEMENT — pure decision.
+ *
+ * SettingsStore.wifiOnly, when ON, means "downloads only on an unmetered (Wi-Fi) network". The
+ * framework callback reports the current network's connected + metered state; this function decides
+ * whether the GOVERNOR should pause or resume the batch. It pauses/resumes ONLY what it itself
+ * paused ([governorPaused] tracks that), so it never fights a user's manual pause.
+ *
+ * Rules (only fire when [wifiOnly] is ON — when OFF the governor never touches the batch):
+ *   - The active network is metered (cellular) or not connected, and the governor hasn't already
+ *     paused -> PAUSE (we strayed onto a metered network).
+ *   - The active network is back on unmetered Wi-Fi, and the governor HAD paused -> RESUME.
+ *   - Otherwise -> NONE (no change; in particular, if the user manually paused we never auto-resume).
+ *
+ * When [wifiOnly] is OFF: if the governor had previously paused the batch (the user just turned the
+ * setting off mid-pause), RESUME to undo our own pause; else NONE.
+ */
+internal fun decideWifiGovernorAction(
+    wifiOnly: Boolean,
+    isConnected: Boolean,
+    isMetered: Boolean,
+    governorPaused: Boolean
+): WifiGovernorAction {
+    if (!wifiOnly) {
+        // Setting is OFF: the governor must not enforce anything. If it had paused the batch itself,
+        // release that pause; otherwise do nothing.
+        return if (governorPaused) WifiGovernorAction.RESUME else WifiGovernorAction.NONE
+    }
+    val onUnmeteredWifi = isConnected && !isMetered
+    return when {
+        // Strayed onto metered/cellular (or lost connectivity) and we haven't paused yet -> pause.
+        !onUnmeteredWifi && !governorPaused -> WifiGovernorAction.PAUSE
+        // Back on unmetered Wi-Fi and WE paused it -> resume (undo only our own pause).
+        onUnmeteredWifi && governorPaused -> WifiGovernorAction.RESUME
+        else -> WifiGovernorAction.NONE
+    }
+}
+
+/**
+ * (3b) THERMAL BACKOFF — pure decision: how many permits the thermal governor should HOLD from the
+ * shared connection Semaphore at a given Android thermal status.
+ *
+ * Holding H permits reduces the LIVE connection cap to ([globalBudget] − H) — fewer available
+ * permits = fewer concurrent connections. The governor NEVER mints permits, so it can only REDUCE
+ * the live cap, never raise it past [globalBudget] (the #1 safety property is preserved).
+ *
+ * Mapping (thermalStatus uses PowerManager.THERMAL_STATUS_* ordinals: NONE=0, LIGHT=1, MODERATE=2,
+ * SEVERE=3, CRITICAL=4, EMERGENCY=5, SHUTDOWN=6):
+ *   - below SEVERE (status < 3): hold 0 — full budget, no backoff.
+ *   - SEVERE or worse (status >= 3): hold enough to drop the live cap to [reducedCap] (~8), i.e.
+ *     hold (globalBudget − reducedCap) permits — but never so many that the live cap falls below 1
+ *     (at least one connection always survives so the download keeps inching forward).
+ */
+internal fun thermalPermitsToHold(
+    thermalStatus: Int,
+    globalBudget: Int = AdaptiveEngine.MAX_ADAPTIVE_WORKERS,
+    reducedCap: Int = AdaptiveEngine.THERMAL_REDUCED_CAP,
+    severeThreshold: Int = THERMAL_STATUS_SEVERE
+): Int {
+    if (thermalStatus < severeThreshold) return 0
+    // Drop the live cap to reducedCap, clamped so at least 1 connection survives and we never try to
+    // hold more permits than exist.
+    val targetLiveCap = reducedCap.coerceIn(1, globalBudget)
+    return (globalBudget - targetLiveCap).coerceIn(0, globalBudget)
+}
+
+/** PowerManager.THERMAL_STATUS_SEVERE ordinal (=3), inlined so the pure logic needs no Android import. */
+internal const val THERMAL_STATUS_SEVERE: Int = 3
+
+/**
+ * THERMAL PERMIT GOVERNOR — operates ONLY on a kotlinx [kotlinx.coroutines.sync.Semaphore] (the
+ * engine's shared 24-permit connection budget). Android-free and unit-testable against a real
+ * Semaphore. It enforces thermal backoff by HOLDING permits: to shrink the live cap it acquires
+ * extra permits (and keeps them); to restore it, it releases them.
+ *
+ * SAFETY: it only ever moves permits it has acquired in/out of the shared Semaphore. Holding permits
+ * can only REDUCE the number available to download runners — it can NEVER increase the live cap past
+ * the Semaphore's capacity. Every acquire is matched by exactly one release (tracked by [heldPermits]),
+ * so the budget is conserved: when the governor releases everything, the full budget is restored.
+ *
+ * It is driven by [applyThermalStatus], called from the (thin) PowerManager listener wiring on a
+ * coroutine. Concurrency: [applyThermalStatus] is serialized by an internal mutex so two rapid
+ * thermal transitions can't race the held-permit count.
+ */
+internal class ThermalPermitGovernor(
+    private val connectionBudget: kotlinx.coroutines.sync.Semaphore,
+    private val globalBudget: Int = AdaptiveEngine.MAX_ADAPTIVE_WORKERS,
+    private val reducedCap: Int = AdaptiveEngine.THERMAL_REDUCED_CAP
+) {
+    private val mutex = kotlinx.coroutines.sync.Mutex()
+    @Volatile private var heldPermits = 0
+
+    /** How many permits the governor is currently holding (test/diagnostic). */
+    fun held(): Int = heldPermits
+
+    /** The current LIVE connection cap (full budget minus held permits) — what runners can use. */
+    fun liveCap(): Int = globalBudget - heldPermits
+
+    /**
+     * React to a thermal status change: acquire/release permits so the number HELD equals
+     * [thermalPermitsToHold] for [thermalStatus]. Acquiring blocks until permits are free (so it
+     * never over-subscribes), which naturally lets in-flight downloads finish their current chunk
+     * before the cap tightens. Idempotent: calling it with the same status twice is a no-op.
+     */
+    suspend fun applyThermalStatus(thermalStatus: Int) {
+        val target = thermalPermitsToHold(thermalStatus, globalBudget, reducedCap)
+        mutex.withLock {
+            while (heldPermits < target) {
+                // Acquire one more permit to REDUCE the live cap. Blocks until one is free — so we
+                // never push past capacity; a runner releases its permit when its chunk finishes.
+                connectionBudget.acquire()
+                heldPermits++
+            }
+            while (heldPermits > target) {
+                // Release a held permit to RESTORE live cap as the device cools.
+                connectionBudget.release()
+                heldPermits--
+            }
+        }
+    }
+
+    /** Release ALL held permits (e.g. batch ended) so the full budget is restored. */
+    suspend fun release() {
+        mutex.withLock {
+            while (heldPermits > 0) {
+                connectionBudget.release()
+                heldPermits--
+            }
+        }
     }
 }
