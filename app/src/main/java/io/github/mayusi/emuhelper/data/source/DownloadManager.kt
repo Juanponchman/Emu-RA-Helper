@@ -105,6 +105,15 @@ class DownloadManager @Inject constructor(
     @Volatile private var segmentsPerFile = 4
     @Volatile private var concurrentFiles = 2
     @Volatile private var extractArchives = false
+
+    /**
+     * Per-batch RAR-extraction choice from the download-preview prompt:
+     *   null  -> no explicit choice; fall back to the global [extractArchives] setting (like ZIP).
+     *   true  -> the user opted IN to extracting .rar files for THIS batch.
+     *   false -> the user opted OUT for this batch (save the .rar verbatim).
+     * Set by [start]/[retry] from [pendingExtractRar]; reset per batch.
+     */
+    @Volatile private var extractRarChoice: Boolean? = null
     /** EXPERIMENTAL adaptive (chunk-queue work-stealing) engine. Default OFF; loaded from
      *  settings on each start()/retry(). When false the proven static path runs unchanged. */
     @Volatile private var adaptiveEngine = false
@@ -167,7 +176,7 @@ class DownloadManager @Inject constructor(
     /** @param folderOverride when non-null, this batch downloads into THIS SAF tree instead of
      *  the global Settings download folder. Used by per-list custom destinations (a saved list
      *  can pin its own folder, e.g. PS1 on internal, N64 on the SD card). */
-    fun start(games: List<CuratedGame>, folderOverride: Uri? = null) {
+    fun start(games: List<CuratedGame>, folderOverride: Uri? = null, extractRar: Boolean? = null) {
         // B2: Atomic check-and-set prevents two concurrent callers (e.g. LaunchedEffect
         // refiring) from both passing the guard and spinning up duplicate batch jobs.
         synchronized(this) {
@@ -177,6 +186,8 @@ class DownloadManager @Inject constructor(
         }
         // Remember the override for the whole batch so retry() of any task lands in the same place.
         activeFolderOverride = folderOverride
+        // Per-batch RAR-extraction choice from the preview prompt (null = use global setting).
+        extractRarChoice = extractRar
         _isPaused.value = false
         userPaused = false
         governorPaused = false
@@ -520,6 +531,8 @@ class DownloadManager @Inject constructor(
         if (_isRunning.value) return
         // Drop the per-list folder override so the next non-list batch uses the global folder.
         activeFolderOverride = null
+        // Drop the per-batch RAR choice so the next batch re-reads the prompt / global setting.
+        extractRarChoice = null
         // B4: Attempt to record history via the same CAS guard used at batch-end.
         // If batch-end already recorded, the CAS in recordBatchHistory returns early (no-op).
         // Reset the AtomicBoolean BEFORE launching so the next batch starts clean,
@@ -602,6 +615,40 @@ class DownloadManager @Inject constructor(
         // the static path (which ignores the scheduler args).
         activeDemands[taskId] = FileDemand(fileId = taskId, mirrors = mirrors, sizeBytes = expected)
 
+        // INCREMENTAL MD5 (v0.9): when this is a clean, non-resumed, adaptive download WITH a known
+        // checksum, build an accumulator that the engine feeds (in order, exactly once per chunk) so
+        // the file is hashed DURING download — eliminating the post-download full-file re-read pass.
+        // [decideMd5Strategy] is the FIRST gate (resume/static/no-checksum -> FULL_ONLY, so we don't
+        // even construct it); the accumulator's own digestIfComplete() is the SECOND gate (returns null
+        // on ANY incomplete/raced/gapped coverage). The full pass below is ALWAYS the final source of
+        // truth — incremental can only ever SKIP it on a provably-complete clean run, never weaken it.
+        // We treat "a manifest exists on disk" as possibly-resumed (conservative over-approximation):
+        // if so, FULL_ONLY, and the engine also refuses to feed a resumed accumulator (belt + braces).
+        val maybeResumed = cacheManifest.exists()
+        val md5Strategy = decideMd5Strategy(
+            adaptive = adaptiveEngine,
+            resumed = maybeResumed,
+            expectedMd5Blank = expectedMd5.isBlank()
+        )
+        val incrementalMd5: IncrementalMd5Accumulator? =
+            if (md5Strategy == Md5Strategy.INCREMENTAL_THEN_FULL && expected > 0) {
+                IncrementalMd5Accumulator(
+                    totalSize = expected,
+                    chunks = partitionChunks(expected),
+                    // Read [len] bytes at absolute [start] from the committed .part. The accumulator
+                    // only reads ranges of chunks already markDone'd (fully written), so the bytes are
+                    // present. Any read error latches the accumulator's failed flag -> full-pass.
+                    reader = { start, len ->
+                        java.io.RandomAccessFile(cacheFile, "r").use { raf ->
+                            raf.seek(start)
+                            val out = ByteArray(len)
+                            raf.readFully(out)
+                            out
+                        }
+                    }
+                )
+            } else null
+
         try {
             val total = source.downloadFileSegmented(
                 candidateUrls = mirrors,
@@ -624,6 +671,12 @@ class DownloadManager @Inject constructor(
                 scheduler = mirrorScheduler,
                 fileId = taskId,
                 liveDemands = { activeDemands.values.toList() },
+                // BATCH-WIDE SETUP ELISION (v0.9): pass the item identifier + this file's relative path
+                // so RemoteSource resolves+ranks+range-probes the item's mirrors ONCE and reuses it for
+                // every subsequent file of the same item in the batch (skipping the redundant per-file
+                // probe round-trips). Adds no connections; the 24-cap stays enforced by connectionBudget.
+                identifier = base.identifier,
+                relativeName = base.relativeName.ifBlank { base.filename },
                 onProgress = { bytes, bps ->
                     // honour pause: suspend until unpaused instead of busy-polling every 200ms.
                     // _isPaused is a StateFlow; .first { !it } suspends cheaply with no polling
@@ -638,7 +691,10 @@ class DownloadManager @Inject constructor(
                     }
                     updateTask(taskId) { it.copy(downloaded = bytes, speed = bps) }
                 },
-                isCancelled = { cancelRequested }
+                isCancelled = { cancelRequested },
+                // INCREMENTAL MD5 (v0.9): the adaptive path feeds this on each chunk DONE (null on the
+                // static/resume/no-checksum cases per [decideMd5Strategy] above).
+                incrementalMd5 = incrementalMd5
             )
 
             // Validate size, then publish into the destination folder.
@@ -653,7 +709,19 @@ class DownloadManager @Inject constructor(
             // mismatch we FAIL the task and do NOT publish the corrupt file. If the md5 is
             // unknown or hashing itself errors, we proceed exactly as before (unverified).
             if (expectedMd5.isNotBlank()) {
-                val actualMd5 = computeMd5OrNull(cacheFile)  // off-main, cancellation-safe
+                // INCREMENTAL MD5 (v0.9): prefer the digest computed DURING download IFF the accumulator
+                // can PROVE it covered the whole file [0,size) in order with every byte fed exactly once
+                // (digestIfComplete() returns null on ANY gap/race/resume/read-error). On null we run
+                // the authoritative FULL pass — the full MD5 always remains the final source of truth, so
+                // a false-corrupt verdict (which would delete the user's file) is impossible: incremental
+                // only ever SKIPS the full read on a provably-clean run, it never substitutes a weaker
+                // check. (computeMd5OrNull also returns null on its own I/O error -> proceed unverified,
+                // exactly as before.)
+                val incremental = incrementalMd5?.digestIfComplete()
+                val actualMd5 = incremental ?: computeMd5OrNull(cacheFile)  // off-main, cancellation-safe
+                if (incremental != null) {
+                    Log.i("EmuHelper", "md5: incremental digest used (skipped full re-read) for $filename")
+                }
                 if (actualMd5 != null && !actualMd5.equals(expectedMd5, ignoreCase = true)) {
                     // Don't rename/copy: throwing CorruptDownloadException lands in the catch below,
                     // which DELETES the .part + manifest (a genuinely corrupt file must NOT be
@@ -666,6 +734,12 @@ class DownloadManager @Inject constructor(
             _statusText.value = "Saving $filename…"
             if (extractArchives && filename.lowercase().endsWith(".zip")) {
                 extractZipToDestination(cacheFile, customRootBase, defaultRootBase, subfolder)
+            } else if (shouldExtractRar(filename)) {
+                // In-app RAR extraction (RAR4 + RAR5) via the native unrar engine.
+                // Modeled on the ZIP path: extract to a SANDBOXED temp dir, publish
+                // on success, and FALL BACK to copying the .rar verbatim on ANY
+                // failure so the download is never lost.
+                extractRarToDestination(cacheFile, customRootBase, defaultRootBase, subfolder, filename)
             } else {
                 copyToDestination(cacheFile, customRootBase, defaultRootBase, subfolder, filename)
             }
@@ -838,6 +912,102 @@ class DownloadManager @Inject constructor(
             Log.w("EmuHelper", "Failed to extract zip, falling back to copy", e)
             // Fall back to copying the zip file as-is
             copyToDestination(zipFile, customRootBase, defaultRootBase, subfolder, zipFile.name)
+        }
+    }
+
+    /**
+     * Decide whether to extract a .rar [filename] for the CURRENT batch.
+     *  - must be a FIRST volume (never a trailing .partN/.rNN — unrar follows the
+     *    chain itself once opened on part 1; starting on a trailing part is wrong).
+     *  - the per-batch prompt choice ([extractRarChoice]) wins; if unset, fall back
+     *    to the global [extractArchives] setting (same toggle ZIP honours).
+     *  - the native engine must actually be available.
+     */
+    private fun shouldExtractRar(filename: String): Boolean {
+        if (!RarNative.available) return false
+        if (!RarExtractor.isFirstVolume(filename)) return false
+        return extractRarChoice ?: extractArchives
+    }
+
+    /**
+     * Extract a .rar archive into the destination folder via the native unrar
+     * engine, then publish the extracted files using the SAME SAF / app-private
+     * logic the ZIP and copy paths use. SAFETY:
+     *   - Extraction runs into a SANDBOXED app-private temp dir (unrar can't write
+     *     to a content:// SAF tree); we publish ONLY on engine success (rc == 0).
+     *   - Cancellation is threaded into the native engine via a cancel-flag handle
+     *     tied to [cancelRequested], so a multi-GB extract aborts promptly.
+     *   - On ANY failure (corrupt, password, OOM, missing volume, unexpected) we
+     *     FALL BACK to copying the .rar verbatim — the download is never lost and
+     *     a half-extracted mess is never published.
+     */
+    private fun extractRarToDestination(
+        rarFile: File, customRootBase: DocumentFile?, defaultRootBase: File, subfolder: String, filename: String
+    ) {
+        // Native cancel flag tied to the batch's cancelRequested. A tiny watcher
+        // thread flips it if the batch is cancelled mid-extract, so unrar aborts.
+        var cancelHandle = 0L
+        var watcher: Thread? = null
+        try {
+            cancelHandle = runCatching { RarNative.nativeNewCancelFlag() }.getOrDefault(0L)
+            if (cancelHandle != 0L) {
+                val h = cancelHandle
+                watcher = Thread {
+                    try {
+                        while (!Thread.currentThread().isInterrupted) {
+                            if (cancelRequested) { RarNative.nativeSetCancel(h); return@Thread }
+                            Thread.sleep(150)
+                        }
+                    } catch (_: InterruptedException) { /* extract finished */ }
+                }.apply { isDaemon = true; start() }
+            }
+
+            val cacheRoot = File(appContext.cacheDir, "rar").apply { mkdirs() }
+            val result = RarExtractor.extractToTempDir(rarFile, cacheRoot, cancelHandle)
+
+            if (!result.success || result.tempDir == null) {
+                // Engine failed / cancelled / produced nothing -> save the .rar verbatim.
+                Log.w("EmuHelper", "RAR extract unsuccessful (rc=${result.code}); saving $filename verbatim")
+                copyToDestination(rarFile, customRootBase, defaultRootBase, subfolder, filename)
+                return
+            }
+
+            try {
+                // Publish every extracted file into the console subfolder, flattened
+                // (we only ever wrote safe basenames). Reuses the existing helpers so
+                // SAF and app-private destinations behave exactly like the ZIP path.
+                for (f in result.files) {
+                    val entryName = f.name  // already a safe basename from the engine
+                    if (customRootBase != null) {
+                        val dir = resolveSafSubdir(customRootBase, subfolder)
+                        findChildCI(dir, entryName)?.delete()
+                        val out = dir.createFile("application/octet-stream", entryName)
+                            ?: throw IOException("Could not create file: $entryName")
+                        appContext.contentResolver.openOutputStream(out.uri, "w")?.use { os ->
+                            f.inputStream().use { it.copyTo(os, 1 shl 20) }
+                        } ?: throw IOException("Could not open output stream for: $entryName")
+                    } else {
+                        val dir = File(defaultRootBase, subfolder).apply { mkdirs() }
+                        val dest = File(dir, entryName)
+                        if (dest.exists()) dest.delete()
+                        f.inputStream().use { input ->
+                            dest.outputStream().buffered().use { input.copyTo(it, 1 shl 20) }
+                        }
+                    }
+                }
+            } finally {
+                // Always clean up the sandbox temp dir, success or partial-publish.
+                result.tempDir.deleteRecursively()
+            }
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "Failed to extract rar, falling back to copy", e)
+            // Fall back to copying the rar file as-is — never lose the download.
+            runCatching {
+                copyToDestination(rarFile, customRootBase, defaultRootBase, subfolder, filename)
+            }
+        } finally {
+            watcher?.interrupt()
+            if (cancelHandle != 0L) runCatching { RarNative.nativeFreeCancelFlag(cancelHandle) }
         }
     }
 

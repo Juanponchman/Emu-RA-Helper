@@ -52,6 +52,16 @@ class ScanStateHolder @Inject constructor() {
     val pendingListFolderUri = MutableStateFlow<String?>(null)
 
     /**
+     * Per-batch RAR-extraction choice from the download-preview prompt.
+     *   null  -> no .rar in the batch / no choice made -> use the global Extract setting.
+     *   true  -> extract .rar files after download for this batch.
+     *   false -> save .rar files verbatim for this batch.
+     * Consumed by [io.github.mayusi.emuhelper.ui.download.DownloadViewModel] at download start
+     * and passed through to DownloadManager.start(extractRar = ...).
+     */
+    val pendingExtractRar = MutableStateFlow<Boolean?>(null)
+
+    /**
      * Release the large scannedFiles map (can be 10s of MB) once the user has committed
      * their selection and the chosen games have been copied into downloadQueue / pendingListGames.
      * Does NOT touch selectedGames, downloadQueue, or pendingListGames — those are still

@@ -217,7 +217,9 @@ class DownloadViewModel @Inject constructor(
         // A per-list custom folder (if the batch came from a saved list that pinned one)
         // overrides the global download folder for this batch.
         val override = scanState.pendingListFolderUri.value?.let { Uri.parse(it) }
-        manager.start(games, folderOverride = override)
+        // Per-batch RAR-extraction choice from the preview prompt (null = use global setting).
+        val extractRar = scanState.pendingExtractRar.value
+        manager.start(games, folderOverride = override, extractRar = extractRar)
     }
     fun cancelAll() {
         // Clear auto-pause tracking on cancel so it doesn't linger.
@@ -239,6 +241,7 @@ class DownloadViewModel @Inject constructor(
     fun clearQueue() {
         scanState.downloadQueue.value = emptyList()
         scanState.pendingListFolderUri.value = null
+        scanState.pendingExtractRar.value = null
         manager.clear()
     }
 

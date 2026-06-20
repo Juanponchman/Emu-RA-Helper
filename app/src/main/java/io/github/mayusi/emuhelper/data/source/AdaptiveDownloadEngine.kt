@@ -183,6 +183,25 @@ internal object AdaptiveEngine {
      * 1 (always at least one connection survives so the download never fully stalls).
      */
     const val THERMAL_REDUCED_CAP: Int = 8
+
+    // ===================================================================================
+    // BATCH-WIDE SETUP ELISION (v0.9 — the #1 small/medium-batch win).
+    //
+    // Every file in the SAME IA item resolves to the SAME datacenter hosts (ia6/ia8) with the SAME
+    // speed ranking and the SAME range support — only the trailing path segment differs. The
+    // per-file setup (resolveFinalUrl per candidate + a 256 KB rankHosts probe per host +
+    // supportsRange) is therefore REDUNDANT across files of one item. [HostResolutionCache] resolves
+    // and ranks the item's hosts ONCE and reuses the result for every subsequent file in the batch,
+    // removing ~(2N+1) round-trips + N×256 KB of probe transfer PER file. It adds NO connections —
+    // strictly fewer — so the 24-cap Semaphore is untouched.
+    // ===================================================================================
+
+    /**
+     * TTL for a cached per-item host resolution+ranking. Long enough to cover a whole batch of files
+     * for one item, short enough that a stale entry can't outlive the conditions it measured (a
+     * datacenter going down, IA rotating nodes). A few minutes is the measured sweet spot.
+     */
+    const val HOST_CACHE_TTL_MS: Long = 5L * 60L * 1000L
 }
 
 /**
@@ -195,6 +214,148 @@ internal object AdaptiveEngine {
  * connectionBudget permit before opening its socket, so the global 24-cap holds regardless.
  */
 internal data class Lane(val host: String, val streams: Int)
+
+/**
+ * A cached per-item host resolution + ranking (BATCH-WIDE SETUP ELISION, v0.9). It records, for one
+ * IA identifier, the work that is IDENTICAL across every file of that item so the second-and-later
+ * files in a batch skip it entirely:
+ *
+ *  - [hostPrefixes]:  the RANKED, weighted host pool (fastest-first, slow nodes dropped) — but stored
+ *    as URL PREFIXES (each resolved host URL with the resolving file's encoded path stripped off).
+ *    A later file synthesises its own per-host URL by appending its OWN encoded path to each prefix.
+ *    The pool may repeat a prefix (rankHosts weights faster hosts by repetition) — preserved verbatim
+ *    so synthesis reproduces the exact same weighted pool the first file used.
+ *  - [distinctPrefixes]: the de-duplicated prefixes, fastest-first, for per-segment/lane failover.
+ *  - [probeRates]: the measured probe rate (bytes/ms) per resolved host URL, keyed by the FIRST
+ *    file's full resolved URL (used only to seed the adaptive EWMA; absent rates are harmless).
+ *  - [rangeOk]: whether the item's hosts honour Range requests (a property of the HOST, not the file,
+ *    so it is safe to reuse — the per-chunk Content-Range guard + final MD5 still catch any drift).
+ *  - [resolvedAtMs]: wall-clock of resolution, for TTL expiry.
+ *
+ * CORRECTNESS: range support + host speed are properties of the HOST, not the file, so reuse is safe.
+ * The per-chunk Content-Range mismatch guard and the final MD5 verify remain the source of truth, so
+ * a stale reuse can never publish a corrupt file — at worst it costs one failed attempt that the
+ * normal failover/error path absorbs.
+ */
+internal data class HostResolution(
+    val hostPrefixes: List<String>,
+    val distinctPrefixes: List<String>,
+    val probeRates: Map<String, Double>,
+    val rangeOk: Boolean,
+    val resolvedAtMs: Long
+)
+
+/**
+ * Thread-safe, TTL-bounded cache of [HostResolution] keyed by IA identifier — PURE, Android-free,
+ * unit-testable (an injected [nowProvider] makes TTL expiry deterministic in tests).
+ *
+ * This is the heart of BATCH-WIDE SETUP ELISION: [get] returns a still-fresh resolution for an item
+ * (a HIT lets the caller skip resolveFinalUrl + rankHosts + supportsRange entirely), [put] records a
+ * fresh one after a MISS does the probes once, and [evictHost] DROPS a dead host from a cached
+ * ranking so subsequent files in the batch don't reuse a node that died mid-batch.
+ *
+ * Mirrors the [java.util.LinkedHashMap] LRU pattern used elsewhere in RemoteSource, but keyed by
+ * identifier and additionally TTL-bounded. All access is synchronized; the map is tiny (one entry per
+ * recently-scanned item, LRU-capped) so contention is negligible.
+ */
+internal class HostResolutionCache(
+    private val ttlMs: Long = AdaptiveEngine.HOST_CACHE_TTL_MS,
+    private val maxEntries: Int = 16,
+    private val nowProvider: () -> Long = { System.currentTimeMillis() }
+) {
+    private val lock = Any()
+    private val map = object : LinkedHashMap<String, HostResolution>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, HostResolution>?): Boolean =
+            size > maxEntries
+    }
+
+    /**
+     * Return a still-fresh resolution for [identifier], or null on a miss / expired entry. An expired
+     * entry is removed so a re-probe repopulates it. A blank identifier never caches (returns null) so
+     * an item we can't key safely always takes the full per-file path — the safe fallback.
+     */
+    fun get(identifier: String): HostResolution? = synchronized(lock) {
+        if (identifier.isBlank()) return null
+        val entry = map[identifier] ?: return null
+        if (nowProvider() - entry.resolvedAtMs >= ttlMs) {
+            map.remove(identifier)
+            return null
+        }
+        entry
+    }
+
+    /** Record a freshly-probed resolution for [identifier]. A blank identifier is ignored (no caching). */
+    fun put(
+        identifier: String,
+        hostPrefixes: List<String>,
+        distinctPrefixes: List<String>,
+        probeRates: Map<String, Double>,
+        rangeOk: Boolean
+    ): Unit = synchronized(lock) {
+        if (identifier.isBlank()) return
+        map[identifier] = HostResolution(
+            hostPrefixes = hostPrefixes,
+            distinctPrefixes = distinctPrefixes,
+            probeRates = probeRates,
+            rangeOk = rangeOk,
+            resolvedAtMs = nowProvider()
+        )
+    }
+
+    /**
+     * Drop [deadPrefix] from the cached ranking for [identifier] so later files in the batch don't
+     * reuse a node that died mid-batch (the adaptive engine's liveHosts detection feeds this). Removes
+     * every occurrence from BOTH the weighted pool and the distinct list. If that empties the pool the
+     * whole entry is dropped (a re-probe will rebuild it). A no-op if the item isn't cached.
+     */
+    fun evictHost(identifier: String, deadPrefix: String): Unit = synchronized(lock) {
+        val entry = map[identifier] ?: return
+        val newPool = entry.hostPrefixes.filter { it != deadPrefix }
+        val newDistinct = entry.distinctPrefixes.filter { it != deadPrefix }
+        if (newPool.isEmpty() || newDistinct.isEmpty()) {
+            map.remove(identifier)
+            return
+        }
+        map[identifier] = entry.copy(hostPrefixes = newPool, distinctPrefixes = newDistinct)
+    }
+
+    /** Test/diagnostic: number of entries currently cached (post-LRU). */
+    fun size(): Int = synchronized(lock) { map.size }
+}
+
+/** What the connection pre-warmer decides to do for an item (CONNECTION PRE-WARMING, v0.9). */
+internal data class PrewarmDecision(
+    /** Whether to fire any warm-up GETs at all. */
+    val warm: Boolean,
+    /** The hosts to warm — capped at [AdaptiveEngine] ≤3 (one per datacenter). Empty when [warm] is false. */
+    val hosts: List<String>
+)
+
+/**
+ * PURE pre-warm decision (CONNECTION PRE-WARMING, v0.9). Decides whether — and which hosts — to fire
+ * a tiny best-effort bytes=0-0 GET at, to warm the per-mirror h2 sockets before the first chunk so
+ * chunk 1 skips the TCP+TLS+h2 handshake.
+ *
+ * RULES (all must hold to warm):
+ *  - there is at least one resolved host,
+ *  - we are NOT on a metered network while wifiOnly is ON (never warm on cellular when the user asked
+ *    Wi-Fi-only — same gate the download itself respects),
+ * and the host list is capped at [maxHosts] (≤3 — one per datacenter) so pre-warming never opens more
+ * than a handful of tiny connections. Pre-warming acquires NO download permit (it is pre-Semaphore and
+ * the GETs are trivial), so it can never push the live connection count over the 24-cap.
+ */
+internal fun decidePrewarm(
+    resolvedHosts: List<String>,
+    wifiOnly: Boolean,
+    isMetered: Boolean,
+    maxHosts: Int = 3
+): PrewarmDecision {
+    val distinct = resolvedHosts.distinct().filter { it.isNotBlank() }
+    if (distinct.isEmpty()) return PrewarmDecision(warm = false, hosts = emptyList())
+    // Respect wifiOnly: don't warm on a metered network when the user asked for Wi-Fi-only.
+    if (wifiOnly && isMetered) return PrewarmDecision(warm = false, hosts = emptyList())
+    return PrewarmDecision(warm = true, hosts = distinct.take(maxHosts.coerceAtLeast(1)))
+}
 
 /**
  * Plan the laned topology for a SINGLE file (v3) — PURE, Android-free, unit-testable.
@@ -308,6 +469,152 @@ internal fun partitionChunks(size: Long, chunkSize: Long = AdaptiveEngine.CHUNK_
         index++
     }
     return chunks
+}
+
+// =====================================================================================
+// INCREMENTAL MD5 (v0.9) — kill the post-download full-file re-read.
+//
+// THE PROBLEM. After a multi-GB download finishes, DownloadManager streams the ENTIRE assembled
+// .part through MD5 a SECOND time to verify integrity — a full extra sequential read of every byte
+// (seconds-to-tens-of-seconds of "Saving…" dead time on a handheld). The chunks are written OUT OF
+// ORDER by the laned work-stealing pool, and MD5 is inherently sequential, so we can't naively hash
+// as bytes arrive.
+//
+// THE DESIGN (in-order gated). Keep ONE MessageDigest that consumes the file STRICTLY in order. Track
+// a "hash high-water mark" = the largest CONTIGUOUS-from-0 prefix of completed chunks. Each time a
+// chunk completes ([onChunkDone]), if it EXTENDS the contiguous prefix we feed those newly-contiguous
+// bytes (read from the committed .part) into the digest and then DRAIN any earlier-completed chunks
+// that are now contiguous. In the common near-in-order case the digest finishes almost as the
+// download does, collapsing the end MD5 from "read 100%" to nothing.
+//
+// SAFETY (this sits on the delete-the-file gate, so it must NEVER produce a wrong digest):
+//  - Each byte range is fed to the digest EXACTLY ONCE, in order, only when contiguous-complete. The
+//    caller fires [onChunkDone] exactly once per chunk (markDone transitions exactly one winner), so
+//    no double-feed under racing.
+//  - RESUME: pre-seeded done chunks are NOT reported via [onChunkDone], so if any resumed chunk sits
+//    at/under the contiguous frontier the mark never advances past it and [digestIfComplete] returns
+//    null -> the caller falls back to the FULL pass. (The caller also disables the accumulator
+//    outright on a resumed download via [decideMd5Strategy] — belt and braces.)
+//  - [digestIfComplete] returns the hex digest ONLY when the mark covers the WHOLE file [0,size) with
+//    every byte fed exactly once. On ANY gap, short read, or doubt it returns null and the caller
+//    runs the authoritative full pass. The full MD5 ALWAYS remains the final source of truth.
+//  - [failed] latches on any read error so a partial/raced read can never yield a bogus digest.
+//
+// PURITY: the byte source is injected as a reader lambda `(start,len)->ByteArray` so the unit is
+// testable against an in-memory buffer with no file/network; production passes a RandomAccessFile
+// reader. Uses java.security.MessageDigest (available in plain JVM unit tests).
+// =====================================================================================
+internal class IncrementalMd5Accumulator(
+    private val totalSize: Long,
+    chunks: List<Chunk>,
+    /** Reads exactly [len] bytes from absolute offset [start] of the committed file. */
+    private val reader: (start: Long, len: Int) -> ByteArray,
+    private val digest: java.security.MessageDigest =
+        java.security.MessageDigest.getInstance("MD5")
+) {
+    private val lock = Any()
+    private val byIndex: List<Chunk> = chunks.sortedBy { it.index }
+    /** Indices reported done but not yet folded into the digest (out-of-order arrivals). */
+    private val pendingDone = HashSet<Int>()
+    /** Next chunk index the digest expects (the contiguous frontier). */
+    private var nextIndex = 0
+    /** Bytes folded into the digest so far (== byIndex[0..nextIndex-1] lengths). Monotonic. */
+    private var hashedBytes = 0L
+    /** Latches true on any read/short-read error: the digest is then untrustworthy -> full-pass. */
+    private var failed = false
+
+    /** Bytes folded into the digest so far (test/diagnostic). */
+    fun markBytes(): Long = synchronized(lock) { hashedBytes }
+
+    /** True iff a read error has poisoned the incremental digest (forces the full-pass fallback). */
+    fun isFailed(): Boolean = synchronized(lock) { failed }
+
+    /**
+     * Report that chunk [index]'s full range is written to the committed file. If it extends the
+     * contiguous frontier, fold it (and any now-contiguous earlier arrivals) into the digest. Safe to
+     * call out of order; a duplicate or already-folded index is ignored. Never throws — a read error
+     * just latches [failed] so the caller falls back to the full pass.
+     */
+    fun onChunkDone(index: Int) = synchronized(lock) {
+        if (failed) return
+        if (index < 0 || index >= byIndex.size) return
+        if (index < nextIndex) return            // already folded
+        pendingDone.add(index)
+        // Drain every chunk that is now contiguous from the frontier, in order.
+        while (nextIndex < byIndex.size && nextIndex in pendingDone) {
+            val c = byIndex[nextIndex]
+            val len = c.length
+            if (len < 0 || len > Int.MAX_VALUE) { failed = true; return }
+            try {
+                val bytes = reader(c.start, len.toInt())
+                if (bytes.size.toLong() != len) { failed = true; return }
+                digest.update(bytes, 0, bytes.size)
+            } catch (e: Exception) {
+                failed = true
+                return
+            }
+            hashedBytes += len
+            pendingDone.remove(nextIndex)
+            nextIndex++
+        }
+    }
+
+    /**
+     * The lowercase-hex MD5 digest, but ONLY when the accumulator PROVABLY covered the whole file
+     * [0,size) in order with every byte fed exactly once and no read error occurred. Returns null on
+     * ANY incompleteness/doubt so the caller runs the authoritative full pass. Must be called at most
+     * once (it finalises the digest); a second call after finalisation returns null.
+     */
+    fun digestIfComplete(): String? = synchronized(lock) {
+        if (failed) return null
+        if (nextIndex != byIndex.size) return null          // not every chunk folded
+        if (hashedBytes != totalSize) return null           // byte coverage must equal the file size
+        if (byIndex.isEmpty() || totalSize <= 0L) return null
+        return try {
+            val out = digest.digest()
+            val sb = StringBuilder(out.size * 2)
+            for (b in out) {
+                val v = b.toInt() and 0xFF
+                sb.append("0123456789abcdef"[v shr 4]).append("0123456789abcdef"[v and 0x0F])
+            }
+            sb.toString()
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
+
+/** Which MD5 verification path to use after a download completes (INCREMENTAL MD5, v0.9). */
+internal enum class Md5Strategy {
+    /** Use the incremental accumulator's digest if it proved complete, else fall back to full pass. */
+    INCREMENTAL_THEN_FULL,
+    /** Skip the incremental path entirely; always run the authoritative full pass. */
+    FULL_ONLY
+}
+
+/**
+ * PURE decision: may the incremental MD5 accumulator's result be TRUSTED for this download, or must we
+ * always run the full pass? Conservative by construction — the incremental path is only eligible on a
+ * clean, non-resumed download whose engine reported every chunk completion:
+ *   - [resumed] true  -> FULL_ONLY. A resumed download's pre-seeded done chunks are never reported to
+ *     the accumulator, so it can't reconstruct the partial digest — always full-pass.
+ *   - [adaptive] false -> FULL_ONLY. Only the adaptive (chunk-queue) path reports per-chunk
+ *     completions; the static/single-stream paths don't drive the accumulator, so there is nothing to
+ *     trust — full-pass. (No regression: those paths behave exactly as before.)
+ *   - [expectedMd5Blank] true -> FULL_ONLY is irrelevant (no verification happens at all), but we
+ *     still return FULL_ONLY so the accumulator is never even constructed when there's no checksum.
+ * Otherwise INCREMENTAL_THEN_FULL: try the accumulator, fall back to full pass if it can't prove
+ * complete. The accumulator's own [IncrementalMd5Accumulator.digestIfComplete] is the second gate.
+ */
+internal fun decideMd5Strategy(
+    adaptive: Boolean,
+    resumed: Boolean,
+    expectedMd5Blank: Boolean
+): Md5Strategy {
+    if (expectedMd5Blank) return Md5Strategy.FULL_ONLY
+    if (!adaptive) return Md5Strategy.FULL_ONLY
+    if (resumed) return Md5Strategy.FULL_ONLY
+    return Md5Strategy.INCREMENTAL_THEN_FULL
 }
 
 /**

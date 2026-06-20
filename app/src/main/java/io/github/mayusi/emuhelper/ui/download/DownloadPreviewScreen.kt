@@ -38,6 +38,7 @@ import io.github.mayusi.emuhelper.ui.common.formatSize
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -137,10 +138,47 @@ class DownloadPreviewViewModel @Inject constructor(
         }
     }
 
+    // ---- RAR-extraction prompt (per-batch) --------------------------------
+    // When the batch contains any .rar file we surface a checkbox letting the
+    // user opt in/out of extracting it after download. The choice is stashed in
+    // [ScanStateHolder.pendingExtractRar] and threaded through to
+    // DownloadManager.start(extractRar = ...). Default seeds from the global
+    // Extract setting so behaviour is unsurprising.
+
+    /** True if ANY currently-checked file is a .rar (decides whether to show the prompt). */
+    val hasRarSelected: StateFlow<Boolean> =
+        combine(scanState.downloadQueue, _checked) { games, checked ->
+            games.any { it.key in checked && it.filename.lowercase().trim().endsWith(".rar") }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    private val _extractRar = MutableStateFlow<Boolean?>(null)
+    /** The user's RAR-extraction choice for this batch (null until seeded). */
+    val extractRar: StateFlow<Boolean?> = _extractRar
+
+    private var extractRarSeeded = false
+    /** Seed the toggle from the global Extract setting the first time a .rar appears. */
+    fun seedExtractRarIfNeeded() {
+        if (extractRarSeeded) return
+        extractRarSeeded = true
+        viewModelScope.launch {
+            val global = settings.extractArchives.first()
+            if (_extractRar.value == null) _extractRar.value = global
+        }
+    }
+
+    fun setExtractRar(value: Boolean) {
+        _extractRar.value = value
+    }
+
     /** Narrow the download queue to only the checked games. Returns how many remain. */
     fun confirmSelection(): Int {
         val keep = scanState.downloadQueue.value.filter { it.key in _checked.value }
         scanState.downloadQueue.value = keep
+        // Commit the RAR-extraction choice for this batch. Only set a non-null value
+        // when the batch actually contains a .rar AND the user has a seeded choice;
+        // otherwise leave it null so DownloadManager falls back to the global setting.
+        val batchHasRar = keep.any { it.filename.lowercase().trim().endsWith(".rar") }
+        scanState.pendingExtractRar.value = if (batchHasRar) _extractRar.value else null
         return keep.size
     }
 
@@ -178,6 +216,10 @@ fun DownloadPreviewScreen(
     val games by viewModel.games.collectAsState()
     val checked by viewModel.checked.collectAsState()
     val freeBytes by viewModel.freeBytes.collectAsState()
+    // RAR-extraction prompt: shown only when a .rar is in the selection.
+    val hasRarSelected by viewModel.hasRarSelected.collectAsState()
+    val extractRarChoice by viewModel.extractRar.collectAsState()
+    LaunchedEffect(hasRarSelected) { if (hasRarSelected) viewModel.seedExtractRarIfNeeded() }
     // FIX 3: inline "Signing in…" state for the silent relogin attempt — shown on the Download
     // button instead of bouncing the user to the full login screen.
     val signingIn by viewModel.signingIn.collectAsState()
@@ -231,6 +273,33 @@ fun DownloadPreviewScreen(
         bottomBar = {
             Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 4.dp) {
                 Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.ScreenHorizontal, vertical = Dimens.ItemGap)) {
+                    // RAR-extraction prompt — only when the selection contains a .rar.
+                    if (hasRarSelected) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { viewModel.setExtractRar(!(extractRarChoice ?: false)) },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = extractRarChoice ?: false,
+                                onCheckedChange = { viewModel.setExtractRar(it) }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Extract RAR after downloading",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    "Unpack .rar archives into the folder. If it fails, the .rar is kept.",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
                     // Free-space row (hidden if unavailable)
                     freeBytes?.let { free ->
                         val freeColor = if (spaceWarning) MaterialTheme.colorScheme.error

@@ -49,6 +49,17 @@ class RemoteSource @Inject constructor(
     private val metadataCache = BoundedMetadataCache(METADATA_CACHE_MAX)
 
     /**
+     * BATCH-WIDE SETUP ELISION (v0.9): per-IA-item cache of the resolved+ranked host prefixes, probe
+     * rates, and range support. Resolving + ranking + range-probing the mirrors is IDENTICAL for every
+     * file of one item (same datacenters, same speed order, same range support — only the trailing
+     * path differs), so we do it ONCE per identifier and reuse it for the rest of the batch. This
+     * removes ~(2N+1) round-trips + N×256 KB of probe transfer per subsequent file and adds NO
+     * connections (strictly fewer), so the 24-cap is untouched. TTL-bounded so a stale entry can't
+     * outlive the conditions it measured; a host that dies mid-batch is evicted from the ranking.
+     */
+    private val hostResolutionCache = HostResolutionCache()
+
+    /**
      * Synchronized LRU cache. accessOrder=true means each get()/put() moves the entry to
      * the most-recently-used end, so the eldest (least-recently-used) entry is evicted once
      * size exceeds [maxEntries]. All access is synchronized on the instance — the maps are
@@ -262,6 +273,59 @@ class RemoteSource @Inject constructor(
         result.toList()
     }
 
+    /**
+     * CONNECTION PRE-WARMING (v0.9) — best-effort, cancellable warm-up of an item's per-mirror h2
+     * sockets BEFORE its first download, so chunk 1 skips the TCP+TLS+h2 handshake (the OkHttp pool
+     * keeps connections warm for 5 min — see AppModule). Call when the user scans an item / lands on
+     * the download-confirm screen.
+     *
+     * It resolves the item's mirror hosts for [relativeName], then [decidePrewarm] gates it: at most
+     * 3 hosts (one per datacenter), and NEVER on a metered network when [wifiOnly] is on. Each warm-up
+     * is a trivial bytes=0-0 GET — it acquires NO download permit (pre-Semaphore, so it can never push
+     * the live connection count over the 24-cap) and any failure is swallowed (warming is pure upside).
+     *
+     * NOTE: the heavier per-item resolve+rank probe that the download itself runs ALSO warms these
+     * sockets (one action, two wins — see downloadFileSegmented's cache MISS path); this method is the
+     * EARLIER, lighter touch for the confirm-screen moment before a download is even started.
+     */
+    suspend fun prewarmItem(
+        identifier: String,
+        relativeName: String,
+        wifiOnly: Boolean,
+        isMetered: Boolean,
+        isCancelled: () -> Boolean = { false }
+    ): Unit = withContext(Dispatchers.IO) {
+        try {
+            val mirrors = mirrorUrls(identifier, relativeName)
+            // Resolve redirects to the real datanodes (deduped) so we warm the ACTUAL sockets used.
+            val resolved = mirrors.mapNotNull { if (isCancelled()) null else resolveFinalUrl(it) ?: it }
+                .distinct()
+            val decision = decidePrewarm(resolved, wifiOnly = wifiOnly, isMetered = isMetered)
+            if (!decision.warm) return@withContext
+            coroutineScope {
+                decision.hosts.map { host ->
+                    async {
+                        if (isCancelled()) return@async
+                        runCatching {
+                            val req = Request.Builder().url(host)
+                                .header("User-Agent", USER_AGENT)
+                                .header("Accept-Encoding", "identity")
+                                .header("Range", "bytes=0-0") // trivial; only to open/keep the socket warm
+                                .header("Referer", "https://archive.org/")
+                                .build()
+                            okHttpClient.newCall(req).execute().use { it.body?.close() }
+                        }
+                        Unit
+                    }
+                }.awaitAll()
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("EmuHelper", "prewarmItem($identifier) failed (best-effort, ignored)", e)
+        }
+    }
+
     private fun encodeSegment(segment: String): String {
         val sb = StringBuilder(segment.length + 16)
         for (b in segment.toByteArray(Charsets.UTF_8)) {
@@ -435,22 +499,88 @@ class RemoteSource @Inject constructor(
         // pins; the global 24-cap is still enforced by [connectionBudget].
         scheduler: MirrorScheduler? = null,
         fileId: String? = null,
-        liveDemands: (() -> List<FileDemand>)? = null
+        liveDemands: (() -> List<FileDemand>)? = null,
+        // BATCH-WIDE SETUP ELISION (v0.9): the IA identifier + this file's relative path. When the
+        // identifier is non-blank, host resolution + ranking + range probing is cached per-item and
+        // REUSED across every file of the batch (skipping ~(2N+1) round-trips + N×256 KB of probing
+        // per subsequent file). Defaulted to blank/"" so existing callers and all unit tests take the
+        // unchanged full-probe path (no caching when the identifier is unknown — the safe fallback).
+        identifier: String = "",
+        relativeName: String = "",
+        // INCREMENTAL MD5 (v0.9): an optional accumulator the ADAPTIVE path feeds on each chunk DONE so
+        // the file is hashed (in order) DURING download, eliminating the post-download full-file
+        // re-read. Only the adaptive path drives it; the static/single-stream paths ignore it (the
+        // caller then runs the authoritative full pass). On a RESUMED download the adaptive path does
+        // NOT feed it (pre-seeded chunks are unreported), so digestIfComplete() returns null and the
+        // caller falls back to the full pass. Default null -> unchanged for every existing caller/test.
+        incrementalMd5: IncrementalMd5Accumulator? = null
     ): Long = withContext(Dispatchers.IO) {
-        // Resolve each candidate's redirect once to its real node, dedup.
-        val resolvedHosts = candidateUrls.map { resolveFinalUrl(it) ?: it }.distinct()
-        // FIX B: when adaptive, capture the REAL probe rates (bytes/ms) to seed the EWMA in correct
-        // units. For the static path probeRates stays null and ranking is byte-for-byte unchanged.
-        val probeRates: MutableMap<String, Double>? = if (adaptive) HashMap() else null
-        // Probe + rank: weighted pool favouring the fastest nodes, slow nodes dropped.
-        val hosts = rankHosts(resolvedHosts, probeRates).ifEmpty { resolvedHosts }
-        // SMALL-FILE FAST PATH (shared by both engines): no range support, single connection,
-        // or <= 1 segment / <1 chunk -> stream straight through. Don't rank, don't chunk.
-        val rangeOk = segments > 1 && expectedSize > 0 && hosts.isNotEmpty() && supportsRange(hosts.first())
-        Log.i("EmuHelper", "segDL: size=$expectedSize segs=$segments poolSize=${hosts.size} distinct=${hosts.distinct().size} rangeOk=$rangeOk adaptive=$adaptive")
-        if (!rangeOk) {
-            Log.i("EmuHelper", "segDL: FALLBACK single-stream")
-            return@withContext singleStreamTo((hosts.firstOrNull() ?: resolvedHosts.first()), expectedSize, destFile, onProgress, isCancelled)
+        // The current file's encoded path (same encoding mirrorUrls/buildDownloadUrl use). Used both to
+        // synthesise per-host URLs from cached prefixes on a HIT and to derive prefixes on a MISS.
+        val encodedPath = if (relativeName.isNotBlank())
+            relativeName.split('/').joinToString("/") { encodeSegment(it) } else ""
+
+        // ---- BATCH-WIDE SETUP ELISION: try the per-item cache FIRST. -------------------------------
+        // On a HIT we have the item's ranked host PREFIXES already (resolved + speed-ranked + range
+        // status), so we synthesise THIS file's per-host URLs by appending its encoded path and SKIP
+        // resolveFinalUrl + rankHosts + supportsRange entirely — the big small/medium-batch win.
+        val cached = if (identifier.isNotBlank() && encodedPath.isNotBlank())
+            hostResolutionCache.get(identifier) else null
+
+        val resolvedHosts: List<String>
+        val hosts: List<String>
+        val rangeOk: Boolean
+        val probeRates: MutableMap<String, Double>?
+
+        if (cached != null) {
+            // HIT: rebuild this file's URLs from the cached prefixes (weighted pool order preserved).
+            hosts = cached.hostPrefixes.map { it + encodedPath }
+            resolvedHosts = cached.distinctPrefixes.map { it + encodedPath }
+            // Seed the adaptive EWMA from the cached probe rates, re-keyed onto THIS file's URLs.
+            probeRates = if (adaptive) {
+                val m = HashMap<String, Double>()
+                cached.hostPrefixes.distinct().forEach { prefix ->
+                    cached.probeRates[prefix]?.let { r -> m[prefix + encodedPath] = r }
+                }
+                m
+            } else null
+            rangeOk = segments > 1 && expectedSize > 0 && hosts.isNotEmpty() && cached.rangeOk
+            Log.i("EmuHelper", "segDL: CACHE HIT id=$identifier poolSize=${hosts.size} rangeOk=$rangeOk adaptive=$adaptive")
+            if (!rangeOk) {
+                Log.i("EmuHelper", "segDL: FALLBACK single-stream (cached)")
+                return@withContext singleStreamTo((hosts.firstOrNull() ?: resolvedHosts.first()), expectedSize, destFile, onProgress, isCancelled)
+            }
+        } else {
+            // MISS: do the one-time per-item probes, then POPULATE the cache for the rest of the batch.
+            // Resolve each candidate's redirect once to its real node, dedup.
+            resolvedHosts = candidateUrls.map { resolveFinalUrl(it) ?: it }.distinct()
+            // FIX B: when adaptive, capture the REAL probe rates (bytes/ms) to seed the EWMA in correct
+            // units. For the static path probeRates stays null and ranking is byte-for-byte unchanged.
+            probeRates = if (adaptive) HashMap() else null
+            // Probe + rank: weighted pool favouring the fastest nodes, slow nodes dropped. This 256 KB
+            // probe per host ALSO warms the per-mirror h2 sockets (CONNECTION PRE-WARMING folded in —
+            // one action, two wins), so chunk 1 skips the TCP+TLS+h2 handshake.
+            hosts = rankHosts(resolvedHosts, probeRates).ifEmpty { resolvedHosts }
+            // SMALL-FILE FAST PATH (shared by both engines): no range support, single connection,
+            // or <= 1 segment / <1 chunk -> stream straight through. Don't rank, don't chunk.
+            rangeOk = segments > 1 && expectedSize > 0 && hosts.isNotEmpty() && supportsRange(hosts.first())
+            // POPULATE the cache (only when keyable): store prefixes = resolved URLs with this file's
+            // encoded path stripped, so later files append their OWN path. range support + speed rank
+            // are HOST properties, safe to reuse; the per-chunk Content-Range guard + final MD5 still
+            // catch any drift. Skipped entirely when not keyable -> unchanged full-probe behaviour.
+            if (identifier.isNotBlank() && encodedPath.isNotBlank()) {
+                val pool = hosts.map { it.stripEncodedSuffix(encodedPath) }
+                val distinct = resolvedHosts.map { it.stripEncodedSuffix(encodedPath) }
+                // Re-key probe rates onto prefixes so a later file can re-key them onto its own URL.
+                val ratesByPrefix = HashMap<String, Double>()
+                probeRates?.forEach { (url, r) -> ratesByPrefix[url.stripEncodedSuffix(encodedPath)] = r }
+                hostResolutionCache.put(identifier, pool, distinct, ratesByPrefix, rangeOk)
+            }
+            Log.i("EmuHelper", "segDL: size=$expectedSize segs=$segments poolSize=${hosts.size} distinct=${hosts.distinct().size} rangeOk=$rangeOk adaptive=$adaptive")
+            if (!rangeOk) {
+                Log.i("EmuHelper", "segDL: FALLBACK single-stream")
+                return@withContext singleStreamTo((hosts.firstOrNull() ?: resolvedHosts.first()), expectedSize, destFile, onProgress, isCancelled)
+            }
         }
 
         // ====================================================================
@@ -475,7 +605,17 @@ class RemoteSource @Inject constructor(
                 isCancelled = isCancelled,
                 scheduler = scheduler,
                 fileId = fileId,
-                liveDemands = liveDemands
+                liveDemands = liveDemands,
+                // BATCH-WIDE SETUP ELISION: when a host dies mid-batch, evict its PREFIX from the
+                // cached ranking so subsequent files of this item don't reuse the dead node. Blank
+                // identifier / empty path -> no-op (nothing was cached). The prefix is the dead host
+                // URL with THIS file's encoded path stripped — exactly the key the cache stores.
+                onHostEvicted = { deadHostUrl ->
+                    if (identifier.isNotBlank() && encodedPath.isNotBlank()) {
+                        hostResolutionCache.evictHost(identifier, deadHostUrl.stripEncodedSuffix(encodedPath))
+                    }
+                },
+                incrementalMd5 = incrementalMd5
             )
         }
 
@@ -623,7 +763,16 @@ class RemoteSource @Inject constructor(
         // WHICH host each runner pins; the 24-cap stays enforced by [connectionBudget].
         scheduler: MirrorScheduler? = null,
         fileId: String? = null,
-        liveDemands: (() -> List<FileDemand>)? = null
+        liveDemands: (() -> List<FileDemand>)? = null,
+        // BATCH-WIDE SETUP ELISION (v0.9): invoked with the FULL host URL when a lane is declared dead
+        // (its error streak exhausted — a mirror went down mid-download), so the caller can evict that
+        // host from the per-item resolution cache and stop subsequent batch files reusing it. NO-OP by
+        // default so existing callers / unit tests are unaffected.
+        onHostEvicted: (deadHostUrl: String) -> Unit = {},
+        // INCREMENTAL MD5 (v0.9): fed on each chunk DONE (in order, exactly once per chunk) so the
+        // file is hashed DURING download. NOT fed on a RESUMED download (pre-seeded chunks are
+        // unreported), so the accumulator can never claim a partial digest as complete. Default null.
+        incrementalMd5: IncrementalMd5Accumulator? = null
     ): Long {
         val distinctHosts = hosts.distinct()
         destFile.parentFile?.mkdirs()
@@ -662,6 +811,14 @@ class RemoteSource @Inject constructor(
                 emptySet()
             }
         }
+
+        // INCREMENTAL MD5 (v0.9): only feed the accumulator on a FRESH (non-resumed) download. A
+        // resumed download's pre-seeded done chunks are never reported to it, so feeding it would leave
+        // a permanent gap and it would (correctly) never claim completeness — but nulling it here makes
+        // that explicit and avoids any wasted reads. With this null, digestIfComplete() stays null on
+        // resume and DownloadManager runs the authoritative full pass. (decideMd5Strategy also gates
+        // this at the call site — belt and braces.)
+        val liveMd5: IncrementalMd5Accumulator? = if (resumedDone.isEmpty()) incrementalMd5 else null
 
         // Pre-size the .part so each worker can seek to any absolute offset (kept from static path).
         // setLength to expectedSize is a no-op when the .part is already full (the resume case), and
@@ -846,6 +1003,9 @@ class RemoteSource @Inject constructor(
                 // Only kill a lane while at least one OTHER host survives — never strand the file.
                 if (streak >= laneDeathThreshold && liveHosts.size > 1) {
                     liveHosts.remove(host)
+                    // BATCH-WIDE SETUP ELISION: drop this dead host from the per-item resolution cache
+                    // so subsequent files in the batch don't reuse a node that just died mid-download.
+                    onHostEvicted(host)
                     Log.w("EmuHelper", "lane died: $host (streak=$streak) — redistributing to survivors")
                 }
             }
@@ -956,7 +1116,8 @@ class RemoteSource @Inject constructor(
                                     onRaceWon = { racesWon.incrementAndGet() },
                                     onChunkCompleted = onChunkCompleted,
                                     onHostOutcome = onHostOutcome,
-                                    onChunkDone = { saveManifest(false) }
+                                    onChunkDone = { saveManifest(false) },
+                                    incrementalMd5 = liveMd5
                                 )
                             } else {
                                 // Nothing to claim right now but peers hold in-flight chunks that
@@ -993,7 +1154,8 @@ class RemoteSource @Inject constructor(
                             onRaceWon = { /* primary path is never a race win */ },
                             onChunkCompleted = onChunkCompleted,
                             onHostOutcome = onHostOutcome,
-                            onChunkDone = { saveManifest(false) }
+                            onChunkDone = { saveManifest(false) },
+                            incrementalMd5 = liveMd5
                         )
                     }
                     @Suppress("UNUSED_EXPRESSION") runnerIdx  // keep index in scope for clarity/debug
@@ -1166,7 +1328,13 @@ class RemoteSource @Inject constructor(
         // RESUME (v0.8): invoked exactly once when THIS attempt's markDone transitioned the chunk to
         // DONE, so the caller can persist the (throttled) resume manifest. NO-OP by default so unit
         // tests are unaffected.
-        onChunkDone: () -> Unit = {}
+        onChunkDone: () -> Unit = {},
+        // INCREMENTAL MD5 (v0.9): fed with this chunk's index inside the SAME markDone-winner block as
+        // [onChunkDone], so it is called EXACTLY ONCE per chunk (the markDone winner) and never by a
+        // losing racer — no double-feed under racing. The accumulator reads the chunk's bytes from the
+        // committed .part (already fully written before markDone) and only folds contiguous prefixes.
+        // Default null -> no-op for unit tests / the resume path.
+        incrementalMd5: IncrementalMd5Accumulator? = null
     ) {
         if (isCancelled()) throw CancellationException()
         // v2 racer: if the chunk already finished between pickRaceTarget and here, there's nothing
@@ -1332,6 +1500,11 @@ class RemoteSource @Inject constructor(
                 // RESUME: persist the (throttled) done-set so an app-kill resumes from here. Fired
                 // only on a real DONE transition (exactly once per chunk), never per byte.
                 onChunkDone()
+                // INCREMENTAL MD5: fold this freshly-completed chunk into the in-order digest. Fires in
+                // the SAME exactly-once markDone-winner block, so each chunk is reported once. The
+                // accumulator reads from the committed .part (this chunk's full range is already
+                // written above) and only advances when the contiguous prefix extends.
+                incrementalMd5?.onChunkDone(chunk.index)
             }
             // DIAG: accumulate per-host stats and HTTP protocol for the bench log.
             // Called for EVERY successful chunk attempt (primary or winning racer) so the
@@ -1420,6 +1593,19 @@ class RemoteSource @Inject constructor(
 
     /** Compact host label for logs (scheme/host only). */
     private fun String.hostLabel(): String = substringAfter("//").substringBefore('/')
+
+    /**
+     * BATCH-WIDE SETUP ELISION (v0.9): strip the trailing [encodedPath] from a resolved host URL to
+     * get its reusable PREFIX (scheme://host + item dir). Within one IA item every file's resolved URL
+     * ends with the file's own encoded path; the prefix before it is identical across files. If the
+     * URL doesn't end with [encodedPath] (a server that rewrote the path on redirect), we keep the URL
+     * verbatim — appending a path to it would be wrong, so the safe choice is to not strip, which the
+     * cache reuse then re-appends a path to; the per-chunk Content-Range guard + final MD5 still catch
+     * any resulting mismatch and the normal failover absorbs it. (Empty [encodedPath] -> no stripping.)
+     */
+    private fun String.stripEncodedSuffix(encodedPath: String): String =
+        if (encodedPath.isNotEmpty() && endsWith(encodedPath)) substring(0, length - encodedPath.length)
+        else this
 
     /**
      * Internal marker for a detected STALL (vs. a real transport error). A stall is always

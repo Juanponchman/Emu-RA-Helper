@@ -269,6 +269,20 @@ fun AboutScreen(
                     .padding(start = 42.dp, bottom = 4.dp)
             )
 
+            // UnRAR attribution (required by the UnRAR license). RAR extraction is
+            // powered by the official RARLAB unrar source; copyrights to RAR/UnRAR
+            // are owned by Alexander Roshal. See the bundled UnRAR license.
+            Text(
+                "RAR extraction powered by UnRAR (© Alexander Roshal, RARLAB). " +
+                    "UnRAR source is used under the UnRAR license; it may not be used to " +
+                    "re-create the RAR compression algorithm.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 42.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)
+            )
+
             Spacer(Modifier.height(8.dp))
             HorizontalDivider()
             Spacer(Modifier.height(8.dp))

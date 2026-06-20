@@ -11,14 +11,33 @@ android {
     namespace = "io.github.mayusi.emuhelper"
     compileSdk = 35
 
+    // Pinned NDK for the native unrar (RAR4 + RAR5) extraction engine.
+    ndkVersion = "27.3.13750724"
+
     defaultConfig {
         applicationId = "io.github.mayusi.emuhelper"
         minSdk = 29
         targetSdk = 35
-        versionCode = 26
-        versionName = "0.8.0"
+        versionCode = 27
+        versionName = "0.9.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
+
+        // Keep the APK lean: only the two ABIs we actually ship to.
+        //   arm64-v8a -> the handhelds (Retroid Pocket 6, Odin 3)
+        //   x86_64    -> the emulator (dev + CI)
+        ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+        externalNativeBuild {
+            cmake { cppFlags += "-std=c++11" }
+        }
+    }
+
+    // Native build for the in-app RAR extraction (unrar engine + JNI shim).
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {

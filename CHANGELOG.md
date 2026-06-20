@@ -4,6 +4,33 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.9.0] - 2026-06-20
+
+### Added
+- **In-app RAR extraction (RAR4 and RAR5).** Download a `.rar` and EmuHelper can
+  unpack it for you automatically when the download finishes — no separate app
+  needed. You're asked per batch whether to extract when a RAR is in your
+  selection. It handles modern RAR5 archives, older RAR4, solid archives, and
+  multi-volume sets, using the official RAR engine. Anything it can't handle
+  (e.g. a password-protected archive) is simply saved as-is — your download is
+  never lost. Powered by UnRAR © Alexander Roshal (see About).
+
+### Changed
+- **Faster batches of small files.** When you download a whole category at once
+  (say, a stack of small ROMs), the app no longer re-checks the Internet Archive
+  mirrors before every single file — it works them out once for the collection
+  and reuses that, cutting a big chunk of per-file overhead. Large single
+  downloads were already at the mirrors' speed limit; this speeds up the
+  many-small-files case that was spending real time on setup instead of
+  downloading.
+- **Less waiting at "Saving…".** For large downloads the integrity checksum is
+  now computed *as the file downloads* instead of in a second full pass at the
+  end, so big files finish and appear in your folder noticeably sooner. (If
+  anything is uncertain, it still falls back to a full verify — the corruption
+  check is never weakened.)
+- **Snappier download starts.** Connections to the Archive's mirrors are warmed
+  up during setup, so the first bytes start flowing a little sooner.
+
 ## [0.8.0] - 2026-06-20
 
 ### Added
