@@ -4,6 +4,18 @@ All notable changes to EmuHelper are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project follows a
 semantic-style versioning scheme while in alpha.
 
+## [0.9.1] - 2026-06-21
+
+### Fixed
+- **Long downloads survive a session expiry.** On a long, multi-hour batch your
+  Internet Archive sign-in could quietly expire partway through, and any download
+  that started a request after that point would fail with an "unauthorized" error
+  (HTTP 401). The app now **silently signs back in and retries** when that happens,
+  using your saved login — so a big overnight batch keeps going instead of failing
+  files. If many downloads hit it at once, only a single sign-in is performed and
+  the rest pick straight back up. If your saved password no longer works, you get
+  a clear "session expired — sign in again" message instead of a silent failure.
+
 ## [0.9.0] - 2026-06-20
 
 ### Added

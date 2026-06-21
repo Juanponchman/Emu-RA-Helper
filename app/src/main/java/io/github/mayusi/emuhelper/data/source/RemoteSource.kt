@@ -3,6 +3,7 @@ package io.github.mayusi.emuhelper.data.source
 import android.util.Log
 import io.github.mayusi.emuhelper.BuildConfig
 import io.github.mayusi.emuhelper.data.model.GameFile
+import io.github.mayusi.emuhelper.data.storage.AuthStore
 import io.github.mayusi.emuhelper.di.PersistentCookieJar
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -30,9 +31,95 @@ import kotlin.math.min
 @Singleton
 class RemoteSource @Inject constructor(
     private val okHttpClient: OkHttpClient,
-    private val cookieJar: PersistentCookieJar
+    private val cookieJar: PersistentCookieJar,
+    private val authStore: AuthStore
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+
+    /**
+     * SESSION-EXPIRY RECOVERY (silent single-flight re-auth). A long overnight batch can outlive the
+     * IA auth session; the datanodes then 401 the next ranged GET and the chunk would fail with no
+     * recovery. This coordinator collapses the many concurrent 401s of a laned download into ONE
+     * re-login (with the saved credentials) and lets each affected request retry exactly once per
+     * re-login generation, so a transient session expiry never surfaces as a download failure. The
+     * login POST goes through the SHARED cookie jar, so a single success immediately fixes every other
+     * in-flight request. See [withReauthRetry] for how request paths consume it, and ReauthCoordinator
+     * for the single-flight + retry-once + no-infinite-loop logic (unit-tested without network).
+     */
+    private val reauth = ReauthCoordinator(
+        doLogin = {
+            val email = authStore.savedEmailNow()
+            val password = authStore.getSavedPassword()
+            if (email.isBlank() || password.isBlank()) false
+            else login(email, password) is LoginResult.Success
+        },
+        credentialsAvailable = {
+            authStore.savedEmailNow().isNotBlank() && authStore.getSavedPassword().isNotBlank()
+        }
+    )
+
+    /**
+     * Marker so a 401 (or auth-expiry 403) thrown deep inside a request path can be recognised by
+     * [withReauthRetry] and trigger the silent re-auth+retry, while any OTHER IOException keeps its
+     * existing behaviour untouched (stall/error budgets, partial-resume, etc.). Carrying the HTTP
+     * [code] lets the wrapper apply the 401-always / 403-only-on-auth-hint policy in one place.
+     */
+    internal class AuthExpiredException(val code: Int) :
+        IOException("HTTP $code (auth session expired)")
+
+    /** Clear, user-facing message when re-auth can't proceed (no creds) or the re-login itself fails. */
+    private val sessionExpiredMessage = "Session expired — sign in again."
+
+    /**
+     * Wrap a single download request [block] so that, if it throws [AuthExpiredException] (HTTP 401, or
+     * an auth-expiry 403), we SILENTLY re-authenticate once via the single-flight [reauth] coordinator
+     * and retry the block. Composition guarantees:
+     *
+     *  - A successful re-auth + retry is INVISIBLE to the caller: [block] returns normally, so the
+     *    chunk's error/stall budget is never touched (the 401 never reaches the chunk's `catch`).
+     *  - At most ONE retry per re-login generation: the coordinator's generation counter prevents an
+     *    infinite 401 -> login -> 401 loop. If the resource still 401s under a fresh session, we
+     *    rethrow the auth failure (a real error) so the normal error budget governs the outcome.
+     *  - No saved creds OR the re-login fails -> we throw a plain IOException with [sessionExpiredMessage]
+     *    so the failure is clear and final (no retry).
+     *
+     * This adds NO download connections: the login POST is a separate, permit-free request issued by
+     * the coordinator, so the 24-connection cap and all governors are untouched.
+     *
+     * INLINE so a non-local `return` inside [block] (e.g. the laned racer's done-check bail) still
+     * returns from the ENCLOSING download function, preserving the existing racer/stall control flow.
+     */
+    private suspend inline fun <T> withReauthRetry(block: () -> T): T {
+        // Record the generation we START at; a 401 we then hit is only "ours to retry" if no newer
+        // login already happened (handled inside the coordinator) AND we haven't already retried in
+        // this generation (tracked by lastRetriedGen below).
+        var lastRetriedGen = ReauthCoordinator.NEVER_RETRIED
+        var observedGen = reauth.currentGeneration()
+        while (true) {
+            try {
+                return block()
+            } catch (e: AuthExpiredException) {
+                // Retry-once gate: if we've already retried in the current generation, the fresh
+                // session still can't read this -> genuine failure (do not loop).
+                if (!reauth.shouldAttemptReauth(lastRetriedGen)) {
+                    throw IOException(sessionExpiredMessage)
+                }
+                when (val outcome = reauth.requestReauth(observedGen)) {
+                    is ReauthCoordinator.Outcome.Retry -> {
+                        // Re-auth succeeded (ours or a concurrent caller's). Record the generation we
+                        // are now retrying under so a repeat 401 in the SAME generation fails fast.
+                        lastRetriedGen = outcome.generation
+                        observedGen = outcome.generation
+                        // loop -> retry block() once on the fresh session
+                    }
+                    ReauthCoordinator.Outcome.NoCredentials,
+                    ReauthCoordinator.Outcome.Failed -> {
+                        throw IOException(sessionExpiredMessage)
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Bounded cache of parsed metadata JSON roots, keyed by identifier.
@@ -350,13 +437,19 @@ class RemoteSource @Inject constructor(
         val identifier = getIdentifier(iaUrl)
         // Use the shared metadata cache to avoid re-fetching when multiple sources share
         // the same identifier, and so subsequent mirrorUrls/fetchFileSize calls are free.
-        val root = metadataCache[identifier] ?: run {
+        // SESSION-EXPIRY RECOVERY: wrap the metadata fetch so a 401 (restricted item whose session
+        // expired) silently re-authenticates once and retries instead of failing the scan.
+        val root = metadataCache[identifier] ?: withReauthRetry {
             val request = Request.Builder()
                 .url("https://archive.org/metadata/$identifier")
                 .header("User-Agent", USER_AGENT)
                 .header("Accept", "application/json")
                 .build()
             okHttpClient.newCall(request).execute().use { response ->
+                // A 401 (or auth-expiry 403) means the session lapsed mid-batch -> trigger re-auth.
+                if (ReauthCoordinator.isAuthExpiry(response.code, authExpiryHint = true)) {
+                    throw AuthExpiredException(response.code)
+                }
                 if (!response.isSuccessful) {
                     throw IOException("HTTP ${response.code} for $identifier")
                 }
@@ -652,6 +745,11 @@ class RemoteSource @Inject constructor(
                         val host = if (attempt == 0) hosts[idx % hosts.size]
                             else distinctHosts[attempt % distinctHosts.size]
                         try {
+                            // SESSION-EXPIRY RECOVERY: wrap the ranged GET so a 401 (auth session
+                            // expired mid-batch) silently re-authenticates once and retries the SAME
+                            // range request, instead of consuming this segment's attempt budget. The
+                            // absolute-offset write is idempotent, so a retried range is byte-safe.
+                            withReauthRetry {
                             val req = Request.Builder().url(host)
                                 .header("User-Agent", USER_AGENT)
                                 .header("Accept-Encoding", "identity")
@@ -660,6 +758,11 @@ class RemoteSource @Inject constructor(
                                 .header("Range", "bytes=$start-$end")
                                 .build()
                             okHttpClient.newCall(req).execute().use { resp ->
+                                // 401 (or auth-expiry 403) -> trigger silent re-auth+retry, not a
+                                // plain transport error that would burn an attempt.
+                                if (ReauthCoordinator.isAuthExpiry(resp.code, authExpiryHint = true)) {
+                                    throw AuthExpiredException(resp.code)
+                                }
                                 if (resp.code != 206) throw IOException("No range (HTTP ${resp.code})")
                                 // Guard against stale metadata: the file was pre-sized to
                                 // expectedSize and segment offsets were sliced from it. If the
@@ -700,6 +803,7 @@ class RemoteSource @Inject constructor(
                                     }
                                 }
                             }
+                            } // end withReauthRetry (static ranged GET)
                             return@async
                         } catch (c: CancellationException) {
                             throw c
@@ -1381,6 +1485,18 @@ class RemoteSource @Inject constructor(
         connAcquired = true
         onConnAcquired()
         try {
+            // SESSION-EXPIRY RECOVERY: wrap the ranged GET so a 401 (the IA datanode rejecting a stale
+            // session mid-batch) triggers a SILENT single-flight re-auth + ONE retry of this chunk's
+            // GET, instead of consuming the chunk's real-error budget. A 401 is rejected at the
+            // response-status check BEFORE any body bytes are read, so a retry always restarts this
+            // chunk cleanly from zero bytes — bytesThisChunk is reset on each (re)attempt below so a
+            // re-auth retry can never double-count, and liveBytes only ever grows on real 206 reads.
+            // The re-auth login is a separate permit-free POST, so the 24-cap is untouched while this
+            // chunk's permit is held. If re-auth has no saved creds or fails, withReauthRetry rethrows
+            // a clear IOException which falls through to the normal error-budget catch below (a genuine
+            // failure that KEEPS the .part for resume).
+            withReauthRetry {
+            bytesThisChunk = 0L
             val req = Request.Builder().url(host)
                 .header("User-Agent", USER_AGENT)
                 .header("Accept-Encoding", "identity")
@@ -1390,6 +1506,10 @@ class RemoteSource @Inject constructor(
                 .build()
             call = okHttpClient.newCall(req)
             call.execute().use { resp ->
+                // 401 (or auth-expiry 403) -> silent re-auth+retry; NOT a real transport error.
+                if (ReauthCoordinator.isAuthExpiry(resp.code, authExpiryHint = true)) {
+                    throw AuthExpiredException(resp.code)
+                }
                 if (resp.code != 206) throw IOException("No range (HTTP ${resp.code})")
                 // DIAG: capture the negotiated HTTP protocol (h2, http/1.1, etc.) for the bench log.
                 // resp.protocol is the okhttp3.Protocol enum; toString() gives the canonical lowercase name.
@@ -1469,6 +1589,7 @@ class RemoteSource @Inject constructor(
                     }
                 }
             }
+            } // end withReauthRetry (laned ranged GET)
             // FULL-RANGE VERIFICATION: only mark done when the received byte count matches the
             // chunk length EXACTLY. A short read requeues the WHOLE chunk (no partial done).
             // (A racer that read its full range but lost the race to the primary still lands here
@@ -1663,7 +1784,16 @@ class RemoteSource @Inject constructor(
         var downloaded = 0L
         val start = System.currentTimeMillis()
         var lastReport = start
+        // SESSION-EXPIRY RECOVERY: a 401 on the single-stream fallback (session expired mid-batch)
+        // silently re-authenticates once and retries. The 401 is rejected before any body bytes, and
+        // FileOutputStream(destFile) truncates on (re)open, so a retry restarts the file cleanly;
+        // `downloaded` is reset per attempt so progress can't double-count.
+        withReauthRetry {
+        downloaded = 0L
         okHttpClient.newCall(req).execute().use { resp ->
+            if (ReauthCoordinator.isAuthExpiry(resp.code, authExpiryHint = true)) {
+                throw AuthExpiredException(resp.code)
+            }
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
             val body = resp.body ?: throw IOException("empty body")
             java.io.BufferedOutputStream(java.io.FileOutputStream(destFile), 256 * 1024).use { out ->
@@ -1685,6 +1815,7 @@ class RemoteSource @Inject constructor(
                 }
             }
         }
+        } // end withReauthRetry (single-stream fallback)
         onProgress(downloaded, 0.0)
         return downloaded
     }
